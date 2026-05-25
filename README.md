@@ -102,6 +102,12 @@ Terminal UI changes must pass the full verification script. It runs Rust tests, 
 
 You can disable (100% completely anonymous) telemetry with  `BUT_TELEMETRY=0`.
 
+### Theme
+
+The TUI defaults to its original dark palette. For light terminal backgrounds,
+launch with `BUT_THEME=light`. `BUT_THEME=auto` also honors `CLITHEME=light`
+when your shell exports it.
+
 ## Docs
 
 - `docs/terminal-ui-product-ux.md`
