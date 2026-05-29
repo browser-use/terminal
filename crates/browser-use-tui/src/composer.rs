@@ -174,13 +174,22 @@ impl Composer {
                 } else {
                     target_col
                 };
-                // Clip the click to the visible content of THIS visual row so
-                // that clicking past the end of a line lands at the end of
-                // that line (or end of the wrapped visual row), instead of
-                // spilling into the next visual row of the same logical line.
+                // Clip the click to the visible content of THIS visual row.
+                // For wrapped logical lines, position == row_end is *visually*
+                // the start of the next wrapped row (no character separates
+                // soft-wrapped rows), so clicking past end-of-row would render
+                // the cursor one row below where the user clicked. Clamp one
+                // position earlier when there is a next visual row, so cursor
+                // stays on the clicked row.
                 let row_start = row_in_line.saturating_mul(wrap_width);
                 let row_end = row_start.saturating_add(wrap_width).min(line_len);
-                let line_col = row_start.saturating_add(col_in_line).min(row_end);
+                let is_last_visual_row_of_line = row_in_line.saturating_add(1) >= line_visual_rows;
+                let click_max = if is_last_visual_row_of_line {
+                    row_end
+                } else {
+                    row_end.saturating_sub(1).max(row_start)
+                };
+                let line_col = row_start.saturating_add(col_in_line).min(click_max);
                 self.cursor = line_start.saturating_add(line_col).min(self.input_len());
                 self.preferred_column = None;
                 return true;
