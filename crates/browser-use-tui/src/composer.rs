@@ -174,10 +174,22 @@ impl Composer {
                 } else {
                     target_col
                 };
-                let line_col = row_in_line
-                    .saturating_mul(wrap_width)
-                    .saturating_add(col_in_line)
-                    .min(line_len);
+                // Clip the click to the visible content of THIS visual row.
+                // For wrapped logical lines, position == row_end is *visually*
+                // the start of the next wrapped row (no character separates
+                // soft-wrapped rows), so clicking past end-of-row would render
+                // the cursor one row below where the user clicked. Clamp one
+                // position earlier when there is a next visual row, so cursor
+                // stays on the clicked row.
+                let row_start = row_in_line.saturating_mul(wrap_width);
+                let row_end = row_start.saturating_add(wrap_width).min(line_len);
+                let is_last_visual_row_of_line = row_in_line.saturating_add(1) >= line_visual_rows;
+                let click_max = if is_last_visual_row_of_line {
+                    row_end
+                } else {
+                    row_end.saturating_sub(1).max(row_start)
+                };
+                let line_col = row_start.saturating_add(col_in_line).min(click_max);
                 self.cursor = line_start.saturating_add(line_col).min(self.input_len());
                 self.preferred_column = None;
                 return true;
@@ -936,6 +948,41 @@ mod tests {
             composer.cursor(),
             "first line\nsecond word\nthi".chars().count()
         );
+    }
+
+    #[test]
+    fn click_past_end_of_line_clips_to_that_line_end() {
+        // Plain (non-wrapped) lines: clicking far past the end of a short
+        // logical line must stop at the end of that line, not bleed into
+        // the next logical line.
+        let mut composer = Composer::default();
+        composer.set_input("first line\nsecond word\nthird".to_string());
+
+        // Click on row 0 ("first line") way past the visible end.
+        assert!(composer.set_cursor_from_wrapped_position(4, 80, 0, 60));
+        assert_eq!(composer.cursor(), "first line".chars().count());
+
+        // Click on row 1 ("second word") way past the visible end.
+        assert!(composer.set_cursor_from_wrapped_position(4, 80, 1, 60));
+        assert_eq!(
+            composer.cursor(),
+            "first line\nsecond word".chars().count()
+        );
+
+        // Wrapped logical line: clicking past the end of visual row 0
+        // must land at the end of that visual row, NOT at the end of the
+        // whole logical line (which would be on a later visual row).
+        let mut composer = Composer::default();
+        // width=8, prompt "> " takes 2 cols => content/wrap width = 6.
+        // "abcdefghij" wraps into "abcdef" and "ghij".
+        composer.set_input("abcdefghij".to_string());
+        // Click on row 0 at the rightmost in-rect column (col 7, past 'f').
+        assert!(composer.set_cursor_from_wrapped_position(4, 8, 0, 7));
+        assert_eq!(composer.cursor(), "abcdef".chars().count());
+        // Click on row 1 past the end of "ghij" still pins to end of row 1
+        // (which is also the end of the logical line here).
+        assert!(composer.set_cursor_from_wrapped_position(4, 8, 1, 7));
+        assert_eq!(composer.cursor(), "abcdefghij".chars().count());
     }
 
     #[test]
