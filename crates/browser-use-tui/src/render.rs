@@ -287,11 +287,13 @@ fn render_main(
         body_content_rect,
     );
     if layout_surface.is_bottom_pane() {
+        app.composer_input_rect.set(None);
         render_bottom_pane(frame, bottom_area, app, state, layout_surface);
     } else if app.surface.is_text_input_popup() {
         // The popup itself is the input — don't render the composer under it,
         // or the user sees their typing duplicated. Clear the area so nothing
         // bleeds through behind the floating popup.
+        app.composer_input_rect.set(None);
         frame.render_widget(Clear, bottom_area);
     } else {
         render_composer(frame, bottom_area, app, state, product_state);
@@ -439,6 +441,7 @@ fn render_bottom_pane(
     surface: Surface,
 ) {
     if area.width == 0 || area.height == 0 {
+        app.composer_input_rect.set(None);
         return;
     }
     let header = surface_header_lines(surface, content_width(area.width));
@@ -1230,7 +1233,10 @@ fn render_composer(
             width: inner.width.saturating_sub(2),
             height: inner.height.saturating_sub(1),
         };
+        app.composer_input_rect.set(Some(input_area));
         render_composer_input(frame, input_area, app, state);
+    } else {
+        app.composer_input_rect.set(None);
     }
 
     let bottom_area = Rect {
