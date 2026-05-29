@@ -1658,6 +1658,11 @@ fn session_model_selection_from_event(event: &EventRecord) -> Option<SessionMode
 
 impl App {
     fn new(mut args: Args) -> Result<Self> {
+        debug_reload_log(&format!(
+            "App::new: starting, BUT_REEXEC_SESSION_ID={:?}, args.select_latest={}",
+            std::env::var(REEXEC_SESSION_ENV).unwrap_or_default(),
+            args.select_latest
+        ));
         args.state_dir = resolve_state_dir(&args.state_dir);
         let (store_tx, store_rx) = mpsc::channel();
         let store = Store::open_with_notifier(&args.state_dir, store_tx)?;
@@ -4161,9 +4166,13 @@ impl App {
         match self.selected_session_id.as_deref() {
             Some(session_id) if !session_id.is_empty() => {
                 std::env::set_var(REEXEC_SESSION_ENV, session_id);
+                debug_reload_log(&format!(
+                    "request_reexec: set BUT_REEXEC_SESSION_ID={session_id}"
+                ));
             }
             _ => {
                 std::env::remove_var(REEXEC_SESSION_ENV);
+                debug_reload_log("request_reexec: no session selected, cleared BUT_REEXEC_SESSION_ID");
             }
         }
         request_process_reexec()
@@ -6132,11 +6141,37 @@ fn request_process_reexec() -> Result<()> {
 #[cfg(unix)]
 fn reexec_terminal_process() -> Result<()> {
     let exe = reexec_binary_path()?;
-    let args = std::env::args_os().skip(1);
+    let args: Vec<_> = std::env::args_os().skip(1).collect();
+    let env_session = std::env::var(REEXEC_SESSION_ENV).unwrap_or_default();
+    debug_reload_log(&format!(
+        "reexec_terminal_process: exec {} args={:?} BUT_REEXEC_SESSION_ID={:?}",
+        exe.display(),
+        args,
+        env_session
+    ));
     io::stdout().flush()?;
     io::stderr().flush()?;
-    Err(ProcessCommand::new(&exe).args(args).exec())
-        .with_context(|| format!("re-exec {}", exe.display()))
+    let err = ProcessCommand::new(&exe).args(args).exec();
+    debug_reload_log(&format!(
+        "reexec_terminal_process: exec returned (FAILED) error={err}"
+    ));
+    Err(err).with_context(|| format!("re-exec {}", exe.display()))
+}
+
+fn debug_reload_log(msg: &str) {
+    use std::io::Write as _;
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open("/tmp/but-reload.log")
+    {
+        let ts = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs_f64())
+            .unwrap_or(0.0);
+        let pid = std::process::id();
+        let _ = writeln!(f, "[{ts:.3} pid={pid}] {msg}");
+    }
 }
 
 #[cfg(not(unix))]
