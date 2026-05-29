@@ -103,6 +103,7 @@ const RESIZE_DEBOUNCE_INTERVAL: Duration = Duration::from_millis(80);
 const ANIM_TICK_INTERVAL: Duration = Duration::from_millis(16); // ~60 fps
 const LIVE_SPINNER_TICK_INTERVAL: Duration = Duration::from_millis(120);
 const REEXEC_BINARY_ENV: &str = "BUT_REEXEC_BINARY";
+const REEXEC_SESSION_ENV: &str = "BUT_REEXEC_SESSION_ID";
 const CODEX_DEVICE_AUTH_URL: &str = "https://auth.openai.com/codex/device";
 const COLLABORATION_MODE_SETTING: &str = "collaboration.mode";
 const REQUEST_USER_INPUT_REQUEST_EVENT: &str = "request_user_input.requested";
@@ -1658,14 +1659,26 @@ impl App {
         let store = Store::open_with_notifier(&args.state_dir, store_tx)?;
         seed_demo_if_requested(&store, args.seed_demo.as_deref())?;
         let state_cache = AppStateCache::hydrate(&store, &args.browser)?;
-        let selected_session_id = if args.select_latest {
-            state_cache
-                .sessions
-                .first()
-                .map(|session| session.id.clone())
-        } else {
-            None
-        };
+        // /reload sets BUT_REEXEC_SESSION_ID in the re-execed process's env so
+        // the new UI resumes whatever session the user had open, instead of
+        // starting fresh. We consume the var here so nested /reloads don't
+        // accidentally pin the wrong session forever.
+        let reexec_session_id = std::env::var(REEXEC_SESSION_ENV)
+            .ok()
+            .filter(|value| !value.is_empty());
+        if reexec_session_id.is_some() {
+            std::env::remove_var(REEXEC_SESSION_ENV);
+        }
+        let selected_session_id = reexec_session_id.or_else(|| {
+            if args.select_latest {
+                state_cache
+                    .sessions
+                    .first()
+                    .map(|session| session.id.clone())
+            } else {
+                None
+            }
+        });
         let surface = args.overlay.map(Into::into).unwrap_or(Surface::Main);
         let current_dir = std::env::current_dir()?;
         let config_overrides = parse_config_overrides(&args.config_overrides)?;
@@ -4024,6 +4037,17 @@ impl App {
 
     fn request_reexec(&mut self) -> Result<()> {
         self.status_notice = Some("Reloading browser-use terminal...".to_string());
+        // Hand the currently-open session through to the re-execed UI so
+        // /reload behaves like "reload + resume" instead of dropping the
+        // user back at a fresh transcript.
+        match self.selected_session_id.as_deref() {
+            Some(session_id) if !session_id.is_empty() => {
+                std::env::set_var(REEXEC_SESSION_ENV, session_id);
+            }
+            _ => {
+                std::env::remove_var(REEXEC_SESSION_ENV);
+            }
+        }
         request_process_reexec()
     }
 
