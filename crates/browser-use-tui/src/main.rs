@@ -631,6 +631,10 @@ struct App {
     /// Filter text shown inside the palette popup. Edited by typing while the
     /// palette is open; cleared whenever the palette is opened or closed.
     palette_filter: String,
+    /// Substring filter applied to the History surface task list. Edited by
+    /// typing while the History popup is open and cleared whenever the surface
+    /// opens or closes. Empty string means "show everything".
+    history_filter: String,
 }
 
 #[derive(Debug)]
@@ -1787,6 +1791,7 @@ impl App {
             composer_input_rect: std::cell::Cell::new(None),
             palette_open: false,
             palette_filter: String::new(),
+            history_filter: String::new(),
         };
         app.refresh_cached_projection();
         Ok(app)
@@ -2656,6 +2661,7 @@ impl App {
         self.close_slash_palette();
         self.surface = surface;
         self.selected_row = 0;
+        self.history_filter.clear();
         if surface != Surface::Browser {
             self.browser_notice = None;
         }
@@ -2671,6 +2677,7 @@ impl App {
         }
         self.surface = Surface::Main;
         self.selected_row = 0;
+        self.history_filter.clear();
         self.browser_notice = None;
     }
 
@@ -3438,6 +3445,15 @@ impl App {
             KeyEvent {
                 code: KeyCode::Esc, ..
             } if self.surface == Surface::Main => self.handle_main_escape()?,
+            // History: first Esc clears the live filter; a second Esc (with the
+            // filter already empty) closes the popup like every other surface.
+            KeyEvent {
+                code: KeyCode::Esc, ..
+            } if self.surface == Surface::History && !self.history_filter.is_empty() => {
+                self.escape_stop_until = None;
+                self.history_filter.clear();
+                self.selected_row = 0;
+            }
             KeyEvent {
                 code: KeyCode::Esc, ..
             } => {
@@ -3491,11 +3507,16 @@ impl App {
                 modifiers: KeyModifiers::CONTROL,
                 ..
             } if self.composer.is_empty() => self.open_surface(Surface::Developer),
+            // `r` resumes the selected history row, but only when the live
+            // filter is empty — otherwise it would steal a perfectly legal
+            // letter mid-search ("foo<r>bar" → "fooba").
             KeyEvent {
                 code: KeyCode::Char('r'),
                 modifiers: KeyModifiers::NONE,
                 ..
-            } if self.surface == Surface::History => self.resume_selected_history()?,
+            } if self.surface == Surface::History && self.history_filter.is_empty() => {
+                self.resume_selected_history()?
+            }
             KeyEvent {
                 code: KeyCode::Up, ..
             } if self.is_slash_palette_active() => self.move_slash_palette_selection(-1),
@@ -3610,6 +3631,59 @@ impl App {
             } if self.is_slash_palette_active() => {
                 self.palette_filter.pop();
                 self.clamp_slash_palette_selection();
+            }
+            // History live filter: typed printable chars extend the substring
+            // filter, Backspace shrinks it, Ctrl-U/Cmd-Backspace clears it.
+            // Selection resets to the top of the filtered list whenever the
+            // filter changes so the highlight is never pointing at a row that
+            // just got filtered out.
+            KeyEvent { .. }
+                if self.surface == Surface::History && is_popup_clear_key(key) =>
+            {
+                self.history_filter.clear();
+                self.selected_row = 0;
+            }
+            KeyEvent {
+                code: KeyCode::Char(ch),
+                modifiers,
+                ..
+            } if self.surface == Surface::History
+                && !modifiers.contains(KeyModifiers::CONTROL)
+                && !modifiers.contains(KeyModifiers::ALT)
+                && !modifiers.intersects(
+                    KeyModifiers::SUPER | KeyModifiers::HYPER | KeyModifiers::META,
+                ) =>
+            {
+                self.history_filter.push(ch);
+                self.selected_row = 0;
+            }
+            KeyEvent {
+                code: KeyCode::Backspace,
+                ..
+            } if self.surface == Surface::History => {
+                self.history_filter.pop();
+                self.selected_row = 0;
+            }
+            // PgUp/PgDn page through the visible history rows by a fixed step
+            // (the popup body height varies but never exceeds ~26 lines, so a
+            // 10-row jump is comfortable without overshooting on small terms).
+            KeyEvent {
+                code: KeyCode::PageUp,
+                ..
+            } if self.surface == Surface::History => {
+                let count = self.selectable_row_count()?;
+                if count > 0 {
+                    self.selected_row = self.selected_row.saturating_sub(10);
+                }
+            }
+            KeyEvent {
+                code: KeyCode::PageDown,
+                ..
+            } if self.surface == Surface::History => {
+                let count = self.selectable_row_count()?;
+                if count > 0 {
+                    self.selected_row = (self.selected_row + 10).min(count - 1);
+                }
             }
             _ if self.surface == Surface::Main && self.handle_main_composer_key(key) => {}
             KeyEvent {
@@ -3734,11 +3808,8 @@ impl App {
         match self.surface {
             Surface::History => {
                 let state = self.workbench_state()?.clone();
-                if let Some(row) = state
-                    .history
-                    .get(self.selected_row.min(state.history.len().saturating_sub(1)))
-                {
-                    self.dispatch(AppCommand::SelectHistory(row.session_id.clone()))?;
+                if let Some(session_id) = self.selected_history_session_id(&state) {
+                    self.dispatch(AppCommand::SelectHistory(session_id))?;
                 }
             }
             Surface::Setup => self.execute_first_run_setup_selection()?,
@@ -3936,13 +4007,34 @@ impl App {
 
     fn resume_selected_history(&mut self) -> Result<()> {
         let state = self.workbench_state()?.clone();
-        if let Some(row) = state
-            .history
-            .get(self.selected_row.min(state.history.len().saturating_sub(1)))
-        {
-            self.dispatch(AppCommand::SelectHistory(row.session_id.clone()))?;
+        if let Some(session_id) = self.selected_history_session_id(&state) {
+            self.dispatch(AppCommand::SelectHistory(session_id))?;
         }
         Ok(())
+    }
+
+    /// Indices into `WorkbenchState::history` for rows visible under the
+    /// current `history_filter` (case-insensitive substring match against the
+    /// task text). When the filter is empty this returns every index.
+    pub(crate) fn history_visible_indices(&mut self) -> Result<Vec<usize>> {
+        let state = self.workbench_state()?;
+        Ok(history_visible_indices_for(&state, &self.history_filter))
+    }
+
+    /// The session id of the currently highlighted row, after filter is
+    /// applied. Returns `None` when the filtered list is empty.
+    fn selected_history_session_id(&self, state: &WorkbenchState) -> Option<String> {
+        let indices = history_visible_indices_for(state, &self.history_filter);
+        if indices.is_empty() {
+            return None;
+        }
+        let pick = self.selected_row.min(indices.len() - 1);
+        let row = state.history.get(indices[pick])?;
+        Some(row.session_id.clone())
+    }
+
+    pub(crate) fn history_filter(&self) -> &str {
+        &self.history_filter
     }
 
     fn execute_failed_selection(&mut self, session_id: String) -> Result<()> {
@@ -4874,7 +4966,7 @@ impl App {
             Surface::Mode => 2,
             Surface::Browser => 3,
             Surface::BrowserSelect => BROWSER_CHOICES.len(),
-            Surface::History => self.workbench_state()?.history.len(),
+            Surface::History => self.history_visible_indices()?.len(),
             Surface::Messages => self.message_action_rows().len(),
             Surface::Developer => 1,
         })
@@ -6393,6 +6485,23 @@ fn escape_prefixed_alt_key_event(event: &TermEvent) -> Option<KeyEvent> {
         }
         _ => None,
     }
+}
+
+/// Case-insensitive substring filter over `state.history`. Returns the
+/// indices into the original `Vec<HistoryRow>` whose task text matches.
+/// An empty filter is treated as "match everything".
+fn history_visible_indices_for(state: &WorkbenchState, filter: &str) -> Vec<usize> {
+    let needle = filter.trim().to_ascii_lowercase();
+    if needle.is_empty() {
+        return (0..state.history.len()).collect();
+    }
+    state
+        .history
+        .iter()
+        .enumerate()
+        .filter(|(_, row)| row.task.to_ascii_lowercase().contains(&needle))
+        .map(|(idx, _)| idx)
+        .collect()
 }
 
 fn is_popup_clear_key(key: KeyEvent) -> bool {
