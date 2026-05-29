@@ -7,6 +7,7 @@ pub(crate) enum PaletteAction {
     PlanMode,
     ChooseModel,
     Authenticate,
+    Reload,
     Update,
     Exit,
 }
@@ -51,11 +52,16 @@ const VISIBLE_ITEMS: [PaletteItem; 6] = [
     },
 ];
 
-const HIDDEN_ITEMS: [PaletteItem; 3] = [
+const HIDDEN_ITEMS: [PaletteItem; 4] = [
     PaletteItem {
         command: "/auth",
         description: "sign in to a provider",
         action: PaletteAction::Authenticate,
+    },
+    PaletteItem {
+        command: "/reload",
+        description: "restart the UI in this terminal",
+        action: PaletteAction::Reload,
     },
     PaletteItem {
         command: "/update",
@@ -90,4 +96,14 @@ pub(crate) fn selected_action(filter: &str, selected_row: usize) -> Option<Palet
     items_filtered(filter)
         .get(selected_row)
         .map(|item| item.action)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn reload_is_available_as_hidden_command() {
+        assert_eq!(selected_action("/reload", 0), Some(PaletteAction::Reload));
+    }
 }

@@ -26,6 +26,7 @@ ROOT = Path(__file__).resolve().parents[1]
 ARTIFACT_DIR = Path("/tmp/but-design-loop")
 HISTORY_TITLE = "Browse and resume previous tasks"
 STATUS_BAR_PREFIX = "GPT-5.5  ·"
+TMUX = ["tmux", "-L", f"but-smoke-{os.getpid()}", "-f", "/dev/null"]
 
 
 def run(cmd: list[str], *, check: bool = True, text: str | None = None) -> subprocess.CompletedProcess[str]:
@@ -47,15 +48,15 @@ def binary_version_label(binary: Path) -> str:
 
 
 def tmux(*args: str, check: bool = True) -> str:
-    return run(["tmux", *args], check=check).stdout
+    return run([*TMUX, *args], check=check).stdout
 
 
 def tmux_send(session: str, *keys: str) -> None:
-    run(["tmux", "send-keys", "-t", session, *keys])
+    run([*TMUX, "send-keys", "-t", session, *keys])
 
 
 def tmux_send_literal(session: str, value: str) -> None:
-    run(["tmux", "send-keys", "-t", session, "-l", value])
+    run([*TMUX, "send-keys", "-t", session, "-l", value])
 
 
 def tmux_send_shift_enter(session: str) -> None:
@@ -75,6 +76,19 @@ def tmux_send_alt_backspace(session: str) -> None:
     # CSI-u Alt+Backspace. This matches the enhanced keyboard protocol enabled
     # by the TUI and avoids relying on tmux's terminal-specific M-BSpace name.
     tmux_send_literal(session, "\x1b[127;3u")
+
+
+def tmux_send_alt_left(session: str) -> None:
+    tmux_send_literal(session, "\x1b[1;3D")
+
+
+def tmux_send_alt_right(session: str) -> None:
+    tmux_send_literal(session, "\x1b[1;3C")
+
+
+def tmux_send_mouse_down(session: str, column: int, row: int) -> None:
+    # SGR mouse coordinates are 1-based terminal cells.
+    tmux_send_literal(session, f"\x1b[<0;{column + 1};{row + 1}M")
 
 
 def capture(session: str, name: str) -> str:
@@ -469,6 +483,47 @@ def smoke_interactive_terminal(binary: Path) -> None:
         assert_not_contains(spaced_word, "> before something-bla", "alt-backspace should stop at previous blank")
         tmux_send_alt_backspace(session)
         wait_for(session, "Type to steer the agent", "main-after-alt-backspace-word-clear")
+
+        tmux_send_literal(session, "alpha beta gamma")
+        wait_for(session, "> alpha beta gamma", "alt-arrow-word-before")
+        tmux_send_alt_left(session)
+        tmux_send_literal(session, "X")
+        alt_left = wait_for(session, "> alpha beta Xgamma", "alt-left-word")
+        assert_contains(
+            alt_left,
+            "> alpha beta Xgamma",
+            "alt-left should move to previous word start",
+        )
+        tmux_send_alt_right(session)
+        tmux_send_literal(session, "!")
+        alt_right = capture_after_idle(session, "alt-right-word", visible_only=True)
+        assert_contains(
+            alt_right,
+            "> alpha beta Xgamma!",
+            "alt-right should move to next word end",
+        )
+        tmux_send(session, "C-c")
+        wait_for(session, "Type to steer the agent", "main-after-alt-arrow-clear")
+
+        tmux_send_literal(session, "first line")
+        tmux_send_shift_enter(session)
+        tmux_send_literal(session, "second word")
+        tmux_send_shift_enter(session)
+        tmux_send_literal(session, "third")
+        multiline_click_before = wait_for(session, "  second word", "multiline-click-before")
+        click_lines = multiline_click_before.splitlines()
+        click_row = next(idx for idx, line in enumerate(click_lines) if "  second word" in line)
+        click_col = click_lines[click_row].index("word")
+        tmux_send_mouse_down(session, click_col, click_row)
+        tmux_send_literal(session, "X")
+        multiline_click = capture_after_idle(session, "multiline-click", visible_only=True)
+        assert_contains(
+            multiline_click,
+            "  second Xword",
+            "mouse click should place cursor on clicked multiline word",
+        )
+        tmux_send(session, "C-c")
+        wait_for(session, "Type to steer the agent", "main-after-multiline-click-clear")
 
         bracketed = "\x1b[200~paste one\npaste two\x1b[201~"
         tmux_send_literal(session, bracketed)

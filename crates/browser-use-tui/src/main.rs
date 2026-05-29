@@ -5,11 +5,17 @@ use std::io::Read;
 use std::io::{self, Write};
 #[cfg(not(test))]
 use std::net::{TcpListener, TcpStream};
+#[cfg(unix)]
+use std::os::unix::process::CommandExt;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::path::{Path, PathBuf};
+use std::process::Command as ProcessCommand;
 #[cfg(not(test))]
-use std::process::{Command as ProcessCommand, Stdio};
-use std::sync::{mpsc, Once};
+use std::process::Stdio;
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    mpsc, Arc, Once,
+};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -59,6 +65,8 @@ use ratatui::text::Line;
 use ratatui::widgets::{Clear as RatatuiClear, Paragraph, Widget};
 use ratatui::{Terminal, TerminalOptions, Viewport};
 use serde::{Deserialize, Serialize};
+#[cfg(unix)]
+use signal_hook::consts::signal::SIGUSR2;
 use unicode_width::UnicodeWidthStr;
 
 mod clipboard_paste;
@@ -94,6 +102,7 @@ const INPUT_POLL_INTERVAL: Duration = Duration::from_millis(25);
 const RESIZE_DEBOUNCE_INTERVAL: Duration = Duration::from_millis(80);
 const ANIM_TICK_INTERVAL: Duration = Duration::from_millis(16); // ~60 fps
 const LIVE_SPINNER_TICK_INTERVAL: Duration = Duration::from_millis(120);
+const REEXEC_BINARY_ENV: &str = "BUT_REEXEC_BINARY";
 const CODEX_DEVICE_AUTH_URL: &str = "https://auth.openai.com/codex/device";
 const COLLABORATION_MODE_SETTING: &str = "collaboration.mode";
 const REQUEST_USER_INPUT_REQUEST_EVENT: &str = "request_user_input.requested";
@@ -391,6 +400,7 @@ enum AppCommand {
     SignIn,
     ConfigureTelemetry,
     ChangeBrowser,
+    Reload,
     Update,
     SaveAccount(String),
     SaveModel(usize),
@@ -611,6 +621,9 @@ struct App {
     /// Last-rendered logo bounding box on screen (terminal cells). Set by
     /// render.rs each frame and read by the mouse click handler.
     welcome_logo_rect: std::cell::Cell<Option<ratatui::layout::Rect>>,
+    /// Last-rendered composer input rectangle on screen (terminal cells). Set
+    /// by render.rs each frame and read by the mouse click handler.
+    composer_input_rect: std::cell::Cell<Option<ratatui::layout::Rect>>,
     /// Whether the slash command palette popup is currently open. Independent
     /// of the composer's content — `/` opens it, Esc closes it, and the
     /// composer is never touched.
@@ -1771,6 +1784,7 @@ impl App {
             welcome_anim: welcome::WelcomeAnim::new(),
             live_spinner_frame: 0,
             welcome_logo_rect: std::cell::Cell::new(None),
+            composer_input_rect: std::cell::Cell::new(None),
             palette_open: false,
             palette_filter: String::new(),
         };
@@ -2942,6 +2956,7 @@ impl App {
             AppCommand::SignIn => self.open_surface(Surface::Account),
             AppCommand::ConfigureTelemetry => self.start_telemetry_entry(),
             AppCommand::ChangeBrowser => self.open_surface(Surface::BrowserSelect),
+            AppCommand::Reload => self.request_reexec()?,
             AppCommand::Update => self.run_update()?,
             AppCommand::SaveAccount(account) => self.save_account(account)?,
             AppCommand::SaveModel(index) => self.save_model(index)?,
@@ -3671,6 +3686,35 @@ impl App {
             && self.welcome_logo_rect.get().is_some()
     }
 
+    fn should_capture_mouse(&self) -> bool {
+        self.should_capture_welcome_mouse()
+            || (self.surface == Surface::Main
+                && !self.is_slash_palette_active()
+                && self.composer_input_rect.get().is_some())
+    }
+
+    fn handle_composer_click(&mut self, column: u16, row: u16) -> bool {
+        if self.surface != Surface::Main || self.is_slash_palette_active() {
+            return false;
+        }
+        let Some(rect) = self.composer_input_rect.get() else {
+            return false;
+        };
+        if column < rect.x
+            || column >= rect.x.saturating_add(rect.width)
+            || row < rect.y
+            || row >= rect.y.saturating_add(rect.height)
+        {
+            return false;
+        }
+        self.composer.set_cursor_from_wrapped_position(
+            rect.height.max(1) as usize,
+            rect.width as usize,
+            row.saturating_sub(rect.y) as usize,
+            column.saturating_sub(rect.x) as usize,
+        )
+    }
+
     fn handle_welcome_logo_click(&mut self, column: u16, row: u16) -> bool {
         if !self.should_capture_welcome_mouse() {
             return false;
@@ -3943,6 +3987,7 @@ impl App {
             PaletteAction::PreviousWork => self.dispatch(AppCommand::OpenHistory)?,
             PaletteAction::ChooseModel => self.dispatch(AppCommand::ChangeModel)?,
             PaletteAction::Authenticate => self.dispatch(AppCommand::SignIn)?,
+            PaletteAction::Reload => self.dispatch(AppCommand::Reload)?,
             PaletteAction::Update => self.dispatch(AppCommand::Update)?,
             PaletteAction::Exit => return Ok(true),
         }
@@ -3975,6 +4020,11 @@ impl App {
             }
         }
         Ok(())
+    }
+
+    fn request_reexec(&mut self) -> Result<()> {
+        self.status_notice = Some("Reloading browser-use terminal...".to_string());
+        request_process_reexec()
     }
 
     fn save_account(&mut self, account: String) -> Result<()> {
@@ -5805,7 +5855,13 @@ fn print_native_transcript(app: &mut App) -> Result<()> {
     Ok(())
 }
 
+enum TerminalRunOutcome {
+    Quit,
+    Reexec,
+}
+
 fn run_terminal(mut app: App) -> Result<()> {
+    let reload_requested = install_reexec_signal_handler()?;
     let mut viewport_height = desired_terminal_viewport_height(&mut app)?;
     enable_raw_mode()?;
     let mut stdout = io::stdout();
@@ -5821,13 +5877,19 @@ fn run_terminal(mut app: App) -> Result<()> {
         )
     )?;
     let mut terminal_driver = TerminalDriver::new(viewport_height)?;
-    let result = (|| -> Result<()> {
+    let result = (|| -> Result<TerminalRunOutcome> {
         let mut draw_needed = true;
         let mut last_fallback_refresh = Instant::now();
         let mut last_anim_tick = Instant::now();
         let mut last_live_spinner_tick = Instant::now();
         let mut pending_resize_at: Option<Instant> = None;
         loop {
+            if reload_requested
+                .as_ref()
+                .is_some_and(|flag| flag.swap(false, Ordering::SeqCst))
+            {
+                break Ok(TerminalRunOutcome::Reexec);
+            }
             draw_needed |= app.drain_store_notifications()?;
             draw_needed |= app.drain_oauth_notifications()?;
             draw_needed |= app.drain_codex_login_notifications()?;
@@ -5887,7 +5949,7 @@ fn run_terminal(mut app: App) -> Result<()> {
                 continue;
             }
             if handle_terminal_event(event, &mut app, &mut terminal_driver)? {
-                break Ok(());
+                break Ok(TerminalRunOutcome::Quit);
             }
             draw_needed = true;
         }
@@ -5896,8 +5958,58 @@ fn run_terminal(mut app: App) -> Result<()> {
     let cursor_result = terminal_driver.show_cursor();
     restore_result?;
     cursor_result?;
-    result?;
-    Ok(())
+    match result? {
+        TerminalRunOutcome::Quit => Ok(()),
+        TerminalRunOutcome::Reexec => reexec_terminal_process(),
+    }
+}
+
+#[cfg(unix)]
+fn install_reexec_signal_handler() -> Result<Option<Arc<AtomicBool>>> {
+    let flag = Arc::new(AtomicBool::new(false));
+    signal_hook::flag::register(SIGUSR2, Arc::clone(&flag))
+        .context("install SIGUSR2 reload handler")?;
+    Ok(Some(flag))
+}
+
+#[cfg(not(unix))]
+fn install_reexec_signal_handler() -> Result<Option<Arc<AtomicBool>>> {
+    Ok(None)
+}
+
+#[cfg(unix)]
+fn request_process_reexec() -> Result<()> {
+    signal_hook::low_level::raise(SIGUSR2).context("request terminal reload")
+}
+
+#[cfg(not(unix))]
+fn request_process_reexec() -> Result<()> {
+    anyhow::bail!("terminal reload is only supported on Unix platforms")
+}
+
+#[cfg(unix)]
+fn reexec_terminal_process() -> Result<()> {
+    let exe = reexec_binary_path()?;
+    let args = std::env::args_os().skip(1);
+    io::stdout().flush()?;
+    io::stderr().flush()?;
+    Err(ProcessCommand::new(&exe).args(args).exec())
+        .with_context(|| format!("re-exec {}", exe.display()))
+}
+
+#[cfg(not(unix))]
+fn reexec_terminal_process() -> Result<()> {
+    anyhow::bail!("terminal reload is only supported on Unix platforms")
+}
+
+fn reexec_binary_path() -> Result<PathBuf> {
+    if let Some(path) = std::env::var_os(REEXEC_BINARY_ENV)
+        .map(PathBuf::from)
+        .filter(|path| !path.as_os_str().is_empty())
+    {
+        return Ok(path);
+    }
+    std::env::current_exe().context("resolve current executable for reload")
 }
 
 struct TerminalDriver {
@@ -5970,7 +6082,7 @@ impl TerminalDriver {
     }
 
     fn sync_mouse_capture(&mut self, app: &App) -> Result<()> {
-        let should_capture = app.should_capture_welcome_mouse();
+        let should_capture = app.should_capture_mouse();
         if should_capture == self.mouse_capture_enabled {
             return Ok(());
         }
@@ -6220,6 +6332,7 @@ fn handle_terminal_event(
             row,
             ..
         }) => {
+            app.handle_composer_click(column, row);
             app.handle_welcome_logo_click(column, row);
             Ok(false)
         }
@@ -6255,6 +6368,9 @@ fn handle_escape_prefix_key(
         if is_unmodified_enter_event(&next_event) {
             return app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::ALT));
         }
+        if let Some(alt_key) = escape_prefixed_alt_key_event(&next_event) {
+            return app.handle_key(alt_key);
+        }
         let should_quit = app.handle_key(escape_key)?;
         if should_quit {
             return Ok(true);
@@ -6262,6 +6378,24 @@ fn handle_escape_prefix_key(
         return handle_terminal_event(next_event, app, terminal_driver);
     }
     app.handle_key(escape_key)
+}
+
+fn escape_prefixed_alt_key_event(event: &TermEvent) -> Option<KeyEvent> {
+    let TermEvent::Key(key) = event else {
+        return None;
+    };
+    if !matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) {
+        return None;
+    }
+    if !key.modifiers.is_empty() {
+        return None;
+    }
+    match key.code {
+        KeyCode::Left | KeyCode::Right | KeyCode::Char('b' | 'f') => {
+            Some(KeyEvent::new(key.code, KeyModifiers::ALT))
+        }
+        _ => None,
+    }
 }
 
 fn is_popup_clear_key(key: KeyEvent) -> bool {
@@ -7059,6 +7193,60 @@ mod redesign_tests {
         assert!(!sequence.contains("\x1b[?1002h"));
         assert!(!sequence.contains("\x1b[?1003h"));
         Ok(())
+    }
+
+    #[test]
+    fn composer_click_maps_to_multiline_cursor_position() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let mut app = ready_app(&temp)?;
+        app.set_input("first line\nsecond word\nthird".to_string());
+        let _screen = render_dump(&mut app)?;
+        let rect = app
+            .composer_input_rect
+            .get()
+            .context("composer input rect")?;
+
+        assert!(app.should_capture_mouse());
+        assert!(app.handle_composer_click(
+            rect.x.saturating_add(2 + "second ".chars().count() as u16),
+            rect.y.saturating_add(1),
+        ));
+        assert_eq!(app.composer.cursor(), "first line\nsecond ".chars().count());
+
+        assert!(app.handle_composer_click(
+            rect.x.saturating_add(2 + "thi".chars().count() as u16),
+            rect.y.saturating_add(2),
+        ));
+        assert_eq!(
+            app.composer.cursor(),
+            "first line\nsecond word\nthi".chars().count()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn escape_prefixed_word_keys_decode_as_alt_navigation() {
+        assert_eq!(
+            escape_prefixed_alt_key_event(&TermEvent::Key(KeyEvent::new(
+                KeyCode::Left,
+                KeyModifiers::NONE,
+            ))),
+            Some(KeyEvent::new(KeyCode::Left, KeyModifiers::ALT))
+        );
+        assert_eq!(
+            escape_prefixed_alt_key_event(&TermEvent::Key(KeyEvent::new(
+                KeyCode::Char('b'),
+                KeyModifiers::NONE,
+            ))),
+            Some(KeyEvent::new(KeyCode::Char('b'), KeyModifiers::ALT))
+        );
+        assert_eq!(
+            escape_prefixed_alt_key_event(&TermEvent::Key(KeyEvent::new(
+                KeyCode::Up,
+                KeyModifiers::NONE,
+            ))),
+            None
+        );
     }
 
     fn row_containing(screen: &str, needle: &str) -> usize {
