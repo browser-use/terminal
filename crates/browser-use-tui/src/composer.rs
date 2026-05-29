@@ -139,6 +139,58 @@ impl Composer {
         )
     }
 
+    pub(crate) fn set_cursor_from_wrapped_position(
+        &mut self,
+        max_lines: usize,
+        width: usize,
+        row: usize,
+        col: usize,
+    ) -> bool {
+        if self.is_empty() {
+            self.cursor = 0;
+            self.preferred_column = None;
+            return true;
+        }
+        let content_width = width.saturating_sub(2).max(1);
+        let visible_start = self.visible_wrapped_line_start(max_lines, width);
+        let target_row = visible_start.saturating_add(row);
+        let target_col = col.saturating_sub(2);
+        let image_width = self.image_width(!self.text.is_empty());
+        let mut visual_row = 0usize;
+        let mut line_start = 0usize;
+
+        for (logical_idx, line) in self.text.split('\n').enumerate() {
+            let line_len = line.chars().count();
+            let wrap_width = if logical_idx == 0 {
+                content_width.saturating_sub(image_width).max(1)
+            } else {
+                content_width
+            };
+            let line_visual_rows = wrapped_line_count(line, wrap_width);
+            if target_row < visual_row.saturating_add(line_visual_rows) {
+                let row_in_line = target_row.saturating_sub(visual_row);
+                let col_in_line = if logical_idx == 0 && row_in_line == 0 {
+                    target_col.saturating_sub(image_width)
+                } else {
+                    target_col
+                };
+                let line_col = row_in_line
+                    .saturating_mul(wrap_width)
+                    .saturating_add(col_in_line)
+                    .min(line_len);
+                self.cursor = line_start.saturating_add(line_col).min(self.input_len());
+                self.preferred_column = None;
+                return true;
+            }
+            visual_row = visual_row.saturating_add(line_visual_rows);
+            line_start = line_start.saturating_add(line_len).saturating_add(1);
+        }
+
+        self.cursor = self.input_len();
+        self.preferred_column = None;
+        true
+    }
+
     pub(crate) fn handle_key(&mut self, key: KeyEvent) -> bool {
         if !matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) {
             return false;
@@ -183,6 +235,20 @@ impl Composer {
         // the shell-style behavior users expect from word erase.
         if key_pressed(key, KeyCode::Backspace, KeyModifiers::ALT) {
             self.delete_backward_word();
+            return true;
+        }
+
+        if key_pressed(key, KeyCode::Left, KeyModifiers::ALT)
+            || key_pressed(key, KeyCode::Char('b'), KeyModifiers::ALT)
+        {
+            self.move_backward_word();
+            return true;
+        }
+
+        if key_pressed(key, KeyCode::Right, KeyModifiers::ALT)
+            || key_pressed(key, KeyCode::Char('f'), KeyModifiers::ALT)
+        {
+            self.move_forward_word();
             return true;
         }
 
@@ -502,6 +568,35 @@ impl Composer {
         self.preferred_column = None;
     }
 
+    fn move_backward_word(&mut self) {
+        if self.cursor == 0 {
+            return;
+        }
+        let chars = self.chars();
+        let mut cursor = self.cursor;
+        while cursor > 0 && chars[cursor - 1].is_whitespace() {
+            cursor -= 1;
+        }
+        while cursor > 0 && !chars[cursor - 1].is_whitespace() {
+            cursor -= 1;
+        }
+        self.cursor = cursor;
+        self.preferred_column = None;
+    }
+
+    fn move_forward_word(&mut self) {
+        let chars = self.chars();
+        let mut cursor = self.cursor.min(chars.len());
+        while cursor < chars.len() && chars[cursor].is_whitespace() {
+            cursor += 1;
+        }
+        while cursor < chars.len() && !chars[cursor].is_whitespace() {
+            cursor += 1;
+        }
+        self.cursor = cursor;
+        self.preferred_column = None;
+    }
+
     fn move_to_line_start(&mut self) {
         self.cursor = self.current_line_start();
         self.preferred_column = None;
@@ -794,6 +889,53 @@ mod tests {
         composer.set_input("alpha  ".to_string());
         assert!(composer.handle_key(KeyEvent::new(KeyCode::Backspace, KeyModifiers::META)));
         assert_eq!(composer.input(), "");
+    }
+
+    #[test]
+    fn alt_arrows_move_by_whitespace_delimited_words_across_lines() {
+        let mut composer = Composer::default();
+
+        composer.set_input("alpha beta\ngamma-delta epsilon".to_string());
+        assert!(composer.handle_key(KeyEvent::new(KeyCode::Left, KeyModifiers::ALT)));
+        assert_eq!(
+            composer.cursor(),
+            "alpha beta\ngamma-delta ".chars().count()
+        );
+        assert!(composer.handle_key(KeyEvent::new(KeyCode::Left, KeyModifiers::ALT)));
+        assert_eq!(composer.cursor(), "alpha beta\n".chars().count());
+        assert!(composer.handle_key(KeyEvent::new(KeyCode::Left, KeyModifiers::ALT)));
+        assert_eq!(composer.cursor(), "alpha ".chars().count());
+
+        assert!(composer.handle_key(KeyEvent::new(KeyCode::Right, KeyModifiers::ALT)));
+        assert_eq!(composer.cursor(), "alpha beta".chars().count());
+        assert!(composer.handle_key(KeyEvent::new(KeyCode::Right, KeyModifiers::ALT)));
+        assert_eq!(composer.cursor(), "alpha beta\ngamma-delta".chars().count());
+    }
+
+    #[test]
+    fn escape_word_keys_move_like_option_arrows() {
+        let mut composer = Composer::default();
+
+        composer.set_input("alpha beta gamma".to_string());
+        assert!(composer.handle_key(KeyEvent::new(KeyCode::Char('b'), KeyModifiers::ALT)));
+        assert_eq!(composer.cursor(), "alpha beta ".chars().count());
+        assert!(composer.handle_key(KeyEvent::new(KeyCode::Char('f'), KeyModifiers::ALT)));
+        assert_eq!(composer.cursor(), "alpha beta gamma".chars().count());
+    }
+
+    #[test]
+    fn click_position_maps_to_wrapped_multiline_cursor() {
+        let mut composer = Composer::default();
+        composer.set_input("first line\nsecond word\nthird".to_string());
+
+        assert!(composer.set_cursor_from_wrapped_position(4, 40, 1, 2 + "second ".chars().count()));
+        assert_eq!(composer.cursor(), "first line\nsecond ".chars().count());
+
+        assert!(composer.set_cursor_from_wrapped_position(4, 40, 2, 2 + "thi".chars().count()));
+        assert_eq!(
+            composer.cursor(),
+            "first line\nsecond word\nthi".chars().count()
+        );
     }
 
     #[test]

@@ -23,6 +23,7 @@ pulldown-cmark.workspace = true
 ratatui.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+signal-hook = "0.3.18"
 syntect.workspace = true
 tempfile.workspace = true
 two-face.workspace = true

@@ -18,6 +18,24 @@ is_working_rg() {
   esac
 }
 
+is_bootstrap_rg() {
+  candidate="$1"
+  if [ "$candidate" = "$self" ]; then
+    return 0
+  fi
+  case "$candidate" in
+    */browser-use-terminal-agent-tools-*/rg) return 0 ;;
+  esac
+  line_count=0
+  while IFS= read -r line && [ "$line_count" -lt 80 ]; do
+    case "$line" in
+      *'browser-use terminal could not find a working ripgrep executable'*) return 0 ;;
+    esac
+    line_count=$((line_count + 1))
+  done < "$candidate" 2>/dev/null || true
+  return 1
+}
+
 find_working_rg() {
   old_ifs="$IFS"
   IFS=:
@@ -26,7 +44,7 @@ find_working_rg() {
       dir=.
     fi
     candidate="$dir/rg"
-    if [ "$candidate" = "$self" ]; then
+    if is_bootstrap_rg "$candidate"; then
       continue
     fi
     if [ -x "$candidate" ] && is_working_rg "$candidate"; then
@@ -39,14 +57,14 @@ find_working_rg() {
 
   if [ -n "${HOME:-}" ]; then
     candidate="$HOME/.cargo/bin/rg"
-    if [ -x "$candidate" ] && [ "$candidate" != "$self" ] && is_working_rg "$candidate"; then
+    if [ -x "$candidate" ] && ! is_bootstrap_rg "$candidate" && is_working_rg "$candidate"; then
       printf '%s\n' "$candidate"
       return 0
     fi
   fi
 
   for candidate in /opt/homebrew/bin/rg /usr/local/bin/rg /usr/bin/rg /bin/rg; do
-    if [ -x "$candidate" ] && [ "$candidate" != "$self" ] && is_working_rg "$candidate"; then
+    if [ -x "$candidate" ] && ! is_bootstrap_rg "$candidate" && is_working_rg "$candidate"; then
       printf '%s\n' "$candidate"
       return 0
     fi
@@ -211,13 +229,17 @@ mod tests {
     fn rg_bootstrap_skips_broken_launcher_and_execs_working_ripgrep() {
         let tmp = TempDir::new().expect("tmp");
         let wrapper_dir = tmp.path().join("wrapper");
+        let second_wrapper_dir = tmp.path().join("second-wrapper");
         let broken_dir = tmp.path().join("broken");
         let real_dir = tmp.path().join("real");
         std::fs::create_dir_all(&wrapper_dir).expect("wrapper dir");
+        std::fs::create_dir_all(&second_wrapper_dir).expect("second wrapper dir");
         std::fs::create_dir_all(&broken_dir).expect("broken dir");
         std::fs::create_dir_all(&real_dir).expect("real dir");
 
         write_rg_bootstrap_wrapper(&wrapper_dir.join("rg")).expect("write rg wrapper");
+        write_rg_bootstrap_wrapper(&second_wrapper_dir.join("rg"))
+            .expect("write second rg wrapper");
         write_executable(
             &broken_dir.join("rg"),
             "#!/bin/sh\nprintf 'env: dotslash: No such file or directory\\n' >&2\nexit 127\n",
@@ -227,7 +249,8 @@ mod tests {
             "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then printf 'ripgrep 99.0.0\\n'; exit 0; fi\nif [ \"$1\" = \"--files\" ]; then printf 'file.txt\\n'; exit 0; fi\nprintf 'fake rg %s\\n' \"$*\"\n",
         );
 
-        let path = std::env::join_paths([wrapper_dir, broken_dir, real_dir]).expect("join path");
+        let path = std::env::join_paths([wrapper_dir, second_wrapper_dir, broken_dir, real_dir])
+            .expect("join path");
         let output = Command::new("/bin/sh")
             .arg("-c")
             .arg("command -v rg && rg --version && rg --files")
