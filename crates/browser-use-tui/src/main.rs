@@ -6121,7 +6121,10 @@ impl TerminalDriver {
         if desired_height == current_height {
             return Ok(current_height);
         }
-        reset_terminal_screen(self.terminal.backend_mut(), ClearType::Purge)?;
+        // ClearType::All wipes the visible viewport without touching the
+        // host terminal's scrollback, so the user's scroll position is
+        // preserved across composer height changes (Purge would clobber it).
+        reset_terminal_screen(self.terminal.backend_mut(), ClearType::All)?;
         self.terminal = new_inline_terminal(desired_height)?;
         app.native_history.reset();
         self.manual_modal_overlay_rect = None;
@@ -6433,7 +6436,10 @@ fn handle_terminal_event(
 fn reset_inline_terminal_after_resize(
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
 ) -> Result<()> {
-    reset_terminal_screen(terminal.backend_mut(), ClearType::Purge)?;
+    // ClearType::All clears the visible screen but preserves the host
+    // terminal's scrollback, so the user's scroll position survives a
+    // real terminal resize. The terminal emulator reflows scrollback itself.
+    reset_terminal_screen(terminal.backend_mut(), ClearType::All)?;
     reset_inline_viewport_origin(terminal)?;
     terminal.autoresize()?;
     terminal.clear()?;
