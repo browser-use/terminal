@@ -2128,6 +2128,7 @@ pub struct AnthropicMessagesProvider {
     oauth_refresh: Option<ClaudeCodeOAuthRefresh>,
     model: String,
     base_url: String,
+    provider_name: String,
     instructions: String,
     client: reqwest::blocking::Client,
     request_retry: ProviderRequestRetryConfig,
@@ -2329,6 +2330,7 @@ impl AnthropicMessagesProvider {
             oauth_refresh: None,
             model: model.into(),
             base_url: base_url.into().trim_end_matches('/').to_string(),
+            provider_name: "anthropic".to_string(),
             instructions: default_instructions(),
             client: reqwest::blocking::Client::new(),
             request_retry: ProviderRequestRetryConfig::default(),
@@ -2360,6 +2362,14 @@ impl AnthropicMessagesProvider {
 
     pub fn with_instructions(mut self, instructions: impl Into<String>) -> Self {
         self.instructions = instructions.into();
+        self
+    }
+
+    pub fn with_provider_name(mut self, provider_name: impl Into<String>) -> Self {
+        let provider_name = provider_name.into();
+        if !provider_name.trim().is_empty() {
+            self.provider_name = provider_name;
+        }
         self
     }
 
@@ -2464,7 +2474,7 @@ impl AnthropicMessagesProvider {
 
 impl ModelProvider for AnthropicMessagesProvider {
     fn provider_name(&self) -> &str {
-        "anthropic"
+        &self.provider_name
     }
 
     fn model_name(&self) -> &str {
@@ -10057,7 +10067,44 @@ mod tests {
                 "gpt-5.4-mini",
                 "gpt-5.3-codex",
                 "gpt-5.2",
-                "codex-auto-review"
+                "codex-auto-review",
+                "glm-5",
+                "glm-5.1",
+                "kimi-k2.5",
+                "kimi-k2.6",
+                "mimo-v2.5",
+                "mimo-v2.5-pro",
+                "minimax-m2.5",
+                "minimax-m2.7",
+                "qwen3.6-plus",
+                "qwen3.7-max",
+                "deepseek-v4-pro",
+                "deepseek-v4-flash",
+                "big-pickle",
+                "deepseek-v4-flash-free",
+                "mimo-v2.5-free",
+                "mimo-v2-pro-free",
+                "nemotron-3-super-free",
+                "gpt-5.5-pro",
+                "gpt-5.4-pro",
+                "gpt-5.4-nano",
+                "gpt-5.3-codex-spark",
+                "gpt-5.1",
+                "gpt-5",
+                "gpt-5-nano",
+                "claude-opus-4-8",
+                "claude-opus-4-7",
+                "claude-opus-4-6",
+                "claude-opus-4-5",
+                "claude-opus-4-1",
+                "claude-sonnet-4-6",
+                "claude-sonnet-4-5",
+                "claude-haiku-4-5",
+                "gemini-3.5-flash",
+                "gemini-3.1-pro",
+                "gemini-3-flash",
+                "qwen3.5-plus",
+                "grok-build-0.1"
             ]
         );
 
@@ -10363,6 +10410,18 @@ mod tests {
             .to_ascii_lowercase()
             .contains("\r\nx-provider-test: yes\r\n"));
         Ok(())
+    }
+
+    #[test]
+    fn anthropic_messages_provider_can_override_provider_name() {
+        let provider = AnthropicMessagesProvider::with_base_url(
+            "test-key",
+            "claude-sonnet-4-6",
+            "http://localhost",
+        )
+        .with_provider_name("opencode");
+
+        assert_eq!(provider.provider_name(), "opencode");
     }
 
     #[test]

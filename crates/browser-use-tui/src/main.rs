@@ -84,8 +84,8 @@ use settings::{
     display_model_for_provider_model, fallback_model_choices, is_claude_code_account,
     model_choices_for_catalog, provider_model_for_display, AgentBackend, ModelChoice,
     ACCOUNT_ANTHROPIC, ACCOUNT_CHOICES, ACCOUNT_CODEX, ACCOUNT_DEEPSEEK, ACCOUNT_OPENAI,
-    ACCOUNT_OPENROUTER, BROWSER_CHOICES, BROWSER_LOCAL_CHROME, BROWSER_USE_CLOUD,
-    BROWSER_USE_CLOUD_API_KEY_SETTING,
+    ACCOUNT_OPENCODE, ACCOUNT_OPENCODE_GO, ACCOUNT_OPENROUTER, BROWSER_CHOICES,
+    BROWSER_LOCAL_CHROME, BROWSER_USE_CLOUD, BROWSER_USE_CLOUD_API_KEY_SETTING,
 };
 
 const DOUBLE_ESCAPE_STOP_WINDOW: Duration = Duration::from_millis(1500);
@@ -5014,6 +5014,13 @@ impl App {
                 "auth.deepseek.api_key",
                 &["LLM_BROWSER_DEEPSEEK_API_KEY", "DEEPSEEK_API_KEY"],
             )?,
+            ACCOUNT_OPENCODE => self.has_stored_or_env(
+                "auth.opencode.api_key",
+                &["OPENCODE_API_KEY", "OPENCODE_ZEN_API_KEY"],
+            )?,
+            ACCOUNT_OPENCODE_GO => {
+                self.has_stored_or_env("auth.opencode_go.api_key", &["OPENCODE_GO_API_KEY"])?
+            }
             ACCOUNT_ANTHROPIC => self.has_stored_or_env(
                 "auth.anthropic.api_key",
                 &["LLM_BROWSER_ANTHROPIC_API_KEY", "ANTHROPIC_API_KEY"],
@@ -5058,6 +5065,26 @@ impl App {
                 )? =>
             {
                 Some("DeepSeek API key is missing. Authenticate here before retrying.".to_string())
+            }
+            AgentBackend::Opencode
+                if !self.has_stored_or_env(
+                    "auth.opencode.api_key",
+                    &["OPENCODE_API_KEY", "OPENCODE_ZEN_API_KEY"],
+                )? =>
+            {
+                Some(
+                    "OpenCode Zen API key is missing. Authenticate here before retrying."
+                        .to_string(),
+                )
+            }
+            AgentBackend::OpencodeGo
+                if !self
+                    .has_stored_or_env("auth.opencode_go.api_key", &["OPENCODE_GO_API_KEY"])? =>
+            {
+                Some(
+                    "OpenCode Go API key is missing. Authenticate here before retrying."
+                        .to_string(),
+                )
             }
             AgentBackend::Codex if !self.has_codex_login()? => {
                 Some("Codex login is missing. Select Codex login to sign in.".to_string())
@@ -5232,6 +5259,8 @@ fn auth_setting_key(account: &str) -> &'static str {
         ACCOUNT_OPENAI => "auth.openai.api_key",
         ACCOUNT_OPENROUTER => "auth.openrouter.api_key",
         ACCOUNT_DEEPSEEK => "auth.deepseek.api_key",
+        ACCOUNT_OPENCODE => "auth.opencode.api_key",
+        ACCOUNT_OPENCODE_GO => "auth.opencode_go.api_key",
         ACCOUNT_ANTHROPIC => "auth.anthropic.api_key",
         BROWSER_USE_CLOUD => BROWSER_USE_CLOUD_API_KEY_SETTING,
         account if is_claude_code_account(account) => "auth.claude_code.access_token",
@@ -5244,6 +5273,8 @@ fn auth_secret_label(account: &str) -> &'static str {
         ACCOUNT_OPENAI => "OpenAI API key",
         ACCOUNT_OPENROUTER => "OpenRouter API key",
         ACCOUNT_DEEPSEEK => "DeepSeek API key",
+        ACCOUNT_OPENCODE => "OpenCode Zen API key",
+        ACCOUNT_OPENCODE_GO => "OpenCode Go API key",
         ACCOUNT_ANTHROPIC => "Anthropic API key",
         BROWSER_USE_CLOUD => "Browser Use cloud key",
         account if is_claude_code_account(account) => "Claude Code OAuth token",
@@ -5257,6 +5288,8 @@ fn account_kind(account: &str) -> &'static str {
         ACCOUNT_OPENAI => "openai",
         ACCOUNT_OPENROUTER => "openrouter",
         ACCOUNT_DEEPSEEK => "deepseek",
+        ACCOUNT_OPENCODE => "opencode",
+        ACCOUNT_OPENCODE_GO => "opencode_go",
         ACCOUNT_ANTHROPIC => "anthropic",
         BROWSER_USE_CLOUD => "browser_use_cloud",
         account if is_claude_code_account(account) => "claude_code",

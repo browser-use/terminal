@@ -118,6 +118,16 @@ enum Command {
         #[arg(long, default_value = "deepseek-v4-pro")]
         model: String,
     },
+    RunOpencode {
+        text: String,
+        #[arg(long, default_value = "gpt-5.5")]
+        model: String,
+    },
+    RunOpencodeGo {
+        text: String,
+        #[arg(long, default_value = "kimi-k2.6")]
+        model: String,
+    },
     RunOpenaiSession {
         task_id: String,
         #[arg(long)]
@@ -141,6 +151,16 @@ enum Command {
     RunDeepseekSession {
         task_id: String,
         #[arg(long, default_value = "deepseek-v4-pro")]
+        model: String,
+    },
+    RunOpencodeSession {
+        task_id: String,
+        #[arg(long, default_value = "gpt-5.5")]
+        model: String,
+    },
+    RunOpencodeGoSession {
+        task_id: String,
+        #[arg(long, default_value = "kimi-k2.6")]
         model: String,
     },
     Followup {
@@ -488,6 +508,8 @@ enum AuthAccount {
     Anthropic,
     Openrouter,
     Deepseek,
+    Opencode,
+    OpencodeGo,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -644,6 +666,24 @@ fn main() -> Result<()> {
             &config_overrides,
             collaboration_mode,
         ),
+        Command::RunOpencode { text, model } => run_opencode(
+            &store,
+            text,
+            model,
+            config_profile.as_deref(),
+            &config_overrides,
+            collaboration_mode,
+            ProviderBackend::Opencode,
+        ),
+        Command::RunOpencodeGo { text, model } => run_opencode(
+            &store,
+            text,
+            model,
+            config_profile.as_deref(),
+            &config_overrides,
+            collaboration_mode,
+            ProviderBackend::OpencodeGo,
+        ),
         Command::RunOpenaiSession { task_id, model } => run_openai_session(
             &store,
             &task_id,
@@ -683,6 +723,24 @@ fn main() -> Result<()> {
             config_profile.as_deref(),
             &config_overrides,
             collaboration_mode,
+        ),
+        Command::RunOpencodeSession { task_id, model } => run_opencode_session(
+            &store,
+            &task_id,
+            model,
+            config_profile.as_deref(),
+            &config_overrides,
+            collaboration_mode,
+            ProviderBackend::Opencode,
+        ),
+        Command::RunOpencodeGoSession { task_id, model } => run_opencode_session(
+            &store,
+            &task_id,
+            model,
+            config_profile.as_deref(),
+            &config_overrides,
+            collaboration_mode,
+            ProviderBackend::OpencodeGo,
         ),
         Command::Followup { task_id, text } => followup(&store, &task_id, text),
         Command::Finish { task_id, result } => finish(&store, &task_id, result),
@@ -937,11 +995,15 @@ fn command_name(command: &Command) -> &'static str {
         Command::RunAnthropic { .. } => "run_anthropic",
         Command::RunOpenrouter { .. } => "run_openrouter",
         Command::RunDeepseek { .. } => "run_deepseek",
+        Command::RunOpencode { .. } => "run_opencode",
+        Command::RunOpencodeGo { .. } => "run_opencode_go",
         Command::RunOpenaiSession { .. } => "run_openai_session",
         Command::RunCodexSession { .. } => "run_codex_session",
         Command::RunAnthropicSession { .. } => "run_anthropic_session",
         Command::RunOpenrouterSession { .. } => "run_openrouter_session",
         Command::RunDeepseekSession { .. } => "run_deepseek_session",
+        Command::RunOpencodeSession { .. } => "run_opencode_session",
+        Command::RunOpencodeGoSession { .. } => "run_opencode_go_session",
         Command::Followup { .. } => "followup",
         Command::Finish { .. } => "finish",
         Command::Fail { .. } => "fail",
@@ -1314,6 +1376,8 @@ fn default_cli_model_for_backend_with_overrides(
         ProviderBackend::Anthropic => Ok("claude-sonnet-4-6".to_string()),
         ProviderBackend::Openrouter => Ok("openai/gpt-5.5".to_string()),
         ProviderBackend::Deepseek => Ok("deepseek-v4-pro".to_string()),
+        ProviderBackend::Opencode => Ok("gpt-5.5".to_string()),
+        ProviderBackend::OpencodeGo => Ok("kimi-k2.6".to_string()),
         ProviderBackend::Fake | ProviderBackend::None => Ok("fake".to_string()),
     }
 }
@@ -1325,6 +1389,8 @@ fn default_provider_id_for_backend(backend: ProviderBackend) -> &'static str {
         ProviderBackend::Anthropic => "anthropic",
         ProviderBackend::Openrouter => "openrouter",
         ProviderBackend::Deepseek => "deepseek",
+        ProviderBackend::Opencode => "opencode",
+        ProviderBackend::OpencodeGo => "opencode-go",
         ProviderBackend::Fake => "fake",
         ProviderBackend::None => "none",
     }
@@ -1468,6 +1534,23 @@ fn run_deepseek(
     Ok(())
 }
 
+fn run_opencode(
+    store: &Store,
+    text: String,
+    model: String,
+    config_profile: Option<&str>,
+    raw_config_overrides: &[String],
+    collaboration_mode: CollaborationModeKind,
+    backend: ProviderBackend,
+) -> Result<()> {
+    let config = ProviderRunConfig::new(backend, model).with_options(cli_agent_options(
+        config_profile,
+        raw_config_overrides,
+        collaboration_mode,
+    )?);
+    run_new_session_from_config(store, text, config)
+}
+
 fn run_openai_session(
     store: &Store,
     task_id: &str,
@@ -1568,6 +1651,26 @@ fn run_deepseek_session(
     let config = ProviderRunConfig::new(ProviderBackend::Deepseek, model).with_options(
         cli_agent_options(config_profile, raw_config_overrides, collaboration_mode)?,
     );
+    let session_id = run_existing_session_from_config_and_notify(store, task_id, config)?;
+    println!("{session_id}");
+    Ok(())
+}
+
+fn run_opencode_session(
+    store: &Store,
+    task_id: &str,
+    model: String,
+    config_profile: Option<&str>,
+    raw_config_overrides: &[String],
+    collaboration_mode: CollaborationModeKind,
+    backend: ProviderBackend,
+) -> Result<()> {
+    ensure_task_exists(store, task_id)?;
+    let config = ProviderRunConfig::new(backend, model).with_options(cli_agent_options(
+        config_profile,
+        raw_config_overrides,
+        collaboration_mode,
+    )?);
     let session_id = run_existing_session_from_config_and_notify(store, task_id, config)?;
     println!("{session_id}");
     Ok(())
@@ -2029,6 +2132,18 @@ fn auth(store: &Store, command: AuthCommand) -> Result<()> {
                 "auth.deepseek.api_key",
                 &["LLM_BROWSER_DEEPSEEK_API_KEY", "DEEPSEEK_API_KEY"],
             )?;
+            print_api_key_status(
+                store,
+                "OpenCode Zen API key",
+                "auth.opencode.api_key",
+                &["OPENCODE_API_KEY", "OPENCODE_ZEN_API_KEY"],
+            )?;
+            print_api_key_status(
+                store,
+                "OpenCode Go API key",
+                "auth.opencode_go.api_key",
+                &["OPENCODE_GO_API_KEY"],
+            )?;
             print_claude_code_status(store)?;
             Ok(())
         }
@@ -2117,7 +2232,9 @@ fn auth_login(
         AuthAccount::Openai
         | AuthAccount::Anthropic
         | AuthAccount::Openrouter
-        | AuthAccount::Deepseek => {
+        | AuthAccount::Deepseek
+        | AuthAccount::Opencode
+        | AuthAccount::OpencodeGo => {
             let api_key =
                 read_required_secret(api_key, &format!("{} API key", auth_account_label(account)))?;
             let key = api_key_setting(account).context("account does not use an API key")?;
@@ -2174,7 +2291,9 @@ fn auth_logout(store: &Store, account: AuthAccount) -> Result<()> {
         AuthAccount::Openai
         | AuthAccount::Anthropic
         | AuthAccount::Openrouter
-        | AuthAccount::Deepseek => {
+        | AuthAccount::Deepseek
+        | AuthAccount::Opencode
+        | AuthAccount::OpencodeGo => {
             if let Some(key) = api_key_setting(account) {
                 store.delete_setting(key)?;
             }
@@ -2680,6 +2799,8 @@ fn api_key_setting(account: AuthAccount) -> Option<&'static str> {
         AuthAccount::Anthropic => Some("auth.anthropic.api_key"),
         AuthAccount::Openrouter => Some("auth.openrouter.api_key"),
         AuthAccount::Deepseek => Some("auth.deepseek.api_key"),
+        AuthAccount::Opencode => Some("auth.opencode.api_key"),
+        AuthAccount::OpencodeGo => Some("auth.opencode_go.api_key"),
         AuthAccount::BrowserUseCloud => Some(BROWSER_USE_CLOUD_API_KEY_SETTING),
         AuthAccount::Codex | AuthAccount::ClaudeCode => None,
     }
@@ -2694,6 +2815,8 @@ fn auth_account_label(account: AuthAccount) -> &'static str {
         AuthAccount::Anthropic => "Anthropic API key",
         AuthAccount::Openrouter => "OpenRouter API key",
         AuthAccount::Deepseek => "DeepSeek API key",
+        AuthAccount::Opencode => "OpenCode Zen API key",
+        AuthAccount::OpencodeGo => "OpenCode Go API key",
     }
 }
 

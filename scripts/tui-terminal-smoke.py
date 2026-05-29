@@ -704,7 +704,8 @@ def smoke_double_escape_opens_message_selector(binary: Path) -> None:
         assert_no_legacy_dashboard_chrome(armed, "first escape should not restore old dashboard chrome")
         tmux_send(session, "Escape")
         selector = wait_for(session, "Messages", "double-escape-messages")
-        assert_contains(selector, "run", "message selector should show the submitted prompt")
+        assert_contains(selector, "start", "message selector should show the submitted prompt label")
+        assert_contains(selector, "Hacker News", "message selector should show the submitted prompt text")
         assert_contains(
             selector,
             "Edit submitted prompts or cancel queued follow-ups",
@@ -961,12 +962,11 @@ def smoke_streaming_transcript_scrolls_above_composer(binary: Path) -> None:
             "session.done",
             {"result": long_stream},
         )
-        time.sleep(0.5)
-        done_full = capture(session, "transcript-scroll-done-full")
-        assert_contains(
-            done_full,
+        done_full = wait_for(
+            session,
             "Model `gpt-5.5` is not in the active model catalog",
-            "final committed answer should preserve deferred startup warnings",
+            "transcript-scroll-done-full",
+            timeout=10.0
         )
         assert_count(
             done_full,

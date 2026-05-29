@@ -361,6 +361,8 @@ pub enum ProviderBackend {
     Anthropic,
     Openrouter,
     Deepseek,
+    Opencode,
+    OpencodeGo,
     Fake,
     None,
 }
@@ -1863,6 +1865,20 @@ pub fn run_existing_session_from_config(
             let provider = deepseek_provider(store, config.model)?;
             run_existing_session_with_provider(store, &provider, session_id, config.options)
         }
+        ProviderBackend::Opencode => run_opencode_session(
+            store,
+            session_id,
+            config.model,
+            config.options,
+            OpencodePlan::Zen,
+        ),
+        ProviderBackend::OpencodeGo => run_opencode_session(
+            store,
+            session_id,
+            config.model,
+            config.options,
+            OpencodePlan::Go,
+        ),
         ProviderBackend::Fake => {
             let provider = FakeProvider::with_text(
                 config
@@ -1883,6 +1899,8 @@ fn provider_backend_kind(backend: ProviderBackend) -> &'static str {
         ProviderBackend::Anthropic => "anthropic",
         ProviderBackend::Openrouter => "openrouter",
         ProviderBackend::Deepseek => "deepseek",
+        ProviderBackend::Opencode => "opencode",
+        ProviderBackend::OpencodeGo => "opencode-go",
         ProviderBackend::Fake => "fake",
         ProviderBackend::None => "none",
     }
@@ -2650,6 +2668,126 @@ fn deepseek_provider(store: &Store, model: String) -> Result<OpenAICompatibleCha
     Ok(OpenAICompatibleChatProvider::deepseek(
         api_key, model, base_url,
     ))
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum OpencodePlan {
+    Zen,
+    Go,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum OpencodeWireApi {
+    Responses,
+    Messages,
+    Chat,
+}
+
+fn run_opencode_session(
+    store: &Store,
+    session_id: &str,
+    model: String,
+    options: AgentRunOptions,
+    plan: OpencodePlan,
+) -> Result<String> {
+    let api_key = opencode_api_key(store, plan)?;
+    let base_url = opencode_base_url(store, plan)?;
+    let model = normalize_opencode_model(&model, plan);
+    match opencode_wire_api_for_model(&model, plan) {
+        OpencodeWireApi::Responses => {
+            let provider = OpenAIResponsesProvider::with_base_url(api_key, model, base_url)
+                .with_provider_name(opencode_provider_name(plan));
+            run_existing_session_with_provider(store, &provider, session_id, options)
+        }
+        OpencodeWireApi::Messages => {
+            let provider = AnthropicMessagesProvider::with_base_url(api_key, model, base_url)
+                .with_provider_name(opencode_provider_name(plan));
+            run_existing_session_with_provider(store, &provider, session_id, options)
+        }
+        OpencodeWireApi::Chat => {
+            let provider = OpenAICompatibleChatProvider::with_base_url(api_key, model, base_url)
+                .with_provider_name(opencode_provider_name(plan));
+            run_existing_session_with_provider(store, &provider, session_id, options)
+        }
+    }
+}
+
+fn opencode_api_key(store: &Store, plan: OpencodePlan) -> Result<String> {
+    let (setting, env) = match plan {
+        OpencodePlan::Zen => (
+            "auth.opencode.api_key",
+            &["OPENCODE_API_KEY", "OPENCODE_ZEN_API_KEY"][..],
+        ),
+        OpencodePlan::Go => ("auth.opencode_go.api_key", &["OPENCODE_GO_API_KEY"][..]),
+    };
+    stored_or_env(store, setting, env)?.with_context(|| {
+        format!(
+            "run `auth login {}` --api-key ... or set {}",
+            opencode_provider_name(plan),
+            env[0]
+        )
+    })
+}
+
+fn opencode_base_url(store: &Store, plan: OpencodePlan) -> Result<String> {
+    match plan {
+        OpencodePlan::Zen => setting_or_env_or_default(
+            store,
+            "auth.opencode.base_url",
+            &["OPENCODE_BASE_URL", "OPENCODE_ZEN_BASE_URL"],
+            "https://opencode.ai/zen/v1",
+        ),
+        OpencodePlan::Go => setting_or_env_or_default(
+            store,
+            "auth.opencode_go.base_url",
+            &["OPENCODE_GO_BASE_URL"],
+            "https://opencode.ai/zen/go/v1",
+        ),
+    }
+}
+
+fn opencode_provider_name(plan: OpencodePlan) -> &'static str {
+    match plan {
+        OpencodePlan::Zen => "opencode",
+        OpencodePlan::Go => "opencode-go",
+    }
+}
+
+fn normalize_opencode_model(model: &str, plan: OpencodePlan) -> String {
+    let trimmed = model.trim();
+    let prefix = match plan {
+        OpencodePlan::Zen => "opencode/",
+        OpencodePlan::Go => "opencode-go/",
+    };
+    trimmed
+        .strip_prefix(prefix)
+        .unwrap_or(trimmed)
+        .trim()
+        .to_string()
+}
+
+fn opencode_wire_api_for_model(model: &str, plan: OpencodePlan) -> OpencodeWireApi {
+    let normalized = model.trim().to_ascii_lowercase();
+    match plan {
+        OpencodePlan::Zen => {
+            if normalized.starts_with("gpt-") || normalized.contains("-codex") {
+                OpencodeWireApi::Responses
+            } else if normalized.starts_with("claude-")
+                || matches!(normalized.as_str(), "qwen3.6-plus" | "qwen3.5-plus")
+            {
+                OpencodeWireApi::Messages
+            } else {
+                OpencodeWireApi::Chat
+            }
+        }
+        OpencodePlan::Go => {
+            if matches!(normalized.as_str(), "minimax-m2.7" | "minimax-m2.5") {
+                OpencodeWireApi::Messages
+            } else {
+                OpencodeWireApi::Chat
+            }
+        }
+    }
 }
 
 fn stored_codex_auth(store: &Store) -> Result<Option<CodexAuth>> {
@@ -26479,6 +26617,66 @@ mod tests {
     use browser_use_protocol::SessionStatus;
 
     static BROWSER_USE_TERMINAL_HOME_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    #[test]
+    fn opencode_model_prefixes_are_normalized_per_plan() {
+        assert_eq!(
+            normalize_opencode_model("opencode/gpt-5.5", OpencodePlan::Zen),
+            "gpt-5.5"
+        );
+        assert_eq!(
+            normalize_opencode_model("opencode-go/kimi-k2.6", OpencodePlan::Go),
+            "kimi-k2.6"
+        );
+        assert_eq!(
+            normalize_opencode_model("opencode-go/kimi-k2.6", OpencodePlan::Zen),
+            "opencode-go/kimi-k2.6"
+        );
+    }
+
+    #[test]
+    fn opencode_zen_routes_models_to_documented_endpoint_families() {
+        assert_eq!(
+            opencode_wire_api_for_model("gpt-5.5", OpencodePlan::Zen),
+            OpencodeWireApi::Responses
+        );
+        assert_eq!(
+            opencode_wire_api_for_model("gpt-5.3-codex", OpencodePlan::Zen),
+            OpencodeWireApi::Responses
+        );
+        assert_eq!(
+            opencode_wire_api_for_model("claude-sonnet-4-6", OpencodePlan::Zen),
+            OpencodeWireApi::Messages
+        );
+        assert_eq!(
+            opencode_wire_api_for_model("qwen3.6-plus", OpencodePlan::Zen),
+            OpencodeWireApi::Messages
+        );
+        assert_eq!(
+            opencode_wire_api_for_model("kimi-k2.5", OpencodePlan::Zen),
+            OpencodeWireApi::Chat
+        );
+    }
+
+    #[test]
+    fn opencode_go_routes_models_to_documented_endpoint_families() {
+        assert_eq!(
+            opencode_wire_api_for_model("minimax-m2.7", OpencodePlan::Go),
+            OpencodeWireApi::Messages
+        );
+        assert_eq!(
+            opencode_wire_api_for_model("minimax-m2.5", OpencodePlan::Go),
+            OpencodeWireApi::Messages
+        );
+        assert_eq!(
+            opencode_wire_api_for_model("kimi-k2.6", OpencodePlan::Go),
+            OpencodeWireApi::Chat
+        );
+        assert_eq!(
+            opencode_wire_api_for_model("deepseek-v4-pro", OpencodePlan::Go),
+            OpencodeWireApi::Chat
+        );
+    }
 
     fn test_hook_command_config(command: &str) -> HookCommandConfig {
         HookCommandConfig {

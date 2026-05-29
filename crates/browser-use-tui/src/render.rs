@@ -16,7 +16,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use crate::palette;
 use crate::settings::{
     is_claude_code_account, ModelChoiceGroup, ACCOUNT_ANTHROPIC, ACCOUNT_CHOICES, ACCOUNT_CODEX,
-    ACCOUNT_DEEPSEEK, ACCOUNT_OPENAI, ACCOUNT_OPENROUTER, BROWSER_CHOICES, BROWSER_USE_CLOUD,
+    ACCOUNT_DEEPSEEK, ACCOUNT_OPENAI, ACCOUNT_OPENCODE, ACCOUNT_OPENCODE_GO, ACCOUNT_OPENROUTER,
+    BROWSER_CHOICES, BROWSER_USE_CLOUD,
 };
 use crate::theme::*;
 use crate::transcript;
@@ -1812,6 +1813,16 @@ fn setup_confirm_lines(app: &App) -> Vec<Line<'static>> {
                 Line::from("  No API key or second terminal is required."),
             ]);
         }
+    } else if account == ACCOUNT_OPENCODE_GO {
+        lines.extend([
+            Line::from("  Uses your OpenCode Go subscription API key."),
+            Line::from("  Provides low-cost open coding models."),
+        ]);
+    } else if account == ACCOUNT_OPENCODE {
+        lines.extend([
+            Line::from("  Uses your OpenCode Zen API key."),
+            Line::from("  Provides OpenCode curated model gateway access."),
+        ]);
     } else {
         lines.extend([
             Line::from("  Your key will be entered in the API key modal."),
@@ -2094,6 +2105,12 @@ fn model_lines(app: &App, height: usize) -> Vec<Line<'static>> {
         Line::from(Span::styled("bring your own key", muted())),
     ));
     row_idx = push_model_group_lines(&mut lines, app, ModelChoiceGroup::BringYourOwnKey, row_idx);
+    lines.push((None, Line::from("")));
+    lines.push((None, Line::from(Span::styled("opencode go", muted()))));
+    row_idx = push_model_group_lines(&mut lines, app, ModelChoiceGroup::OpenCodeGo, row_idx);
+    lines.push((None, Line::from("")));
+    lines.push((None, Line::from(Span::styled("opencode zen", muted()))));
+    row_idx = push_model_group_lines(&mut lines, app, ModelChoiceGroup::OpenCode, row_idx);
     lines.push((None, Line::from("")));
     lines.push((None, Line::from(Span::styled("openrouter", muted()))));
     row_idx = push_model_group_lines(&mut lines, app, ModelChoiceGroup::OpenRouter, row_idx);
@@ -2794,6 +2811,8 @@ fn auth_secret_label(account: &str) -> &'static str {
         ACCOUNT_OPENAI => "OpenAI API key",
         ACCOUNT_OPENROUTER => "OpenRouter API key",
         ACCOUNT_DEEPSEEK => "DeepSeek API key",
+        ACCOUNT_OPENCODE => "OpenCode Zen API key",
+        ACCOUNT_OPENCODE_GO => "OpenCode Go API key",
         ACCOUNT_ANTHROPIC => "Anthropic API key",
         BROWSER_USE_CLOUD => "Browser Use cloud key",
         account if is_claude_code_account(account) => "Claude Code OAuth token",
@@ -2805,6 +2824,10 @@ fn failure_actions(error: &str) -> (&'static str, &'static str) {
     let lower = error.to_ascii_lowercase();
     if lower.contains("openrouter") {
         ("Authenticate with OpenRouter", "Choose a different model")
+    } else if lower.contains("opencode go") || lower.contains("opencode-go") {
+        ("Authenticate with OpenCode Go", "Choose a different model")
+    } else if lower.contains("opencode") {
+        ("Authenticate with OpenCode Zen", "Choose a different model")
     } else if lower.contains("deepseek") {
         ("Authenticate with DeepSeek", "Choose a different model")
     } else if lower.contains("openai") {
