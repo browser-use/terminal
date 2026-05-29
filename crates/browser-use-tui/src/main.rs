@@ -103,6 +103,7 @@ const RESIZE_DEBOUNCE_INTERVAL: Duration = Duration::from_millis(80);
 const ANIM_TICK_INTERVAL: Duration = Duration::from_millis(16); // ~60 fps
 const LIVE_SPINNER_TICK_INTERVAL: Duration = Duration::from_millis(120);
 const REEXEC_BINARY_ENV: &str = "BUT_REEXEC_BINARY";
+const REEXEC_SESSION_ENV: &str = "BUT_REEXEC_SESSION_ID";
 const CODEX_DEVICE_AUTH_URL: &str = "https://auth.openai.com/codex/device";
 const COLLABORATION_MODE_SETTING: &str = "collaboration.mode";
 const REQUEST_USER_INPUT_REQUEST_EVENT: &str = "request_user_input.requested";
@@ -631,6 +632,10 @@ struct App {
     /// Filter text shown inside the palette popup. Edited by typing while the
     /// palette is open; cleared whenever the palette is opened or closed.
     palette_filter: String,
+    /// Substring filter applied to the History surface task list. Edited by
+    /// typing while the History popup is open and cleared whenever the surface
+    /// opens or closes. Empty string means "show everything".
+    history_filter: String,
 }
 
 #[derive(Debug)]
@@ -1658,14 +1663,36 @@ impl App {
         let store = Store::open_with_notifier(&args.state_dir, store_tx)?;
         seed_demo_if_requested(&store, args.seed_demo.as_deref())?;
         let state_cache = AppStateCache::hydrate(&store, &args.browser)?;
-        let selected_session_id = if args.select_latest {
+        // /reload sets BUT_REEXEC_SESSION_ID in the re-execed process's env so
+        // the new UI resumes whatever session the user had open, instead of
+        // starting fresh. Consume the var here so nested /reloads don't
+        // accidentally pin the wrong session forever.
+        let reexec_session_id = std::env::var(REEXEC_SESSION_ENV)
+            .ok()
+            .filter(|value| !value.is_empty());
+        let resumed_from_reexec = reexec_session_id.is_some();
+        if resumed_from_reexec {
+            std::env::remove_var(REEXEC_SESSION_ENV);
+        }
+        // Only honour the env var if the named session actually exists in the
+        // store — a stale id would silently drop the user on the welcome
+        // surface and look like resume is broken.
+        let reexec_session_id = reexec_session_id.filter(|id| {
             state_cache
                 .sessions
-                .first()
-                .map(|session| session.id.clone())
-        } else {
-            None
-        };
+                .iter()
+                .any(|session| session.id.as_str() == id.as_str())
+        });
+        let selected_session_id = reexec_session_id.or_else(|| {
+            if args.select_latest {
+                state_cache
+                    .sessions
+                    .first()
+                    .map(|session| session.id.clone())
+            } else {
+                None
+            }
+        });
         let surface = args.overlay.map(Into::into).unwrap_or(Surface::Main);
         let current_dir = std::env::current_dir()?;
         let config_overrides = parse_config_overrides(&args.config_overrides)?;
@@ -1787,8 +1814,16 @@ impl App {
             composer_input_rect: std::cell::Cell::new(None),
             palette_open: false,
             palette_filter: String::new(),
+            history_filter: String::new(),
         };
         app.refresh_cached_projection();
+        if resumed_from_reexec {
+            app.status_notice = Some(if app.selected_session_id.is_some() {
+                "Resumed previous session after reload.".to_string()
+            } else {
+                "Previous session no longer available; starting fresh.".to_string()
+            });
+        }
         Ok(app)
     }
 
@@ -2656,6 +2691,7 @@ impl App {
         self.close_slash_palette();
         self.surface = surface;
         self.selected_row = 0;
+        self.history_filter.clear();
         if surface != Surface::Browser {
             self.browser_notice = None;
         }
@@ -2671,6 +2707,7 @@ impl App {
         }
         self.surface = Surface::Main;
         self.selected_row = 0;
+        self.history_filter.clear();
         self.browser_notice = None;
     }
 
@@ -3387,10 +3424,7 @@ impl App {
                 code: KeyCode::Char(c),
                 modifiers,
                 ..
-            } if self.surface == Surface::Main
-                && modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
-                && c.eq_ignore_ascii_case(&'v') =>
-            {
+            } if self.surface == Surface::Main && is_image_paste_shortcut(c, modifiers) => {
                 self.paste_image_from_clipboard();
             }
             KeyEvent {
@@ -3441,6 +3475,15 @@ impl App {
             KeyEvent {
                 code: KeyCode::Esc, ..
             } if self.surface == Surface::Main => self.handle_main_escape()?,
+            // History: first Esc clears the live filter; a second Esc (with the
+            // filter already empty) closes the popup like every other surface.
+            KeyEvent {
+                code: KeyCode::Esc, ..
+            } if self.surface == Surface::History && !self.history_filter.is_empty() => {
+                self.escape_stop_until = None;
+                self.history_filter.clear();
+                self.selected_row = 0;
+            }
             KeyEvent {
                 code: KeyCode::Esc, ..
             } => {
@@ -3477,6 +3520,18 @@ impl App {
             }
             KeyEvent {
                 code: KeyCode::Tab, ..
+            } if self.is_slash_palette_active() => {
+                // Tab autocompletes the highlighted slash command (drop the
+                // leading "/") instead of opening the history surface. The
+                // user is mid-typing a command — opening history would steal
+                // focus and discard their partial filter.
+                if let Some(item) = self.slash_palette_items().get(self.selected_row).copied() {
+                    self.palette_filter = item.command.trim_start_matches('/').to_string();
+                    self.clamp_slash_palette_selection();
+                }
+            }
+            KeyEvent {
+                code: KeyCode::Tab, ..
             } if self.queue_current_composer_followup()? => {}
             KeyEvent {
                 code: KeyCode::Tab, ..
@@ -3494,11 +3549,16 @@ impl App {
                 modifiers: KeyModifiers::CONTROL,
                 ..
             } if self.composer.is_empty() => self.open_surface(Surface::Developer),
+            // `r` resumes the selected history row, but only when the live
+            // filter is empty — otherwise it would steal a perfectly legal
+            // letter mid-search ("foo<r>bar" → "fooba").
             KeyEvent {
                 code: KeyCode::Char('r'),
                 modifiers: KeyModifiers::NONE,
                 ..
-            } if self.surface == Surface::History => self.resume_selected_history()?,
+            } if self.surface == Surface::History && self.history_filter.is_empty() => {
+                self.resume_selected_history()?
+            }
             KeyEvent {
                 code: KeyCode::Up, ..
             } if self.is_slash_palette_active() => self.move_slash_palette_selection(-1),
@@ -3614,6 +3674,59 @@ impl App {
                 self.palette_filter.pop();
                 self.clamp_slash_palette_selection();
             }
+            // History live filter: typed printable chars extend the substring
+            // filter, Backspace shrinks it, Ctrl-U/Cmd-Backspace clears it.
+            // Selection resets to the top of the filtered list whenever the
+            // filter changes so the highlight is never pointing at a row that
+            // just got filtered out.
+            KeyEvent { .. }
+                if self.surface == Surface::History && is_popup_clear_key(key) =>
+            {
+                self.history_filter.clear();
+                self.selected_row = 0;
+            }
+            KeyEvent {
+                code: KeyCode::Char(ch),
+                modifiers,
+                ..
+            } if self.surface == Surface::History
+                && !modifiers.contains(KeyModifiers::CONTROL)
+                && !modifiers.contains(KeyModifiers::ALT)
+                && !modifiers.intersects(
+                    KeyModifiers::SUPER | KeyModifiers::HYPER | KeyModifiers::META,
+                ) =>
+            {
+                self.history_filter.push(ch);
+                self.selected_row = 0;
+            }
+            KeyEvent {
+                code: KeyCode::Backspace,
+                ..
+            } if self.surface == Surface::History => {
+                self.history_filter.pop();
+                self.selected_row = 0;
+            }
+            // PgUp/PgDn page through the visible history rows by a fixed step
+            // (the popup body height varies but never exceeds ~26 lines, so a
+            // 10-row jump is comfortable without overshooting on small terms).
+            KeyEvent {
+                code: KeyCode::PageUp,
+                ..
+            } if self.surface == Surface::History => {
+                let count = self.selectable_row_count()?;
+                if count > 0 {
+                    self.selected_row = self.selected_row.saturating_sub(10);
+                }
+            }
+            KeyEvent {
+                code: KeyCode::PageDown,
+                ..
+            } if self.surface == Surface::History => {
+                let count = self.selectable_row_count()?;
+                if count > 0 {
+                    self.selected_row = (self.selected_row + 10).min(count - 1);
+                }
+            }
             _ if self.surface == Surface::Main && self.handle_main_composer_key(key) => {}
             KeyEvent {
                 code: KeyCode::Char('d'),
@@ -3687,10 +3800,17 @@ impl App {
     }
 
     fn should_capture_mouse(&self) -> bool {
-        self.should_capture_welcome_mouse()
-            || (self.surface == Surface::Main
-                && !self.is_slash_palette_active()
-                && self.composer_input_rect.get().is_some())
+        // Mouse capture is disabled to give the host terminal back native
+        // drag-to-select, mouse-wheel scrollback, and copy-on-selection.
+        // Trade-off: click-to-place-cursor in the composer and click-on-
+        // welcome-logo no longer fire (the events go to the terminal, not us).
+        // Use keyboard navigation (arrows / Alt+arrows / Home / End) instead.
+        // To restore mouse capture, set this back to:
+        //   self.should_capture_welcome_mouse()
+        //     || (self.surface == Surface::Main
+        //         && !self.is_slash_palette_active()
+        //         && self.composer_input_rect.get().is_some())
+        false
     }
 
     fn handle_composer_click(&mut self, column: u16, row: u16) -> bool {
@@ -3737,11 +3857,8 @@ impl App {
         match self.surface {
             Surface::History => {
                 let state = self.workbench_state()?.clone();
-                if let Some(row) = state
-                    .history
-                    .get(self.selected_row.min(state.history.len().saturating_sub(1)))
-                {
-                    self.dispatch(AppCommand::SelectHistory(row.session_id.clone()))?;
+                if let Some(session_id) = self.selected_history_session_id(&state) {
+                    self.dispatch(AppCommand::SelectHistory(session_id))?;
                 }
             }
             Surface::Setup => self.execute_first_run_setup_selection()?,
@@ -3939,13 +4056,34 @@ impl App {
 
     fn resume_selected_history(&mut self) -> Result<()> {
         let state = self.workbench_state()?.clone();
-        if let Some(row) = state
-            .history
-            .get(self.selected_row.min(state.history.len().saturating_sub(1)))
-        {
-            self.dispatch(AppCommand::SelectHistory(row.session_id.clone()))?;
+        if let Some(session_id) = self.selected_history_session_id(&state) {
+            self.dispatch(AppCommand::SelectHistory(session_id))?;
         }
         Ok(())
+    }
+
+    /// Indices into `WorkbenchState::history` for rows visible under the
+    /// current `history_filter` (case-insensitive substring match against the
+    /// task text). When the filter is empty this returns every index.
+    pub(crate) fn history_visible_indices(&mut self) -> Result<Vec<usize>> {
+        let state = self.workbench_state()?;
+        Ok(history_visible_indices_for(&state, &self.history_filter))
+    }
+
+    /// The session id of the currently highlighted row, after filter is
+    /// applied. Returns `None` when the filtered list is empty.
+    fn selected_history_session_id(&self, state: &WorkbenchState) -> Option<String> {
+        let indices = history_visible_indices_for(state, &self.history_filter);
+        if indices.is_empty() {
+            return None;
+        }
+        let pick = self.selected_row.min(indices.len() - 1);
+        let row = state.history.get(indices[pick])?;
+        Some(row.session_id.clone())
+    }
+
+    pub(crate) fn history_filter(&self) -> &str {
+        &self.history_filter
     }
 
     fn execute_failed_selection(&mut self, session_id: String) -> Result<()> {
@@ -4023,7 +4161,23 @@ impl App {
     }
 
     fn request_reexec(&mut self) -> Result<()> {
+        // Close the slash palette and any other overlay BEFORE the exec so
+        // the last frame painted into the inline area (which the host
+        // terminal pushes into scrollback) doesn't keep the palette
+        // popup visible after the new process draws on top.
+        self.close_slash_palette();
         self.status_notice = Some("Reloading browser-use terminal...".to_string());
+        // Hand the currently-open session through to the re-execed UI so
+        // /reload behaves like "reload + resume" instead of dropping the
+        // user back at a fresh transcript.
+        match self.selected_session_id.as_deref() {
+            Some(session_id) if !session_id.is_empty() => {
+                std::env::set_var(REEXEC_SESSION_ENV, session_id);
+            }
+            _ => {
+                std::env::remove_var(REEXEC_SESSION_ENV);
+            }
+        }
         request_process_reexec()
     }
 
@@ -4877,7 +5031,7 @@ impl App {
             Surface::Mode => 2,
             Surface::Browser => 3,
             Surface::BrowserSelect => BROWSER_CHOICES.len(),
-            Surface::History => self.workbench_state()?.history.len(),
+            Surface::History => self.history_visible_indices()?.len(),
             Surface::Messages => self.message_action_rows().len(),
             Surface::Developer => 1,
         })
@@ -6398,6 +6552,23 @@ fn escape_prefixed_alt_key_event(event: &TermEvent) -> Option<KeyEvent> {
     }
 }
 
+/// Case-insensitive substring filter over `state.history`. Returns the
+/// indices into the original `Vec<HistoryRow>` whose task text matches.
+/// An empty filter is treated as "match everything".
+fn history_visible_indices_for(state: &WorkbenchState, filter: &str) -> Vec<usize> {
+    let needle = filter.trim().to_ascii_lowercase();
+    if needle.is_empty() {
+        return (0..state.history.len()).collect();
+    }
+    state
+        .history
+        .iter()
+        .enumerate()
+        .filter(|(_, row)| row.task.to_ascii_lowercase().contains(&needle))
+        .map(|(idx, _)| idx)
+        .collect()
+}
+
 fn is_popup_clear_key(key: KeyEvent) -> bool {
     let command_delete = key
         .modifiers
@@ -6407,6 +6578,17 @@ fn is_popup_clear_key(key: KeyEvent) -> bool {
         && matches!(key.code, KeyCode::Char('u' | 'U'));
     let raw_ctrl_u = key.modifiers.is_empty() && matches!(key.code, KeyCode::Char('\u{15}'));
     command_delete || ctrl_u || raw_ctrl_u
+}
+
+fn is_image_paste_shortcut(ch: char, modifiers: KeyModifiers) -> bool {
+    ch.eq_ignore_ascii_case(&'v')
+        && modifiers.intersects(
+            KeyModifiers::CONTROL
+                | KeyModifiers::ALT
+                | KeyModifiers::SUPER
+                | KeyModifiers::HYPER
+                | KeyModifiers::META,
+        )
 }
 
 fn is_unmodified_enter_event(event: &TermEvent) -> bool {
@@ -7056,6 +7238,25 @@ mod redesign_tests {
         let display = user_input_display_text_from_payload(&payload).expect("display text");
         assert_eq!(display, "[Image 1] [Image 2]\nwhat is here");
         assert!(!display.contains("but-clipboard"));
+    }
+
+    #[test]
+    fn image_paste_shortcut_accepts_control_alt_and_command_modifiers() {
+        for modifiers in [
+            KeyModifiers::CONTROL,
+            KeyModifiers::ALT,
+            KeyModifiers::SUPER,
+            KeyModifiers::HYPER,
+            KeyModifiers::META,
+            KeyModifiers::SUPER | KeyModifiers::SHIFT,
+            KeyModifiers::META | KeyModifiers::SHIFT,
+        ] {
+            assert!(is_image_paste_shortcut('v', modifiers));
+            assert!(is_image_paste_shortcut('V', modifiers));
+        }
+
+        assert!(!is_image_paste_shortcut('v', KeyModifiers::NONE));
+        assert!(!is_image_paste_shortcut('x', KeyModifiers::SUPER));
     }
 
     fn write_tui_model_catalog(app_home: &std::path::Path) -> Result<()> {

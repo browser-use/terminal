@@ -459,9 +459,19 @@ fn render_bottom_pane(
     // dropping rows from the top once it would otherwise scroll off the bottom.
     if matches!(surface, Surface::History | Surface::Messages) {
         let body_h = body_area.height as usize;
-        if body_h > 0 && app.selected_row >= body_h {
-            let skip = app.selected_row + 1 - body_h;
-            lines = lines.into_iter().skip(skip).collect();
+        let header_reserved = if surface == Surface::History && !app.history_filter().is_empty() {
+            2.min(lines.len())
+        } else {
+            0
+        };
+        let data_h = body_h.saturating_sub(header_reserved);
+        if data_h > 0 && app.selected_row >= data_h {
+            let skip = app.selected_row + 1 - data_h;
+            let head: Vec<Line<'static>> = lines.iter().take(header_reserved).cloned().collect();
+            let tail: Vec<Line<'static>> =
+                lines.into_iter().skip(header_reserved + skip).collect();
+            lines = head;
+            lines.extend(tail);
         }
     }
     trim_trailing_whitespace(&mut lines);
@@ -663,9 +673,22 @@ fn render_surface_popup_box(
     );
     if matches!(surface, Surface::History | Surface::Messages) {
         let body_h = body_area.height as usize;
-        if body_h > 0 && app.selected_row >= body_h {
-            let skip = app.selected_row + 1 - body_h;
-            lines = lines.into_iter().skip(skip).collect();
+        // History reserves the first two lines for the live filter input when
+        // the user has typed something — those must always stay pinned to the
+        // top of the popup. Scroll only the data rows underneath.
+        let header_reserved = if surface == Surface::History && !app.history_filter().is_empty() {
+            2.min(lines.len())
+        } else {
+            0
+        };
+        let data_h = body_h.saturating_sub(header_reserved);
+        if data_h > 0 && app.selected_row >= data_h {
+            let skip = app.selected_row + 1 - data_h;
+            let head: Vec<Line<'static>> = lines.iter().take(header_reserved).cloned().collect();
+            let tail: Vec<Line<'static>> =
+                lines.into_iter().skip(header_reserved + skip).collect();
+            lines = head;
+            lines.extend(tail);
         }
     }
     // For text-input popups, position the terminal cursor at the end of the
@@ -1128,7 +1151,7 @@ fn surface_footer(surface: Surface) -> &'static str {
     match surface {
         Surface::ApiKey => "Enter:save | Esc:cancel",
         Surface::Telemetry => "Enter:save | Esc:cancel",
-        Surface::History => "",
+        Surface::History => "Type to filter | Enter:open | Esc:close",
         Surface::Messages => "Enter:edit | Esc:close",
         Surface::Setup | Surface::SetupConfirm => "Enter:continue | Esc:back",
         Surface::SetupResult => "Enter:select | Esc:back",
@@ -2472,15 +2495,40 @@ fn browser_issue_display_from_value(value: &serde_json::Value) -> Option<Browser
 }
 
 fn history_lines(app: &App, state: &WorkbenchState, width: usize) -> Vec<Line<'static>> {
-    if state.history.is_empty() {
-        return vec![Line::from(Span::styled("No previous work yet.", dim()))];
+    let mut lines: Vec<Line<'static>> = Vec::new();
+    let filter = app.history_filter();
+    // When the user is actively typing a filter, show it in a small input line
+    // above the rows. Hidden until the first keystroke so the resting view of
+    // the popup stays identical to before.
+    if !filter.is_empty() {
+        lines.push(Line::from(vec![
+            Span::styled("  search: ", muted()),
+            Span::styled(filter.to_string(), text_style()),
+        ]));
+        lines.push(Line::from(""));
     }
-    state
-        .history
-        .iter()
-        .enumerate()
-        .map(|(idx, row)| history_overlay_line(row, idx, app.selected_row, width))
-        .collect()
+    if state.history.is_empty() {
+        lines.push(Line::from(Span::styled("No previous work yet.", dim())));
+        return lines;
+    }
+    let needle = filter.trim().to_ascii_lowercase();
+    let visible: Vec<&HistoryRow> = if needle.is_empty() {
+        state.history.iter().collect()
+    } else {
+        state
+            .history
+            .iter()
+            .filter(|row| row.task.to_ascii_lowercase().contains(&needle))
+            .collect()
+    };
+    if visible.is_empty() {
+        lines.push(Line::from(Span::styled("No matching tasks.", dim())));
+        return lines;
+    }
+    for (idx, row) in visible.iter().enumerate() {
+        lines.push(history_overlay_line(row, idx, app.selected_row, width));
+    }
+    lines
 }
 
 fn message_lines(app: &App, width: usize) -> Vec<Line<'static>> {
