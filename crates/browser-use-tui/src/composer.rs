@@ -964,25 +964,62 @@ mod tests {
 
         // Click on row 1 ("second word") way past the visible end.
         assert!(composer.set_cursor_from_wrapped_position(4, 80, 1, 60));
-        assert_eq!(
-            composer.cursor(),
-            "first line\nsecond word".chars().count()
-        );
+        assert_eq!(composer.cursor(), "first line\nsecond word".chars().count());
 
         // Wrapped logical line: clicking past the end of visual row 0
-        // must land at the end of that visual row, NOT at the end of the
-        // whole logical line (which would be on a later visual row).
+        // must land in a position that *renders* on visual row 0, not on
+        // the next wrapped row. Position == row_end is the start of the
+        // next wrapped row visually (no character separates wrapped rows),
+        // so we clamp one position earlier on non-last visual rows so the
+        // cursor stays on the clicked row.
         let mut composer = Composer::default();
         // width=8, prompt "> " takes 2 cols => content/wrap width = 6.
         // "abcdefghij" wraps into "abcdef" and "ghij".
         composer.set_input("abcdefghij".to_string());
         // Click on row 0 at the rightmost in-rect column (col 7, past 'f').
         assert!(composer.set_cursor_from_wrapped_position(4, 8, 0, 7));
-        assert_eq!(composer.cursor(), "abcdef".chars().count());
+        // cursor=5 (between 'e' and 'f') renders at (row=0, col=5) — last
+        // cell of visual row 0. cursor=6 would render at (row=1, col=0)
+        // because in soft-wrapped text, position == wrap_width has no
+        // visual home on row 0.
+        assert_eq!(composer.cursor(), 5);
+        let (vrow, _vcol) = composer.cursor_visual_row_col_wrapped(6);
+        assert_eq!(vrow, 0, "cursor must render on the clicked visual row");
         // Click on row 1 past the end of "ghij" still pins to end of row 1
-        // (which is also the end of the logical line here).
+        // (which is the LAST visual row of the logical line, so clamping
+        // to line_len is fine — there's no next wrapped row to spill into).
         assert!(composer.set_cursor_from_wrapped_position(4, 8, 1, 7));
         assert_eq!(composer.cursor(), "abcdefghij".chars().count());
+    }
+
+    #[test]
+    fn click_past_end_of_plain_line_in_multiline_composer_stays_on_clicked_row() {
+        // Magnus's repro: composer has multi-line text via Shift+Enter
+        // (so logical lines separated by \n, each non-wrapped). Clicking
+        // far past the visible end of a line must place the cursor at the
+        // end of that line AND render it on the clicked row, not on the
+        // next logical line.
+        let mut composer = Composer::default();
+        composer.set_input("first line\nsecond line\nthird line".to_string());
+
+        // Click row 0 at col 100 (way past "first line"'s 10 chars).
+        assert!(composer.set_cursor_from_wrapped_position(4, 80, 0, 100));
+        assert_eq!(
+            composer.cursor(),
+            "first line".chars().count(),
+            "cursor byte position should land at end of first line"
+        );
+        let (vrow, _) = composer.cursor_visual_row_col_wrapped(78);
+        assert_eq!(vrow, 0, "cursor must render on row 0, not the next line");
+
+        // Click row 1 at col 100.
+        assert!(composer.set_cursor_from_wrapped_position(4, 80, 1, 100));
+        assert_eq!(
+            composer.cursor(),
+            "first line\nsecond line".chars().count(),
+        );
+        let (vrow, _) = composer.cursor_visual_row_col_wrapped(78);
+        assert_eq!(vrow, 1, "cursor must render on row 1, not the next line");
     }
 
     #[test]
