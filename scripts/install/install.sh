@@ -239,32 +239,44 @@ add_to_path() {
   path_action="already"
   path_profile=""
 
-  case ":$PATH:" in
-    *":$BIN_DIR:"*)
-      return
-      ;;
-  esac
-
   profile="$(pick_profile)"
   path_profile="$profile"
   begin_marker="# >>> browser-use terminal installer >>>"
   end_marker="# <<< browser-use terminal installer <<<"
-  path_line="export PATH=\"$BIN_DIR:\$PATH\""
+  alias_reset_line="unalias browser 2>/dev/null || true"
+  alias_line="alias browser=\"$BIN_DIR/browser\""
+  desired_path_line="export PATH=\"$BIN_DIR:\$PATH\""
+  path_line=""
+
+  case ":$PATH:" in
+    *":$BIN_DIR:"*) ;;
+    *)
+      path_line="$desired_path_line"
+      ;;
+  esac
+
+  if [ -f "$profile" ] &&
+    grep -F "$begin_marker" "$profile" >/dev/null 2>&1 &&
+    grep -F "$desired_path_line" "$profile" >/dev/null 2>&1; then
+    path_line="$desired_path_line"
+  fi
 
   if [ -f "$profile" ] && grep -F "$begin_marker" "$profile" >/dev/null 2>&1; then
-    if grep -F "$path_line" "$profile" >/dev/null 2>&1; then
+    if { [ -z "$path_line" ] || grep -F "$path_line" "$profile" >/dev/null 2>&1; } &&
+      grep -F "$alias_reset_line" "$profile" >/dev/null 2>&1 &&
+      grep -F "$alias_line" "$profile" >/dev/null 2>&1; then
       path_action="configured"
       return
     fi
 
     if grep -F "$end_marker" "$profile" >/dev/null 2>&1; then
-      rewrite_path_block "$profile" "$begin_marker" "$end_marker" "$path_line"
+      rewrite_path_block "$profile" "$begin_marker" "$end_marker" "$path_line" "$alias_reset_line" "$alias_line"
       path_action="updated"
       return
     fi
   fi
 
-  append_path_block "$profile" "$begin_marker" "$end_marker" "$path_line"
+  append_path_block "$profile" "$begin_marker" "$end_marker" "$path_line" "$alias_reset_line" "$alias_line"
   path_action="added"
 }
 
@@ -273,10 +285,16 @@ append_path_block() {
   begin_marker="$2"
   end_marker="$3"
   path_line="$4"
+  alias_reset_line="$5"
+  alias_line="$6"
 
   {
     printf '\n%s\n' "$begin_marker"
-    printf '%s\n' "$path_line"
+    if [ -n "$path_line" ]; then
+      printf '%s\n' "$path_line"
+    fi
+    printf '%s\n' "$alias_reset_line"
+    printf '%s\n' "$alias_line"
     printf '%s\n' "$end_marker"
   } >>"$profile"
 }
@@ -286,9 +304,11 @@ rewrite_path_block() {
   begin_marker="$2"
   end_marker="$3"
   path_line="$4"
+  alias_reset_line="$5"
+  alias_line="$6"
   tmp_profile="$tmp_dir/profile.$$.tmp"
 
-  awk -v begin="$begin_marker" -v end="$end_marker" -v line="$path_line" '
+  awk -v begin="$begin_marker" -v end="$end_marker" -v path_line="$path_line" -v alias_reset_line="$alias_reset_line" -v alias_line="$alias_line" '
     BEGIN {
       in_block = 0
       replaced = 0
@@ -296,7 +316,11 @@ rewrite_path_block() {
     $0 == begin {
       if (!replaced) {
         print begin
-        print line
+        if (path_line != "") {
+          print path_line
+        }
+        print alias_reset_line
+        print alias_line
         print end
         replaced = 1
       }

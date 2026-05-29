@@ -50,8 +50,14 @@ BUT_HOME_DIR="$tmp/home"
 STANDALONE_ROOT="$BUT_HOME_DIR/packages/standalone"
 CURRENT_LINK="$STANDALONE_ROOT/current"
 REPO="browser-use/terminal"
+HOME="$tmp/user-home"
+SHELL="/bin/bash"
+os="linux"
+tmp_dir="$tmp"
+BUT_HOME="$BUT_HOME_DIR"
+export HOME SHELL BUT_HOME
 
-mkdir -p "$CURRENT_LINK/bin" "$BIN_DIR" "$STANDALONE_ROOT"
+mkdir -p "$CURRENT_LINK/bin" "$BIN_DIR" "$STANDALONE_ROOT" "$HOME"
 
 cat >"$CURRENT_LINK/bin/but" <<'EOF'
 #!/bin/sh
@@ -94,6 +100,33 @@ if ! release_dir_is_complete "$release_fixture" "0.1.0" "test-target"; then
 fi
 
 update_visible_commands
+
+PATH_WITHOUT_BIN="$PATH"
+case ":$PATH_WITHOUT_BIN:" in
+  *":$BIN_DIR:"*)
+    PATH_WITHOUT_BIN="$(printf '%s\n' "$PATH_WITHOUT_BIN" | sed "s#:$BIN_DIR:##; s#^$BIN_DIR:##; s#:$BIN_DIR\$##")"
+    ;;
+esac
+
+profile="$HOME/.bashrc"
+printf "%s\n" "alias browser='old-browser'" >"$profile"
+PATH="$PATH_WITHOUT_BIN" add_to_path
+profile_contents="$(cat "$profile")"
+assert_contains "export PATH=\"$BIN_DIR:\$PATH\"" "$profile_contents" "installer profile block adds PATH"
+assert_contains "unalias browser 2>/dev/null || true" "$profile_contents" "installer profile block clears existing browser alias"
+assert_contains "alias browser=\"$BIN_DIR/browser\"" "$profile_contents" "installer profile block sets browser alias"
+alias_output="$(bash --rcfile "$profile" -ic 'alias browser' 2>/dev/null)"
+assert_contains "$BIN_DIR/browser" "$alias_output" "browser alias resolves to installed wrapper"
+
+cat >"$profile" <<EOF
+# >>> browser-use terminal installer >>>
+export PATH="$BIN_DIR:\$PATH"
+# <<< browser-use terminal installer <<<
+EOF
+PATH="$BIN_DIR:$PATH_WITHOUT_BIN" add_to_path
+profile_contents="$(cat "$profile")"
+assert_contains "export PATH=\"$BIN_DIR:\$PATH\"" "$profile_contents" "installer preserves existing managed PATH line"
+assert_contains "alias browser=\"$BIN_DIR/browser\"" "$profile_contents" "installer updates existing managed block with browser alias"
 
 : >"$tmp/update.log"
 verify_visible_command
