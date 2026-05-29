@@ -1665,14 +1665,24 @@ impl App {
         let state_cache = AppStateCache::hydrate(&store, &args.browser)?;
         // /reload sets BUT_REEXEC_SESSION_ID in the re-execed process's env so
         // the new UI resumes whatever session the user had open, instead of
-        // starting fresh. We consume the var here so nested /reloads don't
+        // starting fresh. Consume the var here so nested /reloads don't
         // accidentally pin the wrong session forever.
         let reexec_session_id = std::env::var(REEXEC_SESSION_ENV)
             .ok()
             .filter(|value| !value.is_empty());
-        if reexec_session_id.is_some() {
+        let resumed_from_reexec = reexec_session_id.is_some();
+        if resumed_from_reexec {
             std::env::remove_var(REEXEC_SESSION_ENV);
         }
+        // Only honour the env var if the named session actually exists in the
+        // store — a stale id would silently drop the user on the welcome
+        // surface and look like resume is broken.
+        let reexec_session_id = reexec_session_id.filter(|id| {
+            state_cache
+                .sessions
+                .iter()
+                .any(|session| session.id.as_str() == id.as_str())
+        });
         let selected_session_id = reexec_session_id.or_else(|| {
             if args.select_latest {
                 state_cache
@@ -1807,6 +1817,13 @@ impl App {
             history_filter: String::new(),
         };
         app.refresh_cached_projection();
+        if resumed_from_reexec {
+            app.status_notice = Some(if app.selected_session_id.is_some() {
+                "Resumed previous session after reload.".to_string()
+            } else {
+                "Previous session no longer available; starting fresh.".to_string()
+            });
+        }
         Ok(app)
     }
 
@@ -3499,6 +3516,18 @@ impl App {
                     self.dispatch(AppCommand::SetCollaborationMode(next_collaboration_mode(
                         self.collaboration_mode,
                     )))?;
+                }
+            }
+            KeyEvent {
+                code: KeyCode::Tab, ..
+            } if self.is_slash_palette_active() => {
+                // Tab autocompletes the highlighted slash command (drop the
+                // leading "/") instead of opening the history surface. The
+                // user is mid-typing a command — opening history would steal
+                // focus and discard their partial filter.
+                if let Some(item) = self.slash_palette_items().get(self.selected_row).copied() {
+                    self.palette_filter = item.command.trim_start_matches('/').to_string();
+                    self.clamp_slash_palette_selection();
                 }
             }
             KeyEvent {
