@@ -3387,10 +3387,7 @@ impl App {
                 code: KeyCode::Char(c),
                 modifiers,
                 ..
-            } if self.surface == Surface::Main
-                && modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
-                && c.eq_ignore_ascii_case(&'v') =>
-            {
+            } if self.surface == Surface::Main && is_image_paste_shortcut(c, modifiers) => {
                 self.paste_image_from_clipboard();
             }
             KeyEvent {
@@ -6409,6 +6406,17 @@ fn is_popup_clear_key(key: KeyEvent) -> bool {
     command_delete || ctrl_u || raw_ctrl_u
 }
 
+fn is_image_paste_shortcut(ch: char, modifiers: KeyModifiers) -> bool {
+    ch.eq_ignore_ascii_case(&'v')
+        && modifiers.intersects(
+            KeyModifiers::CONTROL
+                | KeyModifiers::ALT
+                | KeyModifiers::SUPER
+                | KeyModifiers::HYPER
+                | KeyModifiers::META,
+        )
+}
+
 fn is_unmodified_enter_event(event: &TermEvent) -> bool {
     matches!(
         event,
@@ -7056,6 +7064,25 @@ mod redesign_tests {
         let display = user_input_display_text_from_payload(&payload).expect("display text");
         assert_eq!(display, "[Image 1] [Image 2]\nwhat is here");
         assert!(!display.contains("but-clipboard"));
+    }
+
+    #[test]
+    fn image_paste_shortcut_accepts_control_alt_and_command_modifiers() {
+        for modifiers in [
+            KeyModifiers::CONTROL,
+            KeyModifiers::ALT,
+            KeyModifiers::SUPER,
+            KeyModifiers::HYPER,
+            KeyModifiers::META,
+            KeyModifiers::SUPER | KeyModifiers::SHIFT,
+            KeyModifiers::META | KeyModifiers::SHIFT,
+        ] {
+            assert!(is_image_paste_shortcut('v', modifiers));
+            assert!(is_image_paste_shortcut('V', modifiers));
+        }
+
+        assert!(!is_image_paste_shortcut('v', KeyModifiers::NONE));
+        assert!(!is_image_paste_shortcut('x', KeyModifiers::SUPER));
     }
 
     fn write_tui_model_catalog(app_home: &std::path::Path) -> Result<()> {
