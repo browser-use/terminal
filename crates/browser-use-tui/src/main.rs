@@ -6121,24 +6121,16 @@ impl TerminalDriver {
         if desired_height == current_height {
             return Ok(current_height);
         }
-        // The user owns scroll position. Don't purge the terminal scrollback
-        // and don't reset native_history — that would replay the whole
-        // transcript into scrollback and yank the user's view to the top.
-        // ClearType::All clears the visible viewport only (no scrollback),
-        // then the next draw repaints the inline dock at its new height.
-        reset_terminal_screen(self.terminal.backend_mut(), ClearType::All)?;
+        reset_terminal_screen(self.terminal.backend_mut(), ClearType::Purge)?;
         self.terminal = new_inline_terminal(desired_height)?;
+        app.native_history.reset();
         self.manual_modal_overlay_rect = None;
         Ok(desired_height)
     }
 
     fn settle_resize(&mut self, app: &mut App) -> Result<()> {
-        // After a real terminal resize, the terminal emulator reflows its
-        // own scrollback. Don't purge it and don't reset native_history —
-        // both would cause the entire transcript to be re-emitted, which
-        // forces the user to the bottom (looks like scroll-to-top).
-        settle_inline_terminal_after_resize(&mut self.terminal)?;
-        let _ = app; // native_history intentionally preserved
+        reset_inline_terminal_after_resize(&mut self.terminal)?;
+        app.native_history.reset();
         self.manual_modal_overlay_rect = None;
         Ok(())
     }
@@ -6158,12 +6150,6 @@ impl TerminalDriver {
             }
         }
         if self.manual_modal_overlay_rect.is_some() && !manual_overlay_active {
-            // Modal overlays (slash palette, surface popups) draw directly
-            // into terminal cells that include scrollback rows above the
-            // inline viewport. When the overlay closes we must repaint
-            // those rows or stale overlay content stays in scrollback.
-            // This DOES move the user to the bottom — acceptable because
-            // it only fires on user-initiated overlay dismissal.
             app.native_history.reset_with_clear();
         }
         maybe_emit_native_transcript(&mut self.terminal, app)?;
@@ -6444,13 +6430,10 @@ fn handle_terminal_event(
     }
 }
 
-fn settle_inline_terminal_after_resize(
+fn reset_inline_terminal_after_resize(
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
 ) -> Result<()> {
-    // ClearType::All wipes the visible screen (the inline viewport) without
-    // touching scrollback, so the user's scroll position is preserved.
-    // The terminal emulator handles scrollback reflow on resize itself.
-    reset_terminal_screen(terminal.backend_mut(), ClearType::All)?;
+    reset_terminal_screen(terminal.backend_mut(), ClearType::Purge)?;
     reset_inline_viewport_origin(terminal)?;
     terminal.autoresize()?;
     terminal.clear()?;
