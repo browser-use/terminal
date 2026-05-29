@@ -3805,10 +3805,17 @@ impl App {
     }
 
     fn should_capture_mouse(&self) -> bool {
-        self.should_capture_welcome_mouse()
-            || (self.surface == Surface::Main
-                && !self.is_slash_palette_active()
-                && self.composer_input_rect.get().is_some())
+        // Mouse capture is disabled to give the host terminal back native
+        // drag-to-select, mouse-wheel scrollback, and copy-on-selection.
+        // Trade-off: click-to-place-cursor in the composer and click-on-
+        // welcome-logo no longer fire (the events go to the terminal, not us).
+        // Use keyboard navigation (arrows / Alt+arrows / Home / End) instead.
+        // To restore mouse capture, set this back to:
+        //   self.should_capture_welcome_mouse()
+        //     || (self.surface == Surface::Main
+        //         && !self.is_slash_palette_active()
+        //         && self.composer_input_rect.get().is_some())
+        false
     }
 
     fn handle_composer_click(&mut self, column: u16, row: u16) -> bool {
