@@ -855,6 +855,7 @@ struct App {
     clipboard_paste_tx: mpsc::Sender<ClipboardPasteEvent>,
     clipboard_paste_rx: mpsc::Receiver<ClipboardPasteEvent>,
     state_cache: AppStateCache,
+    transcript_model_cache: transcript::TranscriptModelCache,
     args: Args,
     selected_session_id: Option<String>,
     composer: Composer,
@@ -917,6 +918,7 @@ struct AppStateCache {
     sessions: Vec<SessionMeta>,
     events_by_session: HashMap<String, Vec<EventRecord>>,
     last_seq_by_session: HashMap<String, i64>,
+    revision: u64,
     projected: WorkbenchState,
     projection_key: Option<ProjectionKey>,
     dirty_projection: bool,
@@ -944,6 +946,7 @@ impl AppStateCache {
             sessions,
             events_by_session,
             last_seq_by_session,
+            revision: 0,
             projected: empty_workbench_state(browser),
             projection_key: None,
             dirty_projection: true,
@@ -965,6 +968,11 @@ impl AppStateCache {
             }
             StoreNotification::SettingsChanged => Ok(false),
         }
+    }
+
+    fn mark_changed(&mut self) {
+        self.revision = self.revision.wrapping_add(1);
+        self.dirty_projection = true;
     }
 
     fn refresh_all(&mut self, store: &Store) -> Result<bool> {
@@ -1011,7 +1019,7 @@ impl AppStateCache {
         }
         let changed = sessions_changed || removed_events || loaded_events;
         if changed {
-            self.dirty_projection = true;
+            self.mark_changed();
         }
         Ok(changed)
     }
@@ -1028,7 +1036,7 @@ impl AppStateCache {
             }
         };
         if changed {
-            self.dirty_projection = true;
+            self.mark_changed();
         }
         Ok(changed)
     }
@@ -1050,7 +1058,7 @@ impl AppStateCache {
             .extend(events);
         self.last_seq_by_session
             .insert(session_id.to_string(), last_seq);
-        self.dirty_projection = true;
+        self.mark_changed();
         Ok(true)
     }
 
@@ -1688,6 +1696,31 @@ fn request_user_input_response_payload(
     })
 }
 
+/// Flatten a `request_user_input` response payload's answers into a single text
+/// string for analytics. Text/choice values only — these answers never carry
+/// image or attachment content, so nothing binary is included.
+fn request_user_input_response_analytics_text(payload: &serde_json::Value) -> String {
+    let Some(answers) = payload.get("answers").and_then(serde_json::Value::as_object) else {
+        return String::new();
+    };
+    let mut parts = Vec::new();
+    for entry in answers.values() {
+        let Some(values) = entry.get("answers").and_then(serde_json::Value::as_array) else {
+            continue;
+        };
+        for value in values {
+            match value {
+                serde_json::Value::String(text) if !text.trim().is_empty() => {
+                    parts.push(text.clone());
+                }
+                serde_json::Value::String(_) | serde_json::Value::Null => {}
+                other => parts.push(other.to_string()),
+            }
+        }
+    }
+    parts.join(" | ")
+}
+
 fn request_user_input_answer_texts(request: &PendingRequestUserInput, text: &str) -> Vec<String> {
     if let Some(parts) = keyed_request_user_input_answers(request, text) {
         return parts;
@@ -2057,6 +2090,7 @@ impl App {
             clipboard_paste_tx,
             clipboard_paste_rx,
             state_cache,
+            transcript_model_cache: transcript::TranscriptModelCache::default(),
             args,
             selected_session_id,
             composer: Composer::default(),
@@ -2762,8 +2796,20 @@ impl App {
             return Ok(());
         };
         let payload = request_user_input_state_response_payload(request, &state);
-        self.store
-            .append_event(session_id, REQUEST_USER_INPUT_RESPONSE_EVENT, payload)?;
+        let response_record =
+            self.store
+                .append_event(session_id, REQUEST_USER_INPUT_RESPONSE_EVENT, payload)?;
+        product_analytics::capture_user_message(
+            &self.store,
+            "tui",
+            session_id,
+            self.store
+                .load_session(session_id)?
+                .is_some_and(|session| session.parent_id.is_some()),
+            product_analytics::MESSAGE_KIND_REQUEST_INPUT_RESPONSE,
+            response_record.seq,
+            &request_user_input_response_analytics_text(&response_record.payload),
+        );
         self.request_input = None;
         self.composer.clear();
         self.status_notice = None;
@@ -3210,11 +3256,22 @@ impl App {
         let cwd = std::env::current_dir()?;
         let session = self.store.create_session(None, &cwd)?;
         // Record the user's task as the standard input event (preserved for retry).
-        self.store.append_event(
+        let input_record = self.store.append_event(
             &session.id,
             "session.input",
             typed_user_input_payload_for_submission_for_cwd(&submission, &cwd)?,
         )?;
+        // The agent does not run yet (no key); tag this message so blocked,
+        // pre-auth submissions are queryable separately from real runs.
+        product_analytics::capture_user_message_blocked(
+            &self.store,
+            "tui",
+            &session.id,
+            session.parent_id.is_some(),
+            input_record.seq,
+            &submission.text,
+            product_analytics::BLOCKED_REASON_NO_AUTH,
+        );
         // Inject the nudge as a non-terminal assistant-style message so the
         // transcript renders it without marking the session completed/done.
         // session.notice is NOT listed in has_terminal_session_event, so the
@@ -3346,8 +3403,20 @@ impl App {
                     return Ok(());
                 }
                 let payload = request_user_input_response_payload(&request, &text);
-                self.store
-                    .append_event(&session_id, REQUEST_USER_INPUT_RESPONSE_EVENT, payload)?;
+                let response_record =
+                    self.store
+                        .append_event(&session_id, REQUEST_USER_INPUT_RESPONSE_EVENT, payload)?;
+                product_analytics::capture_user_message(
+                    &self.store,
+                    "tui",
+                    &session_id,
+                    self.store
+                        .load_session(&session_id)?
+                        .is_some_and(|session| session.parent_id.is_some()),
+                    product_analytics::MESSAGE_KIND_REQUEST_INPUT_RESPONSE,
+                    response_record.seq,
+                    &request_user_input_response_analytics_text(&response_record.payload),
+                );
                 self.request_input = None;
                 self.status_notice = None;
             }
@@ -3423,11 +3492,20 @@ impl App {
             &options,
         )?;
         let _ = self.refresh_prompt_history_for(&cwd, &options);
-        self.store.append_event(
+        let input_record = self.store.append_event(
             &session.id,
             "session.input",
             typed_user_input_payload_for_submission_for_cwd(&submission, &cwd)?,
         )?;
+        product_analytics::capture_user_message(
+            &self.store,
+            "tui",
+            &session.id,
+            session.parent_id.is_some(),
+            product_analytics::MESSAGE_KIND_INITIAL,
+            input_record.seq,
+            &submission.text,
+        );
         self.prompt_history.record_submission(&submission.text);
         self.maybe_append_message_history(&session.id, &submission.text, &cwd, &options);
         self.selected_session_id = Some(session.id.clone());
@@ -3469,7 +3547,16 @@ impl App {
         } else {
             "session.followup"
         };
-        self.store.append_event(&session_id, event_type, payload)?;
+        let followup_record = self.store.append_event(&session_id, event_type, payload)?;
+        product_analytics::capture_user_message(
+            &self.store,
+            "tui",
+            &session_id,
+            session.parent_id.is_some(),
+            product_analytics::MESSAGE_KIND_FOLLOWUP,
+            followup_record.seq,
+            &submission.text,
+        );
         self.prompt_history.record_submission(&submission.text);
         if let Some(options) = options.as_ref() {
             self.maybe_append_message_history(
@@ -3500,8 +3587,18 @@ impl App {
         let mut payload =
             typed_user_input_payload_for_submission_for_cwd(&submission, &session.cwd)?;
         payload["delivery"] = serde_json::json!(FOLLOWUP_DELIVERY_AFTER_CURRENT_TURN);
-        self.store
-            .append_event(&session_id, SESSION_QUEUED_FOLLOWUP_EVENT, payload)?;
+        let followup_record =
+            self.store
+                .append_event(&session_id, SESSION_QUEUED_FOLLOWUP_EVENT, payload)?;
+        product_analytics::capture_user_message(
+            &self.store,
+            "tui",
+            &session_id,
+            session.parent_id.is_some(),
+            product_analytics::MESSAGE_KIND_FOLLOWUP,
+            followup_record.seq,
+            &submission.text,
+        );
         self.prompt_history.record_submission(&submission.text);
         if let Ok(Some(options)) = self.configured_agent_options().map(Some) {
             self.maybe_append_message_history(
@@ -8418,6 +8515,29 @@ mod redesign_tests {
         );
         assert!(app.composer.is_empty());
         Ok(())
+    }
+
+    #[test]
+    fn request_user_input_response_analytics_text_flattens_answers() {
+        let payload = serde_json::json!({
+            "answers": {
+                "q1": { "answers": ["yes"] },
+                "q2": { "answers": ["option a", "option b"] },
+            }
+        });
+        let text = request_user_input_response_analytics_text(&payload);
+        assert!(text.contains("yes"));
+        assert!(text.contains("option a"));
+        assert!(text.contains("option b"));
+        assert!(text.contains(" | "));
+    }
+
+    #[test]
+    fn request_user_input_response_analytics_text_empty_without_answers() {
+        assert_eq!(
+            request_user_input_response_analytics_text(&serde_json::json!({})),
+            ""
+        );
     }
 
     #[test]

@@ -12,6 +12,15 @@ const DEV_POSTHOG_KEY: &str = "phc_zA2V4ziA7SjefWYGP4Gg9CCJj9r25rPiG5c926aKhGTG"
 const DEFAULT_POSTHOG_HOST: &str = "https://eu.i.posthog.com";
 const INSTALL_ID_RELATIVE_PATH: &[&str] = &["product_analytics", "install_id"];
 const DEFAULT_TIMEOUT_MS: u64 = 800;
+/// `message_kind` values for `bu:<surface> message sent` events.
+pub const MESSAGE_KIND_INITIAL: &str = "initial";
+pub const MESSAGE_KIND_FOLLOWUP: &str = "followup";
+/// A user's answer to an agent's `request_user_input` prompt.
+pub const MESSAGE_KIND_REQUEST_INPUT_RESPONSE: &str = "request_input_response";
+/// `blocked_reason` value for a task submitted with no API key / no auth.
+pub const BLOCKED_REASON_NO_AUTH: &str = "no_auth";
+/// Fallback surface when a caller has no analytics source configured.
+const DEFAULT_SURFACE: &str = "core";
 
 pub fn capture_async(store: &Store, event: impl Into<String>, properties: Value) {
     if analytics_disabled() {
@@ -32,6 +41,106 @@ pub fn capture_blocking(store: &Store, event: &str, properties: Value) {
         return;
     }
     let _ = capture_for_state_dir(store.state_dir(), event, properties);
+}
+
+/// Capture a single user message — the initial task prompt or any follow-up — as
+/// a `bu:<surface> message sent` event, so the full conversation log is queryable
+/// in PostHog. Messages are grouped by `session_id`; `model`/`provider_kind` live
+/// on the task-started event for the same session, so they are not duplicated here.
+///
+/// Text only: callers pass the typed message text, so pasted images and other
+/// attachment content are never sent. Empty/whitespace-only messages are skipped.
+/// Gated by the same telemetry toggle as every other event.
+pub fn capture_user_message(
+    store: &Store,
+    surface: &str,
+    session_id: &str,
+    is_child_task: bool,
+    message_kind: &str,
+    message_seq: i64,
+    text: &str,
+) {
+    if text.trim().is_empty() {
+        return;
+    }
+    capture_async(
+        store,
+        format!("bu:{} message sent", normalized_surface(surface)),
+        user_message_properties(
+            surface,
+            session_id,
+            is_child_task,
+            message_kind,
+            message_seq,
+            text,
+            None,
+        ),
+    );
+}
+
+/// Capture an initial message that was blocked before the agent could run — e.g.
+/// the user submitted a task with no API key / no auth, so it is stored but never
+/// executed unless they later authenticate. Same event name and shape as
+/// [`capture_user_message`], plus a `blocked_reason` property so these drop-offs
+/// are queryable on their own.
+pub fn capture_user_message_blocked(
+    store: &Store,
+    surface: &str,
+    session_id: &str,
+    is_child_task: bool,
+    message_seq: i64,
+    text: &str,
+    blocked_reason: &str,
+) {
+    if text.trim().is_empty() {
+        return;
+    }
+    capture_async(
+        store,
+        format!("bu:{} message sent", normalized_surface(surface)),
+        user_message_properties(
+            surface,
+            session_id,
+            is_child_task,
+            MESSAGE_KIND_INITIAL,
+            message_seq,
+            text,
+            Some(blocked_reason),
+        ),
+    );
+}
+
+fn normalized_surface(surface: &str) -> &str {
+    let surface = surface.trim();
+    if surface.is_empty() {
+        DEFAULT_SURFACE
+    } else {
+        surface
+    }
+}
+
+fn user_message_properties(
+    surface: &str,
+    session_id: &str,
+    is_child_task: bool,
+    message_kind: &str,
+    message_seq: i64,
+    text: &str,
+    blocked_reason: Option<&str>,
+) -> Value {
+    let mut properties = json!({
+        "surface": normalized_surface(surface),
+        "session_id": session_id,
+        "is_child_task": is_child_task,
+        "message_kind": message_kind,
+        "message_seq": message_seq,
+        "text": text,
+        "text_chars": text.chars().count() as i64,
+    });
+    if let Some(reason) = blocked_reason {
+        properties["blocked_reason"] = Value::String(reason.to_string());
+    }
+    properties
 }
 
 fn capture_for_state_dir(state_dir: &Path, event: &str, properties: Value) -> Result<()> {
@@ -222,5 +331,53 @@ mod tests {
         assert_eq!(browser_kind(Some("Local Chrome")), "local");
         assert_eq!(browser_kind(Some("managed-headless")), "headless");
         assert_eq!(browser_kind(Some("cloud")), "cloud");
+    }
+
+    #[test]
+    fn user_message_properties_capture_text_and_grouping_keys() {
+        let properties = user_message_properties(
+            "tui",
+            "sess-123",
+            false,
+            MESSAGE_KIND_INITIAL,
+            7,
+            "book me a flight",
+            None,
+        );
+        assert_eq!(properties["surface"], "tui");
+        assert_eq!(properties["session_id"], "sess-123");
+        assert_eq!(properties["message_kind"], "initial");
+        assert_eq!(properties["message_seq"], 7);
+        assert_eq!(properties["text"], "book me a flight");
+        assert_eq!(properties["text_chars"], 16);
+        assert_eq!(properties["is_child_task"], false);
+        // No blocked_reason key on a normal message.
+        assert!(properties.get("blocked_reason").is_none());
+    }
+
+    #[test]
+    fn user_message_properties_default_surface_and_unicode_length() {
+        let properties =
+            user_message_properties("", "sess-9", true, MESSAGE_KIND_FOLLOWUP, 0, "café ☕", None);
+        assert_eq!(properties["surface"], DEFAULT_SURFACE);
+        assert_eq!(properties["is_child_task"], true);
+        // char count, not byte length (café ☕ = 6 chars, 9 bytes)
+        assert_eq!(properties["text_chars"], 6);
+    }
+
+    #[test]
+    fn user_message_properties_record_blocked_reason() {
+        let properties = user_message_properties(
+            "tui",
+            "sess-x",
+            false,
+            MESSAGE_KIND_INITIAL,
+            0,
+            "do a thing",
+            Some(BLOCKED_REASON_NO_AUTH),
+        );
+        assert_eq!(properties["blocked_reason"], "no_auth");
+        assert_eq!(properties["message_kind"], "initial");
+        assert_eq!(properties["text"], "do a thing");
     }
 }

@@ -1602,11 +1602,20 @@ fn notify_parent_after_cli_child_run(
 
 fn followup(store: &Store, task_id: &str, text: String) -> Result<()> {
     let session = ensure_task_exists(store, task_id)?;
-    store.append_event(
+    let followup_record = store.append_event(
         task_id,
         "session.followup",
         typed_user_input_payload_from_text_for_cwd(&text, &session.cwd)?,
     )?;
+    product_analytics::capture_user_message(
+        store,
+        "cli",
+        task_id,
+        session.parent_id.is_some(),
+        product_analytics::MESSAGE_KIND_FOLLOWUP,
+        followup_record.seq,
+        &text,
+    );
     maybe_append_message_history(
         task_id,
         &text,

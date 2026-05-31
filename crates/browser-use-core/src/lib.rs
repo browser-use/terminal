@@ -1227,11 +1227,20 @@ pub fn start_review_session(store: &Store, prompt: &str, cwd: impl AsRef<Path>) 
     )?;
     let options = review_mode_options(AgentRunOptions::default());
     append_workspace_context_event_with_options(store, &session, &options)?;
-    store.append_event(
+    let input_record = store.append_event(
         &session.id,
         "session.input",
         typed_user_input_payload_from_text_for_cwd(prompt, cwd)?,
     )?;
+    product_analytics::capture_user_message(
+        store,
+        options.analytics_source.as_deref().unwrap_or("core"),
+        &session.id,
+        session.parent_id.is_some(),
+        product_analytics::MESSAGE_KIND_INITIAL,
+        input_record.seq,
+        prompt,
+    );
     Ok(session.id)
 }
 
@@ -1640,11 +1649,20 @@ pub fn run_agent_with_provider<P: ModelProvider>(
 ) -> Result<String> {
     let session = store.create_session(None, cwd.as_ref())?;
     append_workspace_context_event_with_options(store, &session, &options)?;
-    store.append_event(
+    let input_record = store.append_event(
         &session.id,
         "session.input",
         typed_user_input_payload_from_text_for_cwd(task_text, cwd.as_ref())?,
     )?;
+    product_analytics::capture_user_message(
+        store,
+        options.analytics_source.as_deref().unwrap_or("core"),
+        &session.id,
+        session.parent_id.is_some(),
+        product_analytics::MESSAGE_KIND_INITIAL,
+        input_record.seq,
+        task_text,
+    );
     let messages = provider_messages_from_events(&store.events_for_session(&session.id)?);
     run_loaded_session_with_provider(store, provider, session, messages, options)
 }
@@ -1657,11 +1675,20 @@ pub fn run_agent_from_config(
 ) -> Result<String> {
     let session = store.create_session(None, cwd.as_ref())?;
     append_workspace_context_event_with_options(store, &session, &config.options)?;
-    store.append_event(
+    let input_record = store.append_event(
         &session.id,
         "session.input",
         typed_user_input_payload_from_text_for_cwd(task_text, cwd.as_ref())?,
     )?;
+    product_analytics::capture_user_message(
+        store,
+        config.options.analytics_source.as_deref().unwrap_or("core"),
+        &session.id,
+        session.parent_id.is_some(),
+        product_analytics::MESSAGE_KIND_INITIAL,
+        input_record.seq,
+        task_text,
+    );
     run_existing_session_from_config(store, &session.id, config)
 }
 
@@ -23108,7 +23135,16 @@ fn dispatch_spawn_agent_tool_with_hooks<P: ModelProvider>(
     } else {
         typed_user_input_payload_from_text_for_cwd(message.trim(), Path::new(&child.cwd))?
     };
-    store.append_event(&child.id, "session.input", input_payload)?;
+    let child_input_record = store.append_event(&child.id, "session.input", input_payload)?;
+    product_analytics::capture_user_message(
+        store,
+        child_options.analytics_source.as_deref().unwrap_or("core"),
+        &child.id,
+        true,
+        product_analytics::MESSAGE_KIND_INITIAL,
+        child_input_record.seq,
+        message.trim(),
+    );
     store.append_event(
         &session.id,
         "agent.spawned",
