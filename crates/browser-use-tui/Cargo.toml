@@ -27,6 +27,7 @@ serde_json.workspace = true
 signal-hook = "0.3.18"
 syntect.workspace = true
 tempfile.workspace = true
+terminal-colorsaurus.workspace = true
 toml.workspace = true
 tokio = { workspace = true, features = ["rt", "rt-multi-thread", "macros", "io-util", "sync", "time", "net"] }
 tokio-util.workspace = true

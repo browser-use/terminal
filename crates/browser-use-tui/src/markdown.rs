@@ -968,9 +968,12 @@ fn syntax_set() -> &'static SyntaxSet {
 fn syntax_theme() -> &'static Theme {
     static THEME: OnceLock<Theme> = OnceLock::new();
     THEME.get_or_init(|| {
-        two_face::theme::extra()
-            .get(EmbeddedThemeName::CatppuccinMocha)
-            .clone()
+        let name = if crate::theme::is_light() {
+            EmbeddedThemeName::CatppuccinLatte
+        } else {
+            EmbeddedThemeName::CatppuccinMocha
+        };
+        two_face::theme::extra().get(name).clone()
     })
 }
 

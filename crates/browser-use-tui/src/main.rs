@@ -7195,6 +7195,7 @@ fn main() -> Result<()> {
         return Ok(());
     }
     app.track_app_opened();
+    theme::init(theme::detect_palette());
     run_terminal(app)
 }
 
