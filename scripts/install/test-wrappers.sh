@@ -101,6 +101,11 @@ fi
 
 update_visible_commands
 
+assert_eq "$HOME/.zshrc" "$(SHELL=/bin/zsh os=darwin pick_profile)" "macOS zsh writes to interactive ~/.zshrc"
+assert_eq "$HOME/.bashrc" "$(SHELL=/bin/bash os=darwin pick_profile)" "macOS bash writes to interactive ~/.bashrc"
+assert_eq "$HOME/.zshrc" "$(SHELL=/usr/bin/zsh os=linux pick_profile)" "Linux zsh writes to interactive ~/.zshrc"
+assert_eq "$HOME/.bashrc" "$(SHELL=/bin/bash os=linux pick_profile)" "Linux bash writes to interactive ~/.bashrc"
+
 PATH_WITHOUT_BIN="$PATH"
 case ":$PATH_WITHOUT_BIN:" in
   *":$BIN_DIR:"*)

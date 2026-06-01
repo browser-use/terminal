@@ -216,17 +216,11 @@ resolve_version() {
 }
 
 pick_profile() {
-  case "$os:${SHELL:-}" in
-    darwin:*/zsh)
-      printf '%s\n' "$HOME/.zprofile"
-      ;;
-    darwin:*/bash)
-      printf '%s\n' "$HOME/.bash_profile"
-      ;;
-    linux:*/zsh)
+  case "${SHELL:-}" in
+    */zsh)
       printf '%s\n' "$HOME/.zshrc"
       ;;
-    linux:*/bash)
+    */bash)
       printf '%s\n' "$HOME/.bashrc"
       ;;
     *)
