@@ -966,15 +966,21 @@ fn syntax_set() -> &'static SyntaxSet {
 }
 
 fn syntax_theme() -> &'static Theme {
-    static THEME: OnceLock<Theme> = OnceLock::new();
-    THEME.get_or_init(|| {
-        let name = if crate::theme::is_light() {
-            EmbeddedThemeName::CatppuccinLatte
-        } else {
-            EmbeddedThemeName::CatppuccinMocha
-        };
-        two_face::theme::extra().get(name).clone()
-    })
+    static DARK: OnceLock<Theme> = OnceLock::new();
+    static LIGHT: OnceLock<Theme> = OnceLock::new();
+    if crate::theme::is_light() {
+        LIGHT.get_or_init(|| {
+            two_face::theme::extra()
+                .get(EmbeddedThemeName::CatppuccinLatte)
+                .clone()
+        })
+    } else {
+        DARK.get_or_init(|| {
+            two_face::theme::extra()
+                .get(EmbeddedThemeName::CatppuccinMocha)
+                .clone()
+        })
+    }
 }
 
 fn find_syntax(lang: &str) -> Option<&'static SyntaxReference> {
