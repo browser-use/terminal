@@ -132,9 +132,17 @@ impl PythonWorker {
     ) -> Result<Self> {
         if std::env::var_os("LLM_BROWSER_PYTHON_WORKER_DIRECT").is_none() {
             let uv = PathBuf::from("uv");
+            // Pin Python >= 3.11. Without this, `uv run` selects an interpreter via
+            // discovery order, which on a default macOS box is Apple's frozen
+            // /usr/bin/python3 (3.9.6). That fails to satisfy `cdp-use`'s
+            // `requires-python >= 3.11`, so `uv` exits before the worker can speak
+            // and the user only sees "python worker exited before responding".
+            // `>=3.11` lets uv reuse any compatible interpreter or fetch a managed one.
             let args = [
                 "run",
                 "--quiet",
+                "--python",
+                ">=3.11",
                 "--with",
                 "cdp-use==1.4.5",
                 "--with",
