@@ -4224,6 +4224,15 @@ pub fn local_chrome_attach_candidates() -> Vec<LocalChromeDebuggingDisabled> {
         .collect()
 }
 
+pub fn local_chrome_cdp_is_reachable() -> bool {
+    if tcp_port_open("127.0.0.1", 9222) {
+        return true;
+    }
+    local_candidates()
+        .iter()
+        .any(|candidate| candidate.connectable)
+}
+
 /// Narrower check used by the browser picker (`save_browser`): only flag
 /// installs whose `Local State` makes the setup itself broken — `user-enabled`
 /// explicitly `false`, or unset with Chrome running. Picking Local Chrome from

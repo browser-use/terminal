@@ -5340,23 +5340,20 @@ impl App {
         }
         self.last_local_chrome_debugging_poll = Some(Instant::now());
 
-        let candidates = browser_use_browser::local_chrome_attach_candidates();
-        if candidates.is_empty() {
-            self.status_notice = Some(
-                "Open Chrome and visit chrome://inspect to flip the switch — I'll pick it up from there."
-                    .to_string(),
-            );
+        if !browser_use_browser::local_chrome_cdp_is_reachable() {
+            let candidates = browser_use_browser::local_chrome_attach_candidates();
+            if candidates.is_empty() {
+                self.status_notice = Some(
+                    "Open Chrome and visit chrome://inspect to flip the switch — I'll pick it up from there."
+                        .to_string(),
+                );
+            } else {
+                self.pending_local_chrome_debugging_disabled = candidates;
+            }
             return Ok(true);
         }
 
-        let needs_toggle = candidates
-            .iter()
-            .any(|entry| entry.user_enabled != Some(true));
-        self.pending_local_chrome_debugging_disabled = candidates;
-        if needs_toggle {
-            return Ok(false);
-        }
-
+        // CDP port is open → toggle is on → resume.
         self.pending_local_chrome_debugging_setup_wait = false;
         self.last_local_chrome_debugging_poll = None;
         self.status_notice =
