@@ -137,7 +137,6 @@ const INPUT_POLL_INTERVAL: Duration = Duration::from_millis(25);
 const RESIZE_DEBOUNCE_INTERVAL: Duration = Duration::from_millis(80);
 const ANIM_TICK_INTERVAL: Duration = Duration::from_millis(16); // ~60 fps
 const LIVE_SPINNER_TICK_INTERVAL: Duration = Duration::from_millis(120);
-const LOCAL_CHROME_DEBUGGING_POLL_INTERVAL: Duration = Duration::from_millis(50);
 const REEXEC_BINARY_ENV: &str = "BUT_REEXEC_BINARY";
 const REEXEC_SESSION_ENV: &str = "BUT_REEXEC_SESSION_ID";
 const CODEX_DEVICE_AUTH_URL: &str = "https://auth.openai.com/codex/device";
@@ -220,7 +219,6 @@ enum Surface {
     Mode,
     Browser,
     BrowserSelect,
-    EnableDebuggingConfirm,
     CookieSync,
     Goal,
     History,
@@ -239,7 +237,6 @@ impl Surface {
                 | Self::Mode
                 | Self::Browser
                 | Self::BrowserSelect
-                | Self::EnableDebuggingConfirm
                 | Self::CookieSync
                 | Self::Goal
                 | Self::History
@@ -948,41 +945,6 @@ struct App {
     pending_auth_resume: Option<String>,
     pending_initial_goal: Option<String>,
     pending_goal_replacement: Option<PendingGoalReplacement>,
-    /// Local Chrome installs detected at `save_browser` time that have remote
-    /// debugging explicitly disabled. Set right before `Surface::EnableDebuggingConfirm`
-    /// opens; consumed by the confirm/skip handlers.
-    pending_local_chrome_debugging_disabled: Vec<browser_use_browser::LocalChromeDebuggingDisabled>,
-    /// What to resume after the `Surface::EnableDebuggingConfirm` dialog is
-    /// dismissed. `None` for the picker entry (just close the dialog); `Some`
-    /// for any agent run or browser reconnect that we deferred because Chrome
-    /// debugging was off when the user tried to start it.
-    pending_post_debugging_action: Option<PendingPostDebuggingAction>,
-    /// True after Continue opened chrome://inspect for a revoked/unset Local
-    /// Chrome remote-debugging grant. While this is true the modal stays open
-    /// and the terminal loop polls Local State until Chrome records the user's
-    /// toggle, then resumes the deferred action automatically.
-    pending_local_chrome_debugging_setup_wait: bool,
-    last_local_chrome_debugging_poll: Option<Instant>,
-    /// Session id of an agent we just spawned that's about to trigger Chrome's
-    /// per-session "Allow remote debugging?" popup. While this is Some the
-    /// modal stays open in its "click Allow in Chrome" hand-holding state and
-    /// auto-closes the moment a new `browser.connected` event lands on this
-    /// session (seq > `pending_chrome_per_session_baseline_seq`). Watching a
-    /// fresh event instead of `state.browser.status` avoids the mid-conversation
-    /// bug where a previous turn's "connected" status leaked through and
-    /// closed the modal before the new attach even started.
-    pending_chrome_per_session_prompt: Option<String>,
-    pending_chrome_per_session_baseline_seq: Option<i64>,
-}
-
-/// Work that was paused mid-flight because `Surface::EnableDebuggingConfirm`
-/// opened. The Allow handler re-runs the action after enabling debugging; the
-/// Skip handler marks the session as failed so the user isn't left staring at
-/// a stuck "running" state.
-#[derive(Clone, Debug)]
-enum PendingPostDebuggingAction {
-    StartAgent { session_id: String },
-    ReconnectBrowser { session_id: String },
 }
 
 #[derive(Debug)]
@@ -1859,12 +1821,6 @@ impl App {
             pending_auth_resume: None,
             pending_initial_goal: None,
             pending_goal_replacement: None,
-            pending_local_chrome_debugging_disabled: Vec::new(),
-            pending_post_debugging_action: None,
-            pending_local_chrome_debugging_setup_wait: false,
-            last_local_chrome_debugging_poll: None,
-            pending_chrome_per_session_prompt: None,
-            pending_chrome_per_session_baseline_seq: None,
         };
         app.refresh_cached_projection();
         if resumed_from_reexec {
@@ -2836,30 +2792,6 @@ impl App {
             self.claude_code_oauth = None;
             self.codex_login = None;
         }
-        if matches!(self.surface, Surface::EnableDebuggingConfirm) {
-            self.pending_local_chrome_debugging_disabled.clear();
-            self.pending_local_chrome_debugging_setup_wait = false;
-            self.last_local_chrome_debugging_poll = None;
-            self.pending_chrome_per_session_prompt = None;
-            self.pending_chrome_per_session_baseline_seq = None;
-            // Esc out = Skip for any deferred work. Only fail the session for
-            // StartAgent — that session was newly created with no agent
-            // thread to back it. A ReconnectBrowser action belongs to an
-            // existing active session; declining the reconnect must not kill
-            // the whole session.
-            if let Some(PendingPostDebuggingAction::StartAgent { session_id }) =
-                self.pending_post_debugging_action.take()
-            {
-                let _ = self.store.append_event(
-                    &session_id,
-                    "session.status",
-                    serde_json::json!({
-                        "status": "failed",
-                        "reason": "local-chrome-debugging-disabled",
-                    }),
-                );
-            }
-        }
         self.surface = Surface::Main;
         self.selected_row = 0;
         self.history_filter.clear();
@@ -3333,34 +3265,11 @@ impl App {
         Ok(())
     }
 
-    fn start_agent_for_session(&mut self, session_id: String) -> Result<()> {
+    fn start_agent_for_session(&self, session_id: String) -> Result<()> {
         let selection = self.session_model_selection_or_current(&session_id)?;
         if matches!(selection.backend, AgentBackend::None) {
             return Ok(());
         }
-        // Pre-flight: if the user has Local Chrome selected and Chrome is
-        // running, defer the agent start and pop the EnableDebuggingConfirm
-        // heads-up. Catches every TUI entry point that funnels through here —
-        // new tasks, retries, queued follow-up flush, goal continuations,
-        // resume-from-history — without duplicating the check in each one.
-        if self.maybe_open_local_chrome_debugging_dialog(PendingPostDebuggingAction::StartAgent {
-            session_id: session_id.clone(),
-        }) {
-            return Ok(());
-        }
-        self.spawn_agent_thread_for_session(session_id, selection)
-    }
-
-    /// Pure thread-spawn for `start_agent_for_session`. Does NOT run the
-    /// Local Chrome pre-flight. Used by `start_agent_for_session` after the
-    /// gate passes, AND by `resume_after_debugging_dialog` after the user
-    /// presses Continue on the heads-up — otherwise the gate would re-trigger
-    /// and re-open the modal indefinitely.
-    fn spawn_agent_thread_for_session(
-        &self,
-        session_id: String,
-        selection: SessionModelSelection,
-    ) -> Result<()> {
         let state_dir = self.args.state_dir.clone();
         let backend = selection.backend;
         let model = selection.provider_model.clone();
@@ -4389,27 +4298,6 @@ impl App {
             Surface::BrowserSelect => {
                 self.dispatch(AppCommand::SaveBrowser(self.selected_row))?;
             }
-            Surface::EnableDebuggingConfirm => {
-                // Three states, each with its own row layout:
-                //   per-session wait → Cancel (sole row)
-                //   toggle wait      → Reopen | Cancel
-                //   default          → Continue | Cancel
-                // Keep these indices in lock-step with `enable_debugging_confirm_lines`
-                // and `selectable_row_count`.
-                if self.pending_chrome_per_session_prompt.is_some() {
-                    self.skip_local_chrome_debugging_and_resume()?;
-                } else if self.pending_local_chrome_debugging_setup_wait {
-                    match self.selected_row.min(1) {
-                        0 => self.reopen_local_chrome_debugging_setup_page()?,
-                        _ => self.skip_local_chrome_debugging_and_resume()?,
-                    }
-                } else {
-                    match self.selected_row.min(1) {
-                        0 => self.continue_local_chrome_debugging_and_resume()?,
-                        _ => self.skip_local_chrome_debugging_and_resume()?,
-                    }
-                }
-            }
             Surface::CookieSync => self.execute_cookie_sync_selection()?,
             Surface::Goal => self.close_surface(),
             Surface::Messages => self.edit_selected_message()?,
@@ -5239,14 +5127,7 @@ impl App {
         let choice = BROWSER_CHOICES
             .get(index.min(BROWSER_CHOICES.len().saturating_sub(1)))
             .unwrap_or(&BROWSER_CHOICES[0]);
-        let new_browser = (*choice).to_string();
-        if self.browser != new_browser && self.current_task_is_active()? {
-            self.status_notice =
-                Some("Browser can change after the running turn finishes.".to_string());
-            self.close_surface();
-            return Ok(());
-        }
-        self.browser = new_browser;
+        self.browser = (*choice).to_string();
         self.track_browser_selected();
         self.persist_runtime_settings()?;
         if self.browser == BROWSER_USE_CLOUD && !self.browser_use_cloud_key_ready()? {
@@ -5257,287 +5138,6 @@ impl App {
             return Ok(());
         }
         self.status_notice = Some(format!("Browser set to {}.", self.browser));
-        if self.browser == BROWSER_LOCAL_CHROME && self.check_and_open_debugging_dialog_no_action()
-        {
-            return Ok(());
-        }
-        if !self.setup_complete && self.model_configured && self.account_ready(&self.account)? {
-            self.complete_setup()?;
-            self.close_surface();
-        } else if !self.setup_complete {
-            self.open_surface(Surface::Setup);
-        } else {
-            self.close_surface();
-        }
-        Ok(())
-    }
-
-    /// User clicked Continue. Two branches:
-    ///
-    /// * Any install has `user-enabled != Some(true)` (revoked or never set):
-    ///   Chrome will block CDP entirely until the user toggles "Allow remote
-    ///   debugging for this browser instance" on. Spawning the agent now is
-    ///   pointless — it'd just fail with `cdp-disabled` and Chrome would
-    ///   never even consider showing its per-session prompt. So we open
-    ///   chrome://inspect, keep the dialog open, and poll until Chrome records
-    ///   the toggle before resuming the deferred work.
-    ///
-    /// * Every install has `user-enabled == Some(true)`: permission to use
-    ///   CDP is granted, so spawn the agent immediately. Chrome 136+'s
-    ///   per-session "Allow remote debugging?" prompt fires on the first CDP
-    ///   attach — that's exactly the popup the modal warned about.
-    ///
-    /// We do NOT quit, restart, or edit Chrome — pre-setting `Local State`
-    /// doesn't bypass the per-session prompt, and quitting kills tabs.
-    fn continue_local_chrome_debugging_and_resume(&mut self) -> Result<()> {
-        // Re-read Chrome's current state instead of trusting the snapshot
-        // taken when the modal opened. The user may have toggled the
-        // checkbox in chrome://inspect (on or off) between then and now; a
-        // stale read would route to the wrong branch — e.g. "click Allow on
-        // Chrome's popup" when permission is actually still revoked.
-        let fresh = browser_use_browser::local_chrome_attach_candidates();
-        if !fresh.is_empty() {
-            self.pending_local_chrome_debugging_disabled = fresh;
-        }
-        let needs_toggle = self
-            .pending_local_chrome_debugging_disabled
-            .iter()
-            .any(|entry| entry.user_enabled != Some(true));
-        if needs_toggle {
-            // Pass the first running install's name so `open` can target the
-            // right Chrome variant (Canary, Brave, etc) instead of always
-            // defaulting to stock Google Chrome.
-            let hint = self
-                .pending_local_chrome_debugging_disabled
-                .first()
-                .map(|entry| entry.browser_name.as_str());
-            let result = browser_use_browser::open_local_chrome_debugging_setup(hint);
-            let notice = if result.opened {
-                "Opened Chrome's permission page. Check the box, and I'll resume.".to_string()
-            } else {
-                "Couldn't open Chrome's permission page from here. In Chrome, go to chrome://inspect and flip the switch — I'll pick it up.".to_string()
-            };
-            self.status_notice = Some(notice);
-            self.pending_local_chrome_debugging_setup_wait = true;
-            self.last_local_chrome_debugging_poll = None;
-            // Waiting state's row 0 is Reopen (not Continue); reset so the
-            // highlight lands cleanly on it.
-            self.selected_row = 0;
-            return Ok(());
-        }
-        self.status_notice =
-            Some("Chrome will ask permission in a moment — click Allow.".to_string());
-        let resume_action = self.pending_post_debugging_action.take();
-        self.resume_after_debugging_dialog(resume_action)
-    }
-
-    /// Waiting-state "Reopen Chrome permission page" button. If the user
-    /// closed or lost the chrome://inspect tab, this opens it again. We stay
-    /// in the waiting state — the poller is still watching for the toggle.
-    fn reopen_local_chrome_debugging_setup_page(&mut self) -> Result<()> {
-        let hint = self
-            .pending_local_chrome_debugging_disabled
-            .first()
-            .map(|entry| entry.browser_name.as_str());
-        let result = browser_use_browser::open_local_chrome_debugging_setup(hint);
-        self.status_notice = Some(if result.opened {
-            "Reopened Chrome's permission page.".to_string()
-        } else {
-            "Couldn't open Chrome from here. Type chrome://inspect in Chrome's address bar and flip the switch.".to_string()
-        });
-        // Keep polling — the toggle will trigger resume regardless.
-        Ok(())
-    }
-
-    /// Auto-close the EnableDebuggingConfirm modal the instant the agent
-    /// records a FRESH `browser.connected` event on the session we're
-    /// hand-holding. "Fresh" means seq > baseline that we captured when the
-    /// per-session wait started; this avoids leftover "connected" state from
-    /// previous turns closing the modal before the new attach even runs.
-    fn poll_pending_chrome_per_session_prompt(&mut self) -> Result<bool> {
-        let Some(session_id) = self.pending_chrome_per_session_prompt.clone() else {
-            return Ok(false);
-        };
-        if !matches!(self.surface, Surface::EnableDebuggingConfirm) {
-            // Modal closed by something else (Cancel, Esc) — drop the watch.
-            self.pending_chrome_per_session_prompt = None;
-            self.pending_chrome_per_session_baseline_seq = None;
-            return Ok(false);
-        }
-        let baseline = self.pending_chrome_per_session_baseline_seq;
-        let latest_connected_seq = self
-            .store
-            .events_for_session(&session_id)?
-            .iter()
-            .rev()
-            .find(|event| event.event_type == "browser.connected")
-            .map(|event| event.seq);
-        let is_fresh = match (latest_connected_seq, baseline) {
-            (Some(latest), Some(baseline)) => latest > baseline,
-            (Some(_), None) => true,
-            _ => false,
-        };
-        if !is_fresh {
-            return Ok(false);
-        }
-        self.pending_chrome_per_session_prompt = None;
-        self.pending_chrome_per_session_baseline_seq = None;
-        self.status_notice = Some("Connected to Chrome.".to_string());
-        self.close_surface();
-        Ok(true)
-    }
-
-    fn poll_pending_local_chrome_debugging_setup(&mut self) -> Result<bool> {
-        if !self.pending_local_chrome_debugging_setup_wait
-            || !matches!(self.surface, Surface::EnableDebuggingConfirm)
-        {
-            return Ok(false);
-        }
-        if self
-            .last_local_chrome_debugging_poll
-            .is_some_and(|last| last.elapsed() < LOCAL_CHROME_DEBUGGING_POLL_INTERVAL)
-        {
-            return Ok(false);
-        }
-        self.last_local_chrome_debugging_poll = Some(Instant::now());
-
-        let candidates = browser_use_browser::local_chrome_attach_candidates();
-        if candidates.is_empty() {
-            self.status_notice = Some(
-                "Open Chrome and visit chrome://inspect to flip the switch — I'll pick it up from there."
-                    .to_string(),
-            );
-            return Ok(true);
-        }
-
-        let needs_toggle = candidates
-            .iter()
-            .any(|entry| entry.user_enabled != Some(true));
-        self.pending_local_chrome_debugging_disabled = candidates;
-        if needs_toggle {
-            return Ok(false);
-        }
-
-        self.pending_local_chrome_debugging_setup_wait = false;
-        self.last_local_chrome_debugging_poll = None;
-        self.status_notice =
-            Some("Got it. Click Allow on the popup that appears in Chrome.".to_string());
-        let resume_action = self.pending_post_debugging_action.take();
-        self.resume_after_debugging_dialog(resume_action)?;
-        Ok(true)
-    }
-
-    fn skip_local_chrome_debugging_and_resume(&mut self) -> Result<()> {
-        self.pending_local_chrome_debugging_disabled.clear();
-        self.pending_local_chrome_debugging_setup_wait = false;
-        self.last_local_chrome_debugging_poll = None;
-        let was_awaiting_per_session = self.pending_chrome_per_session_prompt.take().is_some();
-        self.pending_chrome_per_session_baseline_seq = None;
-        let resume_action = self.pending_post_debugging_action.take();
-        // If the agent thread is already running and we'd just dismiss the
-        // hand-holding modal, treat this as "close the modal, leave the agent
-        // alone" rather than failing the session — Chrome's per-session
-        // popup may still be on screen and the user can click Allow.
-        if was_awaiting_per_session {
-            self.status_notice = Some(
-                "Closed the heads-up. If Chrome's popup is still showing, you can still click Allow."
-                    .to_string(),
-            );
-            self.close_surface();
-            return Ok(());
-        }
-        self.status_notice = Some(
-            "Cancelled. Re-run the task whenever you're ready to grant Chrome permission."
-                .to_string(),
-        );
-        if let Some(action) = resume_action.as_ref() {
-            match action {
-                // The deferred session was newly created with status=running
-                // and no agent thread spawned. Without flipping it to failed
-                // the row sits spinning forever.
-                PendingPostDebuggingAction::StartAgent { session_id } => {
-                    self.store.append_event(
-                        session_id,
-                        "session.status",
-                        serde_json::json!({
-                            "status": "failed",
-                            "reason": "local-chrome-debugging-disabled",
-                        }),
-                    )?;
-                }
-                // A reconnect request belongs to an existing, active session.
-                // The user is declining to reconnect the browser; that should
-                // not kill the session. Just close the modal.
-                PendingPostDebuggingAction::ReconnectBrowser { .. } => {}
-            }
-            self.close_surface();
-            return Ok(());
-        }
-        if !self.setup_complete && self.model_configured && self.account_ready(&self.account)? {
-            self.complete_setup()?;
-            self.close_surface();
-        } else if !self.setup_complete {
-            self.open_surface(Surface::Setup);
-        } else {
-            self.close_surface();
-        }
-        Ok(())
-    }
-
-    /// Re-run the deferred work after the dialog closed. With no
-    /// `resume_action` we came from the picker, so fall back to the normal
-    /// post-`save_browser` flow. With one, re-run the agent start / reconnect.
-    fn resume_after_debugging_dialog(
-        &mut self,
-        resume_action: Option<PendingPostDebuggingAction>,
-    ) -> Result<()> {
-        if let Some(action) = resume_action {
-            return match action {
-                PendingPostDebuggingAction::StartAgent { session_id } => {
-                    // Bypass the Local Chrome gate — if we re-enter
-                    // start_agent_for_session here it'd find Chrome still
-                    // running and re-open the same modal indefinitely.
-                    let selection = self.session_model_selection_or_current(&session_id)?;
-                    if matches!(selection.backend, AgentBackend::None) {
-                        self.close_surface();
-                        return Ok(());
-                    }
-                    // Keep the modal open in its "click Allow on Chrome's
-                    // popup" hand-holding state. `poll_pending_chrome_per_session_prompt`
-                    // closes it the moment a NEW browser.connected event lands
-                    // (seq > baseline). The baseline is the latest
-                    // browser.connected seq this session has seen so far — a
-                    // previous turn's connected state must NOT trigger the
-                    // close, otherwise mid-conversation grants close the
-                    // modal before Chrome's actual per-session prompt fires.
-                    let baseline = self
-                        .store
-                        .events_for_session(&session_id)?
-                        .iter()
-                        .rev()
-                        .find(|event| event.event_type == "browser.connected")
-                        .map(|event| event.seq);
-                    self.pending_chrome_per_session_prompt = Some(session_id.clone());
-                    self.pending_chrome_per_session_baseline_seq = baseline;
-                    self.pending_local_chrome_debugging_setup_wait = false;
-                    self.last_local_chrome_debugging_poll = None;
-                    self.selected_row = 0;
-                    self.spawn_agent_thread_for_session(session_id, selection)
-                }
-                PendingPostDebuggingAction::ReconnectBrowser { session_id } => {
-                    self.close_surface();
-                    // Append the event directly rather than going through
-                    // request_reconnect_browser, which gates.
-                    self.store.append_event(
-                        &session_id,
-                        "browser.reconnect_requested",
-                        serde_json::json!({ "browser": self.browser }),
-                    )?;
-                    self.browser_notice = Some("Reconnect requested.".to_string());
-                    Ok(())
-                }
-            };
-        }
         if !self.setup_complete && self.model_configured && self.account_ready(&self.account)? {
             self.complete_setup()?;
             self.close_surface();
@@ -5818,13 +5418,6 @@ impl App {
             self.browser_notice = Some("No current browser task yet.".to_string());
             return Ok(());
         };
-        if self.maybe_open_local_chrome_debugging_dialog(
-            PendingPostDebuggingAction::ReconnectBrowser {
-                session_id: session_id.clone(),
-            },
-        ) {
-            return Ok(());
-        }
         self.store.append_event(
             &session_id,
             "browser.reconnect_requested",
@@ -5832,73 +5425,6 @@ impl App {
         )?;
         self.browser_notice = Some("Reconnect requested.".to_string());
         Ok(())
-    }
-
-    /// Picker entry: same check as `maybe_open_local_chrome_debugging_dialog`
-    /// but with no deferred action — `save_browser` just falls through to the
-    /// normal post-setup flow when Allow/Skip closes the dialog.
-    fn check_and_open_debugging_dialog_no_action(&mut self) -> bool {
-        #[cfg(test)]
-        {
-            false
-        }
-        #[cfg(not(test))]
-        {
-            let disabled = browser_use_browser::check_local_chrome_debugging_disabled();
-            if disabled.is_empty() {
-                return false;
-            }
-            self.pending_local_chrome_debugging_disabled = disabled;
-            self.open_surface(Surface::EnableDebuggingConfirm);
-            true
-        }
-    }
-
-    /// Common pre-flight used by every code path that's about to attach to
-    /// Local Chrome. Returns `true` when we opened the EnableDebuggingConfirm
-    /// dialog and stashed `action` — the caller must early-return. Returns
-    /// `false` when there's no running Chrome to attach to (the agent will
-    /// fail with its own error) and the caller should proceed.
-    ///
-    /// Fires on EVERY attach, not just when `Local State` says debugging is
-    /// off, because Chrome 136+ shows its own "Allow remote debugging?"
-    /// prompt on every new CDP connection regardless of `user-enabled`. The
-    /// terminal modal is a heads-up for that — without it, Chrome's prompt
-    /// pops with no in-terminal warning. Internal reconnects/tool retries
-    /// inside an already-running agent thread don't pass through this gate
-    /// (they happen inside the agent crate, not on a TUI command boundary),
-    /// so users aren't nagged mid-task.
-    ///
-    /// Disabled under `cfg(test)`: the test suite leaves browser="Local Chrome"
-    /// on `ready_app`, and the underlying probe would inspect the developer's
-    /// real `~/Library/Application Support/Google/Chrome/Local State` and the
-    /// real Chrome process list, making behavior non-deterministic across
-    /// machines. Tests cover the dialog's own state machine via
-    /// `pending_local_chrome_debugging_disabled` and
-    /// `Surface::EnableDebuggingConfirm` directly.
-    fn maybe_open_local_chrome_debugging_dialog(
-        &mut self,
-        action: PendingPostDebuggingAction,
-    ) -> bool {
-        if self.browser != BROWSER_LOCAL_CHROME || self.pending_post_debugging_action.is_some() {
-            return false;
-        }
-        #[cfg(test)]
-        {
-            let _ = action;
-            return false;
-        }
-        #[cfg(not(test))]
-        {
-            let candidates = browser_use_browser::local_chrome_attach_candidates();
-            if candidates.is_empty() {
-                return false;
-            }
-            self.pending_local_chrome_debugging_disabled = candidates;
-            self.pending_post_debugging_action = Some(action);
-            self.open_surface(Surface::EnableDebuggingConfirm);
-            true
-        }
     }
 
     fn open_cookie_sync(&mut self) -> Result<()> {
@@ -6115,13 +5641,6 @@ impl App {
             Surface::Mode => 2,
             Surface::Browser => 3,
             Surface::BrowserSelect => BROWSER_CHOICES.len(),
-            Surface::EnableDebuggingConfirm => {
-                if self.pending_chrome_per_session_prompt.is_some() {
-                    1
-                } else {
-                    2
-                }
-            }
             Surface::CookieSync => self.cookie_sync_row_count(),
             Surface::Goal => 0,
             Surface::History => self.history_visible_indices()?.len(),
@@ -6266,14 +5785,6 @@ impl App {
     }
 
     fn should_animate_live_spinner(&mut self) -> bool {
-        // EnableDebuggingConfirm in either waiting state needs the spinner
-        // ticking so the modal's animated indicator actually moves.
-        if matches!(self.surface, Surface::EnableDebuggingConfirm)
-            && (self.pending_local_chrome_debugging_setup_wait
-                || self.pending_chrome_per_session_prompt.is_some())
-        {
-            return true;
-        }
         if !self.native_scrollback_is_active() {
             return false;
         }
@@ -7325,8 +6836,6 @@ fn run_terminal(mut app: App) -> Result<()> {
             draw_needed |= app.drain_codex_login_notifications()?;
             draw_needed |= app.drain_clipboard_paste_notifications()?;
             draw_needed |= app.drain_cookie_sync_notifications()?;
-            draw_needed |= app.poll_pending_local_chrome_debugging_setup()?;
-            draw_needed |= app.poll_pending_chrome_per_session_prompt()?;
             if last_fallback_refresh.elapsed() >= STORE_FALLBACK_REFRESH_INTERVAL {
                 draw_needed |= app.refresh_state_cache_from_store()?;
                 last_fallback_refresh = Instant::now();
@@ -7363,11 +6872,6 @@ fn run_terminal(mut app: App) -> Result<()> {
             // logo physics settle to rest (logo stops driving redraws then).
             if app.is_home_examples_active() {
                 poll_interval = poll_interval.min(TYPEWRITER_TICK_INTERVAL);
-            }
-            if app.pending_local_chrome_debugging_setup_wait
-                || app.pending_chrome_per_session_prompt.is_some()
-            {
-                poll_interval = poll_interval.min(LOCAL_CHROME_DEBUGGING_POLL_INTERVAL);
             }
             if !event::poll(poll_interval)? {
                 // Animate the welcome-screen logo by advancing the anim and
@@ -9351,9 +8855,7 @@ mod redesign_tests {
             Surface::Account => "Authenticate",
             Surface::Model => "Model",
             Surface::Mode => "Mode",
-            Surface::Browser | Surface::BrowserSelect | Surface::EnableDebuggingConfirm => {
-                "Browser"
-            }
+            Surface::Browser | Surface::BrowserSelect => "Browser",
             Surface::CookieSync => "Cookie Sync",
             Surface::Goal => "Goal",
             Surface::History => "History",
@@ -9364,29 +8866,6 @@ mod redesign_tests {
             Surface::Setup | Surface::SetupConfirm | Surface::SetupResult => "Setup",
             Surface::Main => "",
         }
-    }
-
-    #[test]
-    fn local_chrome_debugging_modal_waiting_state_tells_user_task_resumes() -> Result<()> {
-        let temp = tempfile::tempdir()?;
-        let mut app = ready_app(&temp)?;
-        app.pending_local_chrome_debugging_disabled =
-            vec![browser_use_browser::LocalChromeDebuggingDisabled {
-                browser_name: "Google Chrome".to_string(),
-                user_data_dir: PathBuf::from("/tmp/chrome-profile"),
-                browser_running: true,
-                user_enabled: Some(false),
-            }];
-        app.pending_local_chrome_debugging_setup_wait = true;
-        app.open_surface(Surface::EnableDebuggingConfirm);
-
-        let screen = render_dump(&mut app)?;
-        assert!(screen.contains("Waiting for you in Chrome"));
-        assert!(screen.contains("checkbox to allow remote"));
-        assert!(screen.contains("Reopen Chrome permission page"));
-        assert!(screen.contains("Cancel"));
-        assert!(!screen.contains("Continue"), "{screen}");
-        Ok(())
     }
 
     // `/plan` flips collaboration mode to Plan; `start_task_submission` then
@@ -10359,9 +9838,7 @@ mod redesign_tests {
 
         let screen = render_dump(&mut app)?;
 
-        // The bottom-border render display-transforms the legacy lowercase
-        // identifier into its branded form. See `composer_bottom_border`.
-        assert!(screen.contains("Browser Use Cloud"), "{screen}");
+        assert!(screen.contains(BROWSER_USE_CLOUD));
         Ok(())
     }
 
