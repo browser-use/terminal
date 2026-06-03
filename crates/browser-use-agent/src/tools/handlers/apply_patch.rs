@@ -486,6 +486,7 @@ pub fn apply_patch_operations(
         match op {
             PatchOperation::AddFile { path, contents } => {
                 let real = resolve_patch_path(root, path);
+                reject_existing_special_file(&real, path)?;
                 if let Some(parent) = real.parent() {
                     std::fs::create_dir_all(parent).map_err(|e| {
                         ToolError::Other(anyhow::anyhow!("creating parent dirs for {path}: {e}"))
@@ -508,6 +509,7 @@ pub fn apply_patch_operations(
                 hunks,
             } => {
                 let real = resolve_patch_path(root, path);
+                ensure_regular_file_for_read(&real, path)?;
                 let original = std::fs::read_to_string(&real).map_err(|e| {
                     ToolError::Other(anyhow::anyhow!("reading file to update {path}: {e}"))
                 })?;
@@ -521,6 +523,7 @@ pub fn apply_patch_operations(
                 } else {
                     real.clone()
                 };
+                reject_existing_special_file(&dest, move_to.as_deref().unwrap_or(path))?;
                 if let Some(parent) = dest.parent() {
                     std::fs::create_dir_all(parent).map_err(|e| {
                         ToolError::Other(anyhow::anyhow!("creating parent dirs for {path}: {e}"))
@@ -543,6 +546,26 @@ pub fn apply_patch_operations(
     }
 
     Ok(ApplyPatchSummary { changed })
+}
+
+fn ensure_regular_file_for_read(real: &Path, display: &str) -> Result<(), ToolError> {
+    let meta = std::fs::metadata(real)
+        .map_err(|e| ToolError::Other(anyhow::anyhow!("reading metadata for {display}: {e}")))?;
+    if !meta.file_type().is_file() {
+        return Err(ToolError::Rejected(format!(
+            "apply_patch refuses to read non-regular file {display}"
+        )));
+    }
+    Ok(())
+}
+
+fn reject_existing_special_file(real: &Path, display: &str) -> Result<(), ToolError> {
+    match std::fs::metadata(real) {
+        Ok(meta) if !meta.file_type().is_file() => Err(ToolError::Rejected(format!(
+            "apply_patch refuses to write non-regular file {display}"
+        ))),
+        Ok(_) | Err(_) => Ok(()),
+    }
 }
 
 /// Apply update hunks to the original file contents, returning the new contents.

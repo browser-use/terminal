@@ -35,6 +35,7 @@ use std::time::Duration;
 
 use futures_util::{Stream, StreamExt};
 use serde_json::Value;
+use tokio::time::timeout;
 
 use crate::route::framing::{SseDecoder, SseFrame};
 use crate::route::protocol::{Protocol, ProtocolStream};
@@ -538,6 +539,18 @@ fn aggregate(events: Vec<LlmEvent>) -> LlmResponse {
 // Async client + streaming state machine
 // ===========================================================================
 
+/// Upper bound for opening an LLM request and receiving response headers.
+///
+/// Streaming generations may run much longer, but establishing the stream must
+/// not wait forever on a wedged socket or provider edge.
+pub const DEFAULT_LLM_REQUEST_TIMEOUT: Duration = Duration::from_secs(120);
+
+/// Maximum idle gap between byte chunks once a streaming response has opened.
+///
+/// This mirrors Codex's SSE idle-timeout shape while keeping the production
+/// default generous enough for long model turns.
+pub const DEFAULT_LLM_STREAM_IDLE_TIMEOUT: Duration = Duration::from_secs(300);
+
 /// Where the streaming state machine is in the response lifecycle.
 enum Phase {
     /// Still pulling byte chunks off the HTTP body.
@@ -561,6 +574,8 @@ struct StreamState {
     protocol_stream: Box<dyn ProtocolStream>,
     /// Events decoded but not yet yielded.
     ready: VecDeque<Result<LlmEvent, LlmError>>,
+    /// Maximum time to wait for the next byte chunk.
+    idle_timeout: Duration,
     /// Lifecycle phase.
     phase: Phase,
 }
@@ -599,12 +614,18 @@ pub struct ModelClient {
     http: reqwest::Client,
     /// Retry/backoff configuration.
     retry: RetryPolicy,
+    /// Timeout for opening a request and reading non-2xx body snippets.
+    request_timeout: Duration,
+    /// Timeout for idle streaming body reads.
+    stream_idle_timeout: Duration,
 }
 
 impl fmt::Debug for ModelClient {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("ModelClient")
             .field("retry", &self.retry)
+            .field("request_timeout", &self.request_timeout)
+            .field("stream_idle_timeout", &self.stream_idle_timeout)
             .finish_non_exhaustive()
     }
 }
@@ -621,6 +642,8 @@ impl ModelClient {
         Self {
             http: reqwest::Client::new(),
             retry: RetryPolicy::default(),
+            request_timeout: DEFAULT_LLM_REQUEST_TIMEOUT,
+            stream_idle_timeout: DEFAULT_LLM_STREAM_IDLE_TIMEOUT,
         }
     }
 
@@ -629,12 +652,34 @@ impl ModelClient {
         Self {
             http: reqwest::Client::new(),
             retry,
+            request_timeout: DEFAULT_LLM_REQUEST_TIMEOUT,
+            stream_idle_timeout: DEFAULT_LLM_STREAM_IDLE_TIMEOUT,
         }
     }
 
     /// Construct a client from an existing `reqwest::Client` and retry policy.
     pub fn from_parts(http: reqwest::Client, retry: RetryPolicy) -> Self {
-        Self { http, retry }
+        Self {
+            http,
+            retry,
+            request_timeout: DEFAULT_LLM_REQUEST_TIMEOUT,
+            stream_idle_timeout: DEFAULT_LLM_STREAM_IDLE_TIMEOUT,
+        }
+    }
+
+    /// Construct a client from explicit parts, including watchdog timeouts.
+    pub fn from_parts_with_timeouts(
+        http: reqwest::Client,
+        retry: RetryPolicy,
+        request_timeout: Duration,
+        stream_idle_timeout: Duration,
+    ) -> Self {
+        Self {
+            http,
+            retry,
+            request_timeout,
+            stream_idle_timeout,
+        }
     }
 
     /// The retry policy in effect.
@@ -677,9 +722,17 @@ impl ModelClient {
         for (k, v) in headers {
             builder = builder.header(k.as_str(), v.as_str());
         }
-        let resp = builder
-            .send()
+        let resp = timeout(self.request_timeout, builder.send())
             .await
+            .map_err(|_| {
+                (
+                    LlmError::transport(format!(
+                        "LLM request timed out after {:?}",
+                        self.request_timeout
+                    )),
+                    None,
+                )
+            })?
             .map_err(|e| (LlmError::transport(scrub(&e.to_string())), None))?;
 
         let status = resp.status();
@@ -690,7 +743,11 @@ impl ModelClient {
         // Non-2xx: collect headers for the rate-limit hint, then the body snippet.
         let info = RateLimitInfo::from_headers(&header_map(resp.headers()));
         let code = status.as_u16();
-        let text = resp.text().await.unwrap_or_default();
+        let text = timeout(self.request_timeout, resp.text())
+            .await
+            .ok()
+            .and_then(Result::ok)
+            .unwrap_or_default();
         Err((error_for_status(code, &scrub(&text)), info.retry_after_ms))
     }
 
@@ -743,6 +800,7 @@ impl ModelClient {
             sse: SseDecoder::new(),
             protocol_stream: route.protocol.decoder(),
             ready: VecDeque::new(),
+            idle_timeout: self.stream_idle_timeout,
             phase: Phase::Streaming,
         };
 
@@ -754,17 +812,32 @@ impl ModelClient {
                     return Some((ev, st));
                 }
                 match st.phase {
-                    Phase::Streaming => match st.byte_stream.next().await {
-                        Some(Ok(chunk)) => {
-                            let frames = st.sse.push(chunk.as_ref());
-                            st.decode_frames(frames);
+                    Phase::Streaming => {
+                        let next = match timeout(st.idle_timeout, st.byte_stream.next()).await {
+                            Ok(next) => next,
+                            Err(_) => {
+                                st.phase = Phase::Done;
+                                return Some((
+                                    Err(LlmError::transport(format!(
+                                        "LLM stream stalled for {:?}",
+                                        st.idle_timeout
+                                    ))),
+                                    st,
+                                ));
+                            }
+                        };
+                        match next {
+                            Some(Ok(chunk)) => {
+                                let frames = st.sse.push(chunk.as_ref());
+                                st.decode_frames(frames);
+                            }
+                            Some(Err(e)) => {
+                                st.phase = Phase::Done;
+                                return Some((Err(LlmError::transport(scrub(&e.to_string()))), st));
+                            }
+                            None => st.phase = Phase::Flushing,
                         }
-                        Some(Err(e)) => {
-                            st.phase = Phase::Done;
-                            return Some((Err(LlmError::transport(scrub(&e.to_string()))), st));
-                        }
-                        None => st.phase = Phase::Flushing,
-                    },
+                    }
                     Phase::Flushing => {
                         st.phase = Phase::Done;
                         match st.protocol_stream.finish() {
@@ -1284,5 +1357,51 @@ mod tests {
         assert_eq!(err.reason, LlmErrorReason::Transport);
         // The bearer token must never leak into the transport error message.
         assert!(!err.message.contains("sk-not-used"), "leaked token: {err}");
+    }
+
+    #[tokio::test]
+    async fn stream_body_idle_timeout_returns_transport_error() {
+        use std::io::{Read as _, Write as _};
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind listener");
+        let addr = listener.local_addr().expect("local addr");
+        std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept");
+            let mut buf = [0u8; 4096];
+            let _ = stream.read(&mut buf);
+            stream
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\n\r\n",
+                )
+                .expect("write headers");
+            std::thread::sleep(Duration::from_secs(10));
+        });
+
+        let client = ModelClient::from_parts_with_timeouts(
+            reqwest::Client::new(),
+            RetryPolicy {
+                max_attempts: 1,
+                ..RetryPolicy::default()
+            },
+            Duration::from_secs(2),
+            Duration::from_millis(100),
+        );
+        let route = Route::new(
+            Box::new(OpenAiResponsesProtocol::new()),
+            Endpoint::new(format!("http://{addr}"), "/v1/responses"),
+            Auth::bearer("sk-not-used"),
+        );
+        let mut req = LlmRequest::new("gpt-5.1-codex", "openai");
+        req.messages.push(crate::schema::Message::user_text("hi"));
+
+        let mut stream = client.stream(&route, &req).await.expect("open stream");
+        let err = tokio::time::timeout(Duration::from_secs(2), stream.next())
+            .await
+            .expect("idle watchdog should fire")
+            .expect("stream should yield timeout error")
+            .expect_err("idle timeout should be an error item");
+
+        assert_eq!(err.reason, LlmErrorReason::Transport);
+        assert!(err.message.contains("LLM stream stalled"), "{err}");
     }
 }

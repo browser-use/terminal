@@ -242,6 +242,7 @@ struct StoreTurnState {
     base_instructions: String,
     current_model: Option<String>,
     previous_model_compaction: Option<PreviousModelCompaction>,
+    cancel: CancellationToken,
     /// The model-based summary pass for [`compact`](TurnState::compact). `None`
     /// disables compaction (the no-sampler / `Fake` path); the production run sets
     /// a real [`EntrypointSampler`].
@@ -276,6 +277,7 @@ impl StoreTurnState {
             base_instructions: crate::prompts::browser_agent_system_prompt(),
             current_model: None,
             previous_model_compaction: None,
+            cancel: CancellationToken::new(),
             compaction_sampler: None,
             compacted: Mutex::new(None),
         }
@@ -318,6 +320,11 @@ impl StoreTurnState {
 
     fn with_previous_model_compaction(mut self, previous: Option<PreviousModelCompaction>) -> Self {
         self.previous_model_compaction = previous;
+        self
+    }
+
+    fn with_cancel(mut self, cancel: CancellationToken) -> Self {
+        self.cancel = cancel;
         self
     }
 
@@ -1230,14 +1237,18 @@ async fn run_compaction_with_retries(
     token_limit: usize,
     max_retries: u32,
     context_window: Option<i64>,
+    cancel: CancellationToken,
 ) -> Result<crate::compact::CompactedHistory, AgentError> {
     let mut retries = 0;
     let mut working: Vec<Item> = history.to_vec();
     working.push(compaction_prompt_item(compact_prompt));
     loop {
+        if cancel.is_cancelled() {
+            return Err(AgentError::TurnAborted);
+        }
         let request = compaction_request_messages(&working);
         let request_len = request.len();
-        match sampler.summarize(request, CancellationToken::new()).await {
+        match sampler.summarize(request, cancel.clone()).await {
             Ok(summary) => {
                 append_compaction_token_usage(
                     store,
@@ -1269,10 +1280,13 @@ async fn run_compaction_with_retries(
                     session_id.as_str(),
                     &format!("Reconnecting... {retries}/{max_retries}"),
                 );
-                tokio::time::sleep(std::time::Duration::from_millis(
+                let delay = tokio::time::sleep(std::time::Duration::from_millis(
                     crate::decision::backoff_ms(retries),
-                ))
-                .await;
+                ));
+                tokio::select! {
+                    _ = cancel.cancelled() => return Err(AgentError::TurnAborted),
+                    _ = delay => {}
+                }
             }
             Err(error) => return Err(error),
         }
@@ -1667,6 +1681,7 @@ impl StoreTurnState {
             COMPACT_USER_MESSAGE_MAX_TOKENS,
             DEFAULT_STREAM_MAX_RETRIES,
             self.context_window(),
+            self.cancel.clone(),
         )
         .await
         {
@@ -2053,7 +2068,8 @@ async fn drive_run<Sd: SamplingDriver>(
         base_instructions.unwrap_or_else(|| crate::prompts::browser_agent_system_prompt()),
         developer_instructions,
     )
-    .with_previous_model_compaction(previous_model_compaction);
+    .with_previous_model_compaction(previous_model_compaction)
+    .with_cancel(cancel.clone());
 
     let pre_turn_replay_from_seq = if turn_has_fresh_input {
         let events = events_from_store(&store, session_id.as_str());
@@ -2684,6 +2700,21 @@ mod tests {
             _cancel: CancellationToken,
         ) -> impl Future<Output = Result<CompactionSummary, AgentError>> + Send {
             async { Err(AgentError::ContextWindowExceeded) }
+        }
+    }
+
+    struct WaitForCancelSampler;
+
+    impl CompactionSampler for WaitForCancelSampler {
+        fn summarize(
+            &self,
+            _request: Vec<Message>,
+            cancel: CancellationToken,
+        ) -> impl Future<Output = Result<CompactionSummary, AgentError>> + Send {
+            async move {
+                cancel.cancelled().await;
+                Err(AgentError::TurnAborted)
+            }
         }
     }
 
@@ -3521,6 +3552,7 @@ mod tests {
             COMPACT_USER_MESSAGE_MAX_TOKENS,
             1,
             Some(1_000),
+            CancellationToken::new(),
         )
         .await
         .expect("mixed window and retryable errors should eventually succeed");
@@ -3550,6 +3582,7 @@ mod tests {
             COMPACT_USER_MESSAGE_MAX_TOKENS,
             0,
             Some(1_000),
+            CancellationToken::new(),
         )
         .await
         .expect_err("unshrinkable summary request should fail");
@@ -3572,6 +3605,38 @@ mod tests {
         assert!(log
             .iter()
             .any(|event| event.event_type == "model.turn.context_overflow"));
+    }
+
+    #[tokio::test]
+    async fn compaction_uses_callers_cancellation_token() {
+        let (_dir, store, session_id) = store_with_session();
+        let cancel = CancellationToken::new();
+        let cancel_from_task = cancel.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            cancel_from_task.cancel();
+        });
+
+        let sampler: Arc<dyn DynCompactionSampler> = Arc::new(WaitForCancelSampler);
+        let err = tokio::time::timeout(
+            Duration::from_secs(2),
+            run_compaction_with_retries(
+                &SessionId(session_id.clone()),
+                &store,
+                &[],
+                sampler.as_ref(),
+                crate::compact::SUMMARIZATION_PROMPT,
+                COMPACT_USER_MESSAGE_MAX_TOKENS,
+                0,
+                Some(1_000),
+                cancel,
+            ),
+        )
+        .await
+        .expect("compaction should observe cancellation")
+        .expect_err("cancelled compaction should fail");
+
+        assert!(matches!(err, AgentError::TurnAborted));
     }
 
     #[tokio::test]

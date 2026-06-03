@@ -97,6 +97,30 @@ async fn add_file_creates_nested_dirs() {
     assert_eq!(written, "nested");
 }
 
+#[tokio::test]
+async fn add_file_over_directory_is_rejected_before_write() {
+    let dir = tempfile::tempdir().unwrap();
+    let ctx = ctx_in(dir.path());
+    std::fs::create_dir(dir.path().join("existing.txt")).unwrap();
+
+    let patch = "\
+*** Begin Patch
+*** Add File: existing.txt
++replacement
+*** End Patch
+";
+    let req = ApplyPatchRequest::new(patch);
+    match run_direct(&req, &ctx).await {
+        Err(ToolError::Rejected(msg)) => {
+            assert!(
+                msg.contains("non-regular file"),
+                "should reject directories before writing, got: {msg}"
+            );
+        }
+        other => panic!("expected Rejected for directory add, got {other:?}"),
+    }
+}
+
 // (2) Update File applies a hunk (context + +/- lines) correctly.
 #[tokio::test]
 async fn update_file_applies_hunk() {
@@ -125,6 +149,31 @@ async fn update_file_applies_hunk() {
         result, "alpha\nBETA\ngamma\ndelta\n",
         "hunk should replace beta with BETA and preserve trailing newline"
     );
+}
+
+#[tokio::test]
+async fn update_directory_is_rejected_before_read() {
+    let dir = tempfile::tempdir().unwrap();
+    let ctx = ctx_in(dir.path());
+    std::fs::create_dir(dir.path().join("not-a-file.txt")).unwrap();
+
+    let patch = "\
+*** Begin Patch
+*** Update File: not-a-file.txt
+@@
+ anything
+*** End Patch
+";
+    let req = ApplyPatchRequest::new(patch);
+    match run_direct(&req, &ctx).await {
+        Err(ToolError::Rejected(msg)) => {
+            assert!(
+                msg.contains("non-regular file"),
+                "should reject directories before reading, got: {msg}"
+            );
+        }
+        other => panic!("expected Rejected for directory update, got {other:?}"),
+    }
 }
 
 // (2b) Update File with an *** End of File marker terminating the hunk.

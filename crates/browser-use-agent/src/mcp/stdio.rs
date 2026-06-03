@@ -39,6 +39,8 @@ use crate::mcp::protocol::{
 
 type PendingMap = Arc<Mutex<HashMap<RequestId, oneshot::Sender<JsonRpcMessage>>>>;
 
+const MCP_SERVER_REPLY_TIMEOUT: Duration = Duration::from_secs(5);
+
 /// A connected stdio MCP server.
 pub struct StdioTransport {
     /// Kept alive (killed on drop via `kill_on_drop`) for the transport's life.
@@ -147,7 +149,7 @@ impl StdioTransport {
             .await
             .context("initialize handshake failed")?;
         transport
-            .notify(initialized_notification())
+            .notify(initialized_notification(), startup_timeout)
             .await
             .context("sending notifications/initialized failed")?;
 
@@ -191,16 +193,17 @@ impl StdioTransport {
         }
 
         let req = JsonRpcRequest::new(id.clone(), method, params);
-        if let Err(err) = write_json(&self.writer, &req).await {
-            self.pending.lock().await.remove(&id);
-            return Err(err);
-        }
+        let operation = async {
+            write_json(&self.writer, &req).await?;
+            rx.await
+                .map_err(|_| anyhow!("MCP server closed stdout before responding to {method}"))
+        };
 
-        let msg = match timeout(timeout_dur, rx).await {
+        let msg = match timeout(timeout_dur, operation).await {
             Ok(Ok(msg)) => msg,
-            Ok(Err(_)) => {
+            Ok(Err(err)) => {
                 self.pending.lock().await.remove(&id);
-                bail!("MCP server closed stdout before responding to {method}");
+                return Err(err);
             }
             Err(_) => {
                 self.pending.lock().await.remove(&id);
@@ -218,8 +221,13 @@ impl StdioTransport {
         Ok(msg.result.unwrap_or(Value::Null))
     }
 
-    async fn notify(&self, notification: JsonRpcNotification) -> Result<()> {
-        write_json(&self.writer, &notification).await
+    async fn notify(&self, notification: JsonRpcNotification, timeout_dur: Duration) -> Result<()> {
+        match timeout(timeout_dur, write_json(&self.writer, &notification)).await {
+            Ok(result) => result,
+            Err(_) => {
+                bail!("MCP server timed out while sending notification after {timeout_dur:?}")
+            }
+        }
     }
 }
 
@@ -242,7 +250,7 @@ async fn handle_server_request(writer: &Arc<Mutex<ChildStdin>>, msg: JsonRpcMess
             "error": { "code": -32601, "message": format!("method not found: {method}") },
         })
     };
-    let _ = write_json(writer, &reply).await;
+    let _ = timeout(MCP_SERVER_REPLY_TIMEOUT, write_json(writer, &reply)).await;
 }
 
 /// Write a serializable message as a newline-terminated JSON line, then flush.

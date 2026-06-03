@@ -39,6 +39,7 @@
 use std::fs;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::{anyhow, bail};
 use base64::{engine::general_purpose, Engine as _};
@@ -66,6 +67,16 @@ pub const DEFAULT_BROWSER_SCRIPT_TIMEOUT_SECS: u64 = 120;
 ///
 /// Mirrors the legacy default observe window used by the browser_script runtime.
 pub const DEFAULT_OBSERVE_TIMEOUT_MS: u64 = 1_000;
+
+/// Final async watchdog for browser command calls.
+pub const DEFAULT_BROWSER_COMMAND_OUTER_TIMEOUT_SECS: u64 = 180;
+
+/// Grace added around script backend timeouts so the handler can serialize the
+/// timeout result instead of racing the lower layer.
+pub const BROWSER_SCRIPT_OUTER_GRACE_SECS: u64 = 30;
+
+/// Final async watchdog for cancel calls.
+pub const BROWSER_CANCEL_OUTER_TIMEOUT_SECS: u64 = 15;
 
 /// Appended to `browser_script` stdout when the response carries image parts.
 ///
@@ -189,6 +200,26 @@ impl BrowserRequest {
     fn effective_observe_ms(&self) -> u64 {
         self.observe_timeout_ms
             .unwrap_or(DEFAULT_OBSERVE_TIMEOUT_MS)
+    }
+}
+
+fn browser_action_outer_timeout(
+    action: &BrowserAction,
+    timeout_secs: u64,
+    observe_ms: u64,
+) -> Duration {
+    match action {
+        BrowserAction::Command { .. } => {
+            Duration::from_secs(DEFAULT_BROWSER_COMMAND_OUTER_TIMEOUT_SECS)
+        }
+        BrowserAction::Execute { .. } => Duration::from_secs(
+            timeout_secs
+                .saturating_add(BROWSER_SCRIPT_OUTER_GRACE_SECS)
+                .max(1),
+        ),
+        BrowserAction::Observe { .. } => Duration::from_millis(observe_ms)
+            .saturating_add(Duration::from_secs(BROWSER_SCRIPT_OUTER_GRACE_SECS)),
+        BrowserAction::Cancel { .. } => Duration::from_secs(BROWSER_CANCEL_OUTER_TIMEOUT_SECS),
     }
 }
 
@@ -1489,6 +1520,7 @@ impl ToolRuntime<BrowserRequest, ExecOutput> for BrowserTool {
     ) -> Result<ExecOutput, ToolError> {
         // No sandbox backend is exercised here (the browser runtime spawns its
         // own processes); acknowledge the attempt to make the seam explicit.
+        let cancel = attempt.cancel.clone();
         let _ = attempt;
 
         let effective_session_id = if req.session_id.trim().is_empty() {
@@ -1534,6 +1566,7 @@ impl ToolRuntime<BrowserRequest, ExecOutput> for BrowserTool {
         let timeout_secs = req.effective_timeout_secs(self.default_script_timeout_secs);
         let observe_ms = req.effective_observe_ms();
         let action = req.action.clone();
+        let outer_timeout = browser_action_outer_timeout(&action, timeout_secs, observe_ms);
         let persistence = self.persistence.clone();
         let selected_browser_mode = self.selected_browser_mode.clone();
         let tool_call_id = ctx.call_id.clone();
@@ -1550,7 +1583,7 @@ impl ToolRuntime<BrowserRequest, ExecOutput> for BrowserTool {
 
         // The browser fns are synchronous and spawn external processes; run on a
         // blocking thread so we never stall the async runtime.
-        let result = tokio::task::spawn_blocking(move || -> Result<ExecOutput, ToolError> {
+        let task = tokio::task::spawn_blocking(move || -> Result<ExecOutput, ToolError> {
             match action {
                 BrowserAction::Command { command } => {
                     let selected_browser_mode = selected_browser_mode.as_deref();
@@ -1661,9 +1694,31 @@ impl ToolRuntime<BrowserRequest, ExecOutput> for BrowserTool {
                     Ok(map_script_output(out))
                 }
             }
-        })
-        .await
-        .map_err(|e| ToolError::Other(anyhow::anyhow!("browser task panicked: {e}")))?;
+        });
+
+        let result = tokio::select! {
+            biased;
+            _ = async {
+                if let Some(cancel) = cancel {
+                    cancel.cancelled().await;
+                } else {
+                    std::future::pending::<()>().await;
+                }
+            } => {
+                return Err(ToolError::Other(anyhow::anyhow!("browser task cancelled")));
+            }
+            timed = tokio::time::timeout(outer_timeout, task) => {
+                match timed {
+                    Ok(joined) => joined
+                        .map_err(|e| ToolError::Other(anyhow::anyhow!("browser task panicked: {e}")))?,
+                    Err(_) => {
+                        return Err(ToolError::Other(anyhow::anyhow!(
+                            "browser task timed out after {outer_timeout:?}"
+                        )));
+                    }
+                }
+            }
+        };
 
         result
     }

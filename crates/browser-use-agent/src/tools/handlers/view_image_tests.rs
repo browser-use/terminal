@@ -168,11 +168,29 @@ async fn nonexistent_file_errors() {
     match run_direct(&req, &ctx).await {
         Err(ToolError::Other(e)) => {
             assert!(
-                e.to_string().contains("cannot read"),
-                "should report it could not read the file, got: {e}"
+                e.to_string().contains("cannot stat"),
+                "should report it could not stat the file, got: {e}"
             );
         }
         other => panic!("expected Other for nonexistent file, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn directory_with_image_extension_is_rejected_before_read() {
+    let dir = tempfile::tempdir().unwrap();
+    let ctx = ctx_in(dir.path());
+    std::fs::create_dir(dir.path().join("not-a-file.png")).unwrap();
+
+    let req = ViewImageRequest::new("not-a-file.png");
+    match run_direct(&req, &ctx).await {
+        Err(ToolError::Rejected(msg)) => {
+            assert!(
+                msg.contains("non-regular file"),
+                "should reject directories before reading, got: {msg}"
+            );
+        }
+        other => panic!("expected Rejected for directory, got {other:?}"),
     }
 }
 

@@ -58,6 +58,60 @@ struct FakeBackend {
     fail: bool,
 }
 
+struct SlowCommandBackend;
+
+impl BrowserBackend for SlowCommandBackend {
+    fn command(
+        &self,
+        _session_id: &str,
+        _cwd: &std::path::Path,
+        _artifact_dir: &std::path::Path,
+        _command: &str,
+    ) -> anyhow::Result<BrowserCommandOutput> {
+        std::thread::sleep(std::time::Duration::from_secs(2));
+        Ok(FakeBackend::ok_command())
+    }
+
+    fn run_script(
+        &self,
+        _session_id: &str,
+        _cwd: &std::path::Path,
+        _artifact_dir: &std::path::Path,
+        _code: &str,
+        _timeout_secs: u64,
+    ) -> anyhow::Result<BrowserScriptOutput> {
+        anyhow::bail!("not used")
+    }
+
+    fn start_script(
+        &self,
+        _session_id: &str,
+        _cwd: &std::path::Path,
+        _artifact_dir: &std::path::Path,
+        _code: &str,
+        _timeout_secs: u64,
+    ) -> anyhow::Result<BrowserScriptOutput> {
+        anyhow::bail!("not used")
+    }
+
+    fn observe_script(
+        &self,
+        _session_id: &str,
+        _run_id: &str,
+        _observe_timeout_ms: u64,
+    ) -> anyhow::Result<BrowserScriptOutput> {
+        anyhow::bail!("not used")
+    }
+
+    fn cancel_script(
+        &self,
+        _session_id: &str,
+        _run_id: &str,
+    ) -> anyhow::Result<BrowserScriptOutput> {
+        anyhow::bail!("not used")
+    }
+}
+
 impl FakeBackend {
     fn last(&self) -> LastCall {
         self.last.lock().unwrap().clone()
@@ -284,6 +338,38 @@ async fn command_routes_and_maps_output() {
         "events should land on stderr: {}",
         out.stderr
     );
+}
+
+#[tokio::test]
+async fn cancelled_browser_task_returns_before_blocking_backend_finishes() {
+    let tool = BrowserTool::with_backend(Arc::new(SlowCommandBackend));
+    let req = BrowserRequest::command("sess-1", "go https://example.com");
+    let launch = none_launch();
+    let cancel = tokio_util::sync::CancellationToken::new();
+    cancel.cancel();
+    let attempt = SandboxAttempt {
+        sandbox: SandboxType::None,
+        permissions: SandboxPermissions::UseDefault,
+        enforce_managed_network: false,
+        launch: &launch,
+        cancel: Some(cancel),
+    };
+
+    let err = tokio::time::timeout(
+        std::time::Duration::from_millis(500),
+        tool.run(&req, &attempt, &ctx()),
+    )
+    .await
+    .expect("outer cancellation should win")
+    .expect_err("cancelled browser task should error");
+
+    match err {
+        ToolError::Other(error) => assert!(
+            error.to_string().contains("cancelled"),
+            "expected cancellation error, got {error:#}"
+        ),
+        other => panic!("expected Other cancellation error, got {other:?}"),
+    }
 }
 
 #[tokio::test]

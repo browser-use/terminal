@@ -468,7 +468,8 @@ impl ToolRuntime<McpToolCallRequest, ExecOutput> for McpTool {
     ) -> Result<ExecOutput, ToolError> {
         // The MCP call runs in the server process; no sandbox backend is
         // exercised here. Acknowledge the seam args explicitly.
-        let _ = (attempt, ctx);
+        let cancel = attempt.cancel.clone();
+        let _ = ctx;
 
         // Validate the request before touching the client (legacy unknown-server
         // / empty-name guards, lib.rs:13404-13411).
@@ -491,7 +492,7 @@ impl ToolRuntime<McpToolCallRequest, ExecOutput> for McpTool {
         // The real client is synchronous (blocking stdio JSON-RPC); run it on a
         // blocking thread so we never stall the async runtime (mirrors the
         // browser/python handlers).
-        let result = tokio::task::spawn_blocking(move || -> Result<ExecOutput, ToolError> {
+        let task = tokio::task::spawn_blocking(move || -> Result<ExecOutput, ToolError> {
             let call = client
                 .call_tool(&server, &tool, args)
                 // Parity with legacy lib.rs:13416-13419 / codex mcp_tool_call.rs:579:
@@ -502,9 +503,22 @@ impl ToolRuntime<McpToolCallRequest, ExecOutput> for McpTool {
                     ))
                 })?;
             Ok(map_call_result(call))
-        })
-        .await
-        .map_err(|e| ToolError::Other(anyhow::anyhow!("MCP task panicked: {e}")))?;
+        });
+
+        let result = tokio::select! {
+            biased;
+            _ = async {
+                if let Some(cancel) = cancel {
+                    cancel.cancelled().await;
+                } else {
+                    std::future::pending::<()>().await;
+                }
+            } => {
+                return Err(ToolError::Other(anyhow::anyhow!("MCP task cancelled")));
+            }
+            joined = task => joined
+                .map_err(|e| ToolError::Other(anyhow::anyhow!("MCP task panicked: {e}")))?,
+        };
 
         result
     }

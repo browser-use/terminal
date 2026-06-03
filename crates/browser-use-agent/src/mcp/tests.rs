@@ -161,6 +161,33 @@ async fn stdio_error_result_maps_is_error() {
     assert_eq!(mcp_result_tool_content(&result.into_seam()), "kaboom");
 }
 
+#[tokio::test]
+async fn stdio_connect_times_out_when_child_never_answers_initialize() {
+    let result = tokio::time::timeout(
+        Duration::from_secs(2),
+        StdioTransport::connect(
+            "python3",
+            &["-c".to_string(), "import time; time.sleep(60)".to_string()],
+            &HashMap::new(),
+            None,
+            Duration::from_millis(100),
+            Duration::from_millis(100),
+        ),
+    )
+    .await
+    .expect("transport watchdog should return");
+    let err = match result {
+        Ok(_) => panic!("connect should fail"),
+        Err(err) => err,
+    };
+
+    let message = format!("{err:#}");
+    assert!(
+        message.contains("timed out"),
+        "expected timeout error, got {message}"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // http transport (loopback TcpListener)
 // ---------------------------------------------------------------------------

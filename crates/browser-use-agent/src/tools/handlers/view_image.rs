@@ -249,6 +249,27 @@ impl ToolRuntime<ViewImageRequest, ExecOutput> for ViewImageTool {
             ))
         })?;
 
+        let meta = std::fs::metadata(&real).map_err(|e| {
+            ToolError::Other(anyhow::anyhow!(
+                "view_image: cannot stat {}: {e}",
+                req.path.display()
+            ))
+        })?;
+        if !meta.file_type().is_file() {
+            return Err(ToolError::Rejected(format!(
+                "view_image refuses to read non-regular file {}",
+                req.path.display()
+            )));
+        }
+        if meta.len() > MAX_INLINE_LOCAL_IMAGE_BYTES as u64 {
+            return Err(ToolError::Rejected(format!(
+                "view_image cannot inline {}: image is {} bytes, above the {} byte inline limit",
+                req.path.display(),
+                meta.len(),
+                MAX_INLINE_LOCAL_IMAGE_BYTES
+            )));
+        }
+
         // Blocking, deliberately-serial read (see the module doc: this tool is
         // not parallel-safe, so a blocking std read is the right choice — no
         // benefit to yielding the async runtime for a fast local file). A

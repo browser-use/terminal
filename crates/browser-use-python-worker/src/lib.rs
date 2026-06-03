@@ -12,6 +12,13 @@ use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+pub const DEFAULT_PYTHON_TOOL_TIMEOUT_SECONDS: f64 = 120.0;
+const PYTHON_WORKER_IO_GRACE: Duration = Duration::from_secs(5);
+
+fn resolved_timeout_seconds(timeout_seconds: Option<f64>) -> f64 {
+    timeout_seconds.unwrap_or(DEFAULT_PYTHON_TOOL_TIMEOUT_SECONDS)
+}
+
 pub struct PythonWorker {
     child: Child,
     stdin: ChildStdin,
@@ -256,6 +263,43 @@ impl PythonWorker {
         })
     }
 
+    fn write_request_line(
+        &mut self,
+        request_id: &str,
+        line: &str,
+        deadline: Instant,
+    ) -> Result<bool> {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Ok(false);
+        }
+
+        let payload = line.to_string();
+        let (tx, rx) = mpsc::channel();
+        let child = &mut self.child;
+        let stdin = &mut self.stdin;
+        std::thread::scope(|scope| {
+            scope.spawn(move || {
+                let result = writeln!(stdin, "{payload}").and_then(|_| stdin.flush());
+                let _ = tx.send(result);
+            });
+
+            match rx.recv_timeout(remaining) {
+                Ok(Ok(())) => Ok(true),
+                Ok(Err(err)) => Err(err.into()),
+                Err(mpsc::RecvTimeoutError::Timeout) => {
+                    kill_worker_child(child);
+                    let _ = rx.recv_timeout(PYTHON_WORKER_IO_GRACE);
+                    Ok(false)
+                }
+                Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    bail!("python worker writer disconnected")
+                }
+            }
+        })
+        .with_context(|| format!("write python worker request {request_id}"))
+    }
+
     pub fn run(
         &mut self,
         session_id: &str,
@@ -304,6 +348,12 @@ impl PythonWorker {
         timeout_seconds: Option<f64>,
         mut on_event: impl FnMut(PythonWorkerEvent),
     ) -> Result<RunPythonResponse> {
+        let effective_timeout_seconds = resolved_timeout_seconds(timeout_seconds);
+        let deadline = {
+            let seconds = effective_timeout_seconds.max(0.0);
+            let grace = (seconds * 0.1).clamp(1.0, 2.0);
+            Instant::now() + Duration::from_secs_f64(seconds + grace)
+        };
         let request = RunPythonRequest {
             id: format!("py-{}", self.next_id),
             session_id: session_id.to_string(),
@@ -311,40 +361,25 @@ impl PythonWorker {
             artifact_dir: artifact_dir.as_ref().display().to_string(),
             code: code.to_string(),
             cancel_requested: false,
-            timeout_seconds,
+            timeout_seconds: Some(effective_timeout_seconds),
             control: None,
         };
         self.next_id += 1;
         let line = serde_json::to_string(&request)?;
-        writeln!(self.stdin, "{line}")?;
-        self.stdin.flush()?;
-
-        let deadline = timeout_seconds.map(|seconds| {
-            let seconds = seconds.max(0.0);
-            let grace = (seconds * 0.1).clamp(1.0, 2.0);
-            Instant::now() + Duration::from_secs_f64(seconds + grace)
-        });
+        if !self.write_request_line(&request.id, &line, deadline)? {
+            self.restart()?;
+            return Ok(timeout_response(&request.id, effective_timeout_seconds));
+        }
 
         loop {
-            let Some(response) = self.read_response_line(&request.id, timeout_seconds, deadline)?
+            let Some(response) = self.read_response_line(
+                &request.id,
+                Some(effective_timeout_seconds),
+                Some(deadline),
+            )?
             else {
                 self.restart()?;
-                return Ok(RunPythonResponse {
-                    id: request.id.clone(),
-                    ok: false,
-                    text: String::new(),
-                    error: Some(format!(
-                        "python tool timed out after {} seconds",
-                        timeout_seconds.unwrap_or_default()
-                    )),
-                    data: Value::Null,
-                    outputs: Vec::new(),
-                    artifacts: Vec::new(),
-                    images: Vec::new(),
-                    browser_events: Vec::new(),
-                    browser_harness_available: false,
-                    browser_harness_error: None,
-                });
+                return Ok(timeout_response(&request.id, effective_timeout_seconds));
             };
             let trimmed = response.trim();
             let value: Value = match serde_json::from_str(trimmed) {
@@ -368,11 +403,18 @@ impl PythonWorker {
                 }
                 continue;
             }
-            return serde_json::from_value(value).context("parse python worker response");
+            let parsed: RunPythonResponse =
+                serde_json::from_value(value).context("parse python worker response")?;
+            if parsed.id != request.id {
+                continue;
+            }
+            return Ok(parsed);
         }
     }
 
     pub fn shutdown_owned_cloud_browser(&mut self) -> Result<Option<Value>> {
+        let effective_timeout_seconds = 5.0;
+        let deadline = Instant::now() + Duration::from_secs_f64(effective_timeout_seconds + 1.0);
         let cwd = std::env::current_dir()?;
         let request = RunPythonRequest {
             id: format!("py-{}", self.next_id),
@@ -385,20 +427,26 @@ impl PythonWorker {
                 .to_string(),
             code: String::new(),
             cancel_requested: false,
-            timeout_seconds: Some(5.0),
+            timeout_seconds: Some(effective_timeout_seconds),
             control: Some("shutdown_owned_cloud_browser".to_string()),
         };
         self.next_id += 1;
         let line = serde_json::to_string(&request)?;
-        writeln!(self.stdin, "{line}")?;
-        self.stdin.flush()?;
+        if !self.write_request_line(&request.id, &line, deadline)? {
+            self.restart()?;
+            return Ok(None);
+        }
 
         loop {
-            let mut response = String::new();
-            let bytes = self.stdout.read_line(&mut response)?;
-            if bytes == 0 {
+            let Some(response) = self.read_response_line(
+                &request.id,
+                Some(effective_timeout_seconds),
+                Some(deadline),
+            )?
+            else {
+                self.restart()?;
                 return Ok(None);
-            }
+            };
             let trimmed = response.trim();
             let value: Value = match serde_json::from_str(trimmed) {
                 Ok(value) => value,
@@ -407,8 +455,31 @@ impl PythonWorker {
             if value.get("event").is_some() {
                 continue;
             }
-            return Ok(value.get("data").cloned());
+            let parsed: RunPythonResponse =
+                serde_json::from_value(value).context("parse python worker control response")?;
+            if parsed.id != request.id {
+                continue;
+            }
+            return Ok(Some(parsed.data));
         }
+    }
+}
+
+fn timeout_response(request_id: &str, timeout_seconds: f64) -> RunPythonResponse {
+    RunPythonResponse {
+        id: request_id.to_string(),
+        ok: false,
+        text: String::new(),
+        error: Some(format!(
+            "python tool timed out after {timeout_seconds} seconds"
+        )),
+        data: Value::Null,
+        outputs: Vec::new(),
+        artifacts: Vec::new(),
+        images: Vec::new(),
+        browser_events: Vec::new(),
+        browser_harness_available: false,
+        browser_harness_error: None,
     }
 }
 
@@ -448,7 +519,7 @@ fn spawn_python_worker(
     let mut child = command
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
+        .stderr(Stdio::null())
         .spawn()
         .with_context(|| {
             format!(
@@ -498,6 +569,15 @@ impl Drop for PythonWorker {
 mod tests {
     use super::*;
     use std::path::PathBuf;
+
+    #[test]
+    fn omitted_timeout_uses_safe_default() {
+        assert_eq!(
+            resolved_timeout_seconds(None),
+            DEFAULT_PYTHON_TOOL_TIMEOUT_SECONDS
+        );
+        assert_eq!(resolved_timeout_seconds(Some(0.25)), 0.25);
+    }
 
     #[test]
     fn worker_keeps_a_persistent_namespace_per_session() -> Result<()> {

@@ -30,6 +30,7 @@ const LOG_LIMIT: usize = 250;
 const SCRIPT_MAX_OUTPUT_CHARS: usize = 120_000;
 const BROWSER_SCRIPT_INITIAL_WAIT_MS: u64 = 750;
 const BROWSER_SCRIPT_DEFAULT_OBSERVE_MS: u64 = 1_000;
+const CDP_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const BROWSER_SCRIPT_HELPERS: &str = include_str!("browser_script_helpers.py");
 
 #[derive(Debug)]
@@ -2598,8 +2599,7 @@ impl BrowserSession {
 
 impl CdpConnection {
     fn connect(ws_url: &str) -> Result<Self> {
-        let (mut socket, _) =
-            connect(ws_url).with_context(|| format!("connect CDP websocket {ws_url}"))?;
+        let mut socket = connect_cdp_websocket(ws_url)?;
         set_cdp_socket_timeouts(&mut socket);
         Ok(Self { socket, next_id: 1 })
     }
@@ -2727,8 +2727,7 @@ struct CdpDispatcher {
 
 impl CdpDispatcher {
     fn connect(ws_url: &str) -> Result<Arc<Self>> {
-        let (mut socket, _) =
-            connect(ws_url).with_context(|| format!("connect CDP websocket {ws_url}"))?;
+        let mut socket = connect_cdp_websocket(ws_url)?;
         set_cdp_dispatcher_socket_timeouts(&mut socket);
         let (tx, rx) = std::sync::mpsc::channel::<CdpDispatchCmd>();
         let reader = thread::spawn(move || cdp_dispatcher_loop(socket, rx));
@@ -2768,6 +2767,27 @@ impl CdpDispatcher {
             Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
                 bail!("CDP dispatcher is shut down")
             }
+        }
+    }
+}
+
+fn connect_cdp_websocket(ws_url: &str) -> Result<WebSocket<MaybeTlsStream<TcpStream>>> {
+    let (tx, rx) = std::sync::mpsc::channel();
+    let url = ws_url.to_string();
+    thread::spawn(move || {
+        let result = connect(url.as_str())
+            .map(|(socket, _)| socket)
+            .with_context(|| format!("connect CDP websocket {url}"));
+        let _ = tx.send(result);
+    });
+
+    match rx.recv_timeout(CDP_CONNECT_TIMEOUT) {
+        Ok(result) => result,
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+            bail!("connect CDP websocket {ws_url} timed out after {CDP_CONNECT_TIMEOUT:?}")
+        }
+        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+            bail!("connect CDP websocket {ws_url} worker disconnected")
         }
     }
 }
