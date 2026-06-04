@@ -927,21 +927,22 @@ fn local_connect_default_profile_preflight(
     if !is_plain_local_connect_command(resolved_command) || has_default_profile {
         return Ok(None);
     }
-    let profiles = backend
-        .command(
-            session_id,
-            cwd,
-            artifact_dir,
-            "browser local profiles --json",
-        )
-        .map(|output| output.content)
-        .unwrap_or_else(|error| {
-            json!({
-                "status": "failed",
-                "error": format!("{error:#}"),
-                "profiles": [],
-            })
-        });
+    let profiles = match backend.command(
+        session_id,
+        cwd,
+        artifact_dir,
+        "browser local profiles --json",
+    ) {
+        Ok(output) => output.content,
+        Err(_) => return Ok(None),
+    };
+    if profiles
+        .get("status")
+        .and_then(serde_json::Value::as_str)
+        .is_some_and(|status| status == "failed")
+    {
+        return Ok(None);
+    }
     let local_profiles = profiles
         .get("local_profiles")
         .or_else(|| profiles.get("profiles"))

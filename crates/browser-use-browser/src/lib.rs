@@ -2025,9 +2025,9 @@ fn open_local_profile(
                 .unwrap_or_default()
         )
     });
-    let target_url = marker.as_ref().map(|marker| {
-        format!("data:text/html,<title>Browser%20Use</title><meta%20name=browser-use-profile-target%20content={marker}>")
-    });
+    let target_url = marker
+        .as_ref()
+        .map(|marker| profile_marker_target_url(marker));
     #[cfg(target_os = "macos")]
     let mut command = {
         let mut command = Command::new(&profile.browser_path);
@@ -3453,6 +3453,9 @@ impl BrowserSession {
         let _ = self.cdp_current("Runtime.enable", json!({}));
         let _ = self.cdp_current("Page.enable", json!({}));
         if attached_profile_marker {
+            if let Some(marker) = preferred_marker.as_deref() {
+                let _ = self.inject_profile_marker_target_html(marker);
+            }
             let current_target = self.current_target_id.clone();
             self.close_profile_marker_targets(
                 attached_browser_context_id.as_deref(),
@@ -3576,6 +3579,9 @@ impl BrowserSession {
         let _ = self.cdp_current_with_deadline("Runtime.enable", json!({}), deadline);
         let _ = self.cdp_current_with_deadline("Page.enable", json!({}), deadline);
         if attached_profile_marker {
+            if let Some(marker) = preferred_marker.as_deref() {
+                let _ = self.inject_profile_marker_target_html_with_deadline(marker, deadline);
+            }
             let current_target = self.current_target_id.clone();
             self.close_profile_marker_targets(
                 attached_browser_context_id.as_deref(),
@@ -3629,6 +3635,37 @@ impl BrowserSession {
             }
             let _ = self.cdp("Target.closeTarget", None, json!({ "targetId": target_id }));
         }
+    }
+
+    fn inject_profile_marker_target_html(&mut self, marker: &str) -> Result<()> {
+        let html = serde_json::to_string(&profile_marker_target_html(marker))?;
+        let _ = self.cdp_current("Page.stopLoading", json!({}));
+        self.cdp_current(
+            "Runtime.evaluate",
+            json!({
+                "expression": format!("document.open();document.write({html});document.close();"),
+                "awaitPromise": false,
+            }),
+        )?;
+        Ok(())
+    }
+
+    fn inject_profile_marker_target_html_with_deadline(
+        &mut self,
+        marker: &str,
+        deadline: Instant,
+    ) -> Result<()> {
+        let html = serde_json::to_string(&profile_marker_target_html(marker))?;
+        let _ = self.cdp_current_with_deadline("Page.stopLoading", json!({}), deadline);
+        self.cdp_current_with_deadline(
+            "Runtime.evaluate",
+            json!({
+                "expression": format!("document.open();document.write({html});document.close();"),
+                "awaitPromise": false,
+            }),
+            deadline,
+        )?;
+        Ok(())
     }
 
     fn clear_local_profile_context(&mut self) {
@@ -6400,7 +6437,13 @@ fn bridge_request_with_session(session: &mut BrowserSession, request: &Value) ->
             let mut params = request.get("params").cloned().unwrap_or_else(|| json!({}));
             if let Some(browser_context_id) = session.preferred_browser_context_id.clone() {
                 if method == "Target.createTarget" {
-                    match params.get("browserContextId").and_then(Value::as_str) {
+                    let params_object = params.as_object_mut().ok_or_else(|| {
+                        anyhow!("bridge cdp request params must be a JSON object")
+                    })?;
+                    match params_object
+                        .get("browserContextId")
+                        .and_then(Value::as_str)
+                    {
                         Some(requested) if requested != browser_context_id => {
                             bail!(
                                 "refusing to create a target in a different Chrome profile context"
@@ -6408,7 +6451,10 @@ fn bridge_request_with_session(session: &mut BrowserSession, request: &Value) ->
                         }
                         Some(_) => {}
                         None => {
-                            params["browserContextId"] = Value::String(browser_context_id);
+                            params_object.insert(
+                                "browserContextId".to_string(),
+                                Value::String(browser_context_id),
+                            );
                         }
                     }
                 } else if method == "Target.attachToTarget" {
@@ -7873,6 +7919,115 @@ fn target_url_contains_marker(target: &Value, marker: &str) -> bool {
             .is_some_and(|url| url.contains(marker))
 }
 
+fn profile_marker_target_url(marker: &str) -> String {
+    format!("https://browser-use.com/browser-use-profile-target/{marker}")
+}
+
+fn profile_marker_target_html(marker: &str) -> String {
+    let browser_session_label = marker.rsplit('-').next().unwrap_or(marker);
+    format!(
+        r##"<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="browser-use-profile-target" content="{marker}">
+  <title>Browser Use</title>
+  <style>
+    * {{
+      box-sizing: border-box;
+    }}
+    html, body {{ height: 100%; margin: 0; }}
+    body {{
+      background: #000;
+      overflow: hidden;
+    }}
+    #pretty-loading-animation {{
+      position: fixed;
+      top: 0;
+      left: 0;
+      width: 100vw;
+      height: 100vh;
+      background: #000;
+      z-index: 99999;
+      overflow: hidden;
+    }}
+    #pretty-loading-animation img {{
+      position: absolute;
+      left: 0;
+      top: 0;
+      width: 200px;
+      height: auto;
+      z-index: 2;
+      opacity: 0.8;
+      user-select: none;
+      pointer-events: none;
+    }}
+  </style>
+</head>
+<body>
+  <div id="pretty-loading-animation">
+    <img src="https://cf.browser-use.com/logo.svg" alt="Browser-Use">
+  </div>
+  <script>
+    (function(browser_session_label) {{
+      if (window.__dvdAnimationRunning) {{
+        return;
+      }}
+      window.__dvdAnimationRunning = true;
+
+      const animated_title = `Starting agent ${{browser_session_label}}...`;
+      if (document.title === animated_title) {{
+        return;
+      }}
+      document.title = animated_title;
+
+      const img = document.querySelector('#pretty-loading-animation img');
+      let x = Math.random() * (window.innerWidth - 300);
+      let y = Math.random() * (window.innerHeight - 300);
+      let dx = 1.2 + Math.random() * 0.4;
+      let dy = 1.2 + Math.random() * 0.4;
+      if (Math.random() > 0.5) dx = -dx;
+      if (Math.random() > 0.5) dy = -dy;
+
+      function animate() {{
+        const imgWidth = img.offsetWidth || 300;
+        const imgHeight = img.offsetHeight || 300;
+        x += dx;
+        y += dy;
+
+        if (x <= 0) {{
+          x = 0;
+          dx = Math.abs(dx);
+        }} else if (x + imgWidth >= window.innerWidth) {{
+          x = window.innerWidth - imgWidth;
+          dx = -Math.abs(dx);
+        }}
+        if (y <= 0) {{
+          y = 0;
+          dy = Math.abs(dy);
+        }} else if (y + imgHeight >= window.innerHeight) {{
+          y = window.innerHeight - imgHeight;
+          dy = -Math.abs(dy);
+        }}
+
+        img.style.left = `${{x}}px`;
+        img.style.top = `${{y}}px`;
+        requestAnimationFrame(animate);
+      }}
+      animate();
+
+      window.addEventListener('resize', () => {{
+        x = Math.min(x, window.innerWidth - img.offsetWidth);
+        y = Math.min(y, window.innerHeight - img.offsetHeight);
+      }});
+    }})('{browser_session_label}');
+  </script>
+</body>
+</html>"##
+    )
+}
+
 fn is_profile_marker_target(target: &Value) -> bool {
     target.get("type").and_then(Value::as_str) == Some("page")
         && target
@@ -8454,6 +8609,28 @@ mod tests {
     }
 
     #[test]
+    fn bridge_create_target_rejects_non_object_params_for_profile_context() {
+        let mut session = BrowserSession {
+            preferred_browser_context_id: Some("context-1".to_string()),
+            ..Default::default()
+        };
+        let request = json!({
+            "kind": "cdp",
+            "method": "Target.createTarget",
+            "params": ["malformed"],
+        });
+
+        let error = bridge_request_with_session(&mut session, &request).unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("bridge cdp request params must be a JSON object"),
+            "{error:#}"
+        );
+    }
+
+    #[test]
     fn remote_debugging_setup_target_matches_inspect_page_only() {
         assert!(is_remote_debugging_setup_target(&json!({
             "type": "page",
@@ -8467,6 +8644,26 @@ mod tests {
             "type": "page",
             "url": "https://example.com",
         })));
+    }
+
+    #[test]
+    fn profile_marker_target_page_keeps_marker_and_user_facing_setup_copy() {
+        let html = profile_marker_target_html("browser-use-profile-target-test");
+        assert!(html.contains("browser-use-profile-target-test"));
+        assert!(html.contains("pretty-loading-animation"));
+        assert!(html.contains("https://cf.browser-use.com/logo.svg"));
+        assert!(html.contains("1.2 + Math.random() * 0.4"));
+        assert!(html.contains("requestAnimationFrame(animate)"));
+        assert!(!html.contains("Starting task"));
+        assert!(!html.contains("Pro Tip"));
+
+        let url = profile_marker_target_url("browser-use-profile-target-test");
+        assert_eq!(
+            url,
+            "https://browser-use.com/browser-use-profile-target/browser-use-profile-target-test"
+        );
+        assert!(!url.contains("<html"));
+        assert!(!url.contains("Starting%20task"));
     }
 
     #[test]

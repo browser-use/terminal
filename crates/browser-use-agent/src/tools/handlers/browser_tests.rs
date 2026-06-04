@@ -61,6 +61,7 @@ struct FakeBackend {
     last_timeout_secs: Mutex<Option<u64>>,
     script_images: Mutex<Vec<serde_json::Value>>,
     fail: bool,
+    fail_local_profiles: bool,
 }
 
 impl FakeBackend {
@@ -220,6 +221,9 @@ impl BrowserBackend for FakeBackend {
         *self.last.lock().unwrap() = LastCall::Command(command.to_string());
         self.commands.lock().unwrap().push(command.to_string());
         self.record_paths(cwd, artifact_dir);
+        if self.fail_local_profiles && command == "browser local profiles --json" {
+            anyhow::bail!("profile discovery failed");
+        }
         if self.fail {
             anyhow::bail!("boom");
         }
@@ -545,6 +549,62 @@ async fn stored_local_profile_does_not_open_marker_when_chrome_is_not_reachable(
         vec![
             "browser local profiles --json".to_string(),
             "browser local list --json".to_string(),
+            "browser connect local".to_string(),
+        ]
+    );
+}
+
+#[tokio::test]
+async fn local_connect_falls_back_to_connect_when_profile_discovery_errors() {
+    let backend = Arc::new(FakeBackend {
+        fail_local_profiles: true,
+        ..Default::default()
+    });
+    let (_dir, store, session) = shared_store();
+    {
+        let store = store.lock().unwrap();
+        store.set_setting("browser", "Local Chrome").unwrap();
+    }
+    let tool = tool_with(Arc::clone(&backend)).with_persistence(store, session);
+
+    let req = BrowserRequest::command("sess-1", "browser connect local");
+    let out = run_direct(&tool, &req).await.unwrap();
+
+    assert_eq!(out.exit_code, 0);
+    assert!(out.stdout.contains("\"status\":\"connected\""));
+    assert_eq!(
+        backend.commands(),
+        vec![
+            "browser local profiles --json".to_string(),
+            "browser connect local".to_string(),
+        ]
+    );
+}
+
+#[tokio::test]
+async fn local_connect_falls_back_to_connect_when_profile_discovery_reports_failed() {
+    let backend = Arc::new(FakeBackend::default());
+    *backend.local_profiles.lock().unwrap() = Some(json!({
+        "status": "failed",
+        "error": "profile discovery failed",
+        "profiles": [],
+    }));
+    let (_dir, store, session) = shared_store();
+    {
+        let store = store.lock().unwrap();
+        store.set_setting("browser", "Local Chrome").unwrap();
+    }
+    let tool = tool_with(Arc::clone(&backend)).with_persistence(store, session);
+
+    let req = BrowserRequest::command("sess-1", "browser connect local");
+    let out = run_direct(&tool, &req).await.unwrap();
+
+    assert_eq!(out.exit_code, 0);
+    assert!(out.stdout.contains("\"status\":\"connected\""));
+    assert_eq!(
+        backend.commands(),
+        vec![
+            "browser local profiles --json".to_string(),
             "browser connect local".to_string(),
         ]
     );

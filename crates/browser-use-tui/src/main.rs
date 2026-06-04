@@ -1134,6 +1134,7 @@ struct App {
     provider_fetch: Option<mpsc::Receiver<(ModelSource, Vec<ProviderModel>)>>,
     collaboration_mode: CollaborationModeKind,
     browser: String,
+    browser_profile_label: Option<String>,
     api_key_account: Option<String>,
     pending_model_after_auth: Option<ModelChoice>,
     /// Set when auth was started from the `/model` provider flow, so it opens the
@@ -2113,6 +2114,7 @@ impl App {
         let browser = store
             .get_setting("browser")?
             .unwrap_or_else(|| args.browser.clone());
+        let browser_profile_label = browser_profile_label_from_store(&store)?;
         let selected_row = 0;
         let _ = had_stored_model;
         let mut app = Self {
@@ -2144,6 +2146,7 @@ impl App {
             provider_fetch: None,
             collaboration_mode,
             browser,
+            browser_profile_label,
             api_key_account: None,
             pending_model_after_auth: None,
             pending_model_search_after_auth: false,
@@ -2248,6 +2251,9 @@ impl App {
         let mut drained_any = false;
         while let Ok(notification) = self.store_rx.try_recv() {
             drained_any = true;
+            if notification == StoreNotification::SettingsChanged {
+                changed |= self.refresh_browser_profile_label()?;
+            }
             changed |= self
                 .state_cache
                 .apply_notification(&self.store, notification)?;
@@ -2509,6 +2515,7 @@ impl App {
 
     fn refresh_state_cache_from_store(&mut self) -> Result<bool> {
         let mut changed = self.state_cache.refresh_all(&self.store)?;
+        changed |= self.refresh_browser_profile_label()?;
         if changed {
             self.refresh_cached_projection();
         }
@@ -4458,9 +4465,12 @@ impl App {
         let cancelled_live_run = cancel_agent_run(&self.args.state_dir, &id);
         self.pause_active_goal_for_interrupt(&id)?;
         if cancelled_live_run {
+            self.store.request_cancel(&id, reason)?;
+            self.refresh_state_cache_from_store()?;
             return Ok(true);
         }
         self.store.request_cancel(&id, reason)?;
+        self.refresh_state_cache_from_store()?;
         cleanup_agent_runtime_state_for_agent_subtree(&self.store, &id, |session_id| {
             usize::from(cancel_agent_run(&self.args.state_dir, session_id))
         })?;
@@ -6940,6 +6950,7 @@ impl App {
         let profile_label = human_profile_label(&profile);
         self.store
             .set_setting("browser.preference.profile_label", &profile_label)?;
+        self.browser_profile_label = Some(profile_label.clone());
         self.default_profile.current_profile_id = Some(profile.id.clone());
         self.status_notice = Some(format!("Default Chrome profile: {profile_label}"));
         self.close_surface();
@@ -6950,23 +6961,17 @@ impl App {
         if self.browser != settings::BROWSER_LOCAL_CHROME {
             return self.browser.clone();
         }
-        let profile_label = self
-            .store
-            .get_setting("browser.preference.profile_label")
-            .ok()
-            .flatten()
-            .filter(|label| !label.trim().is_empty())
-            .or_else(|| {
-                self.store
-                    .get_setting("browser.preference.profile")
-                    .ok()
-                    .flatten()
-                    .filter(|profile| !profile.trim().is_empty())
-            });
-        match profile_label {
+        match self.browser_profile_label.as_deref() {
             Some(profile) => format!("{} · {}", self.browser, concise_profile_label(&profile)),
             None => self.browser.clone(),
         }
+    }
+
+    fn refresh_browser_profile_label(&mut self) -> Result<bool> {
+        let next = browser_profile_label_from_store(&self.store)?;
+        let changed = self.browser_profile_label != next;
+        self.browser_profile_label = next;
+        Ok(changed)
     }
 
     fn start_cookie_sync_profile_load(&mut self) -> Result<()> {
@@ -7630,6 +7635,19 @@ fn concise_profile_label(label: &str) -> String {
         .unwrap_or(without_browser)
         .trim()
         .to_string()
+}
+
+fn browser_profile_label_from_store(store: &Store) -> Result<Option<String>> {
+    Ok(store
+        .get_setting("browser.preference.profile_label")?
+        .filter(|label| !label.trim().is_empty())
+        .or_else(|| {
+            store
+                .get_setting("browser.preference.profile")
+                .ok()
+                .flatten()
+                .filter(|profile| !profile.trim().is_empty())
+        }))
 }
 
 pub(crate) fn human_profile_label(profile: &CookieSyncProfile) -> String {
@@ -10305,7 +10323,7 @@ mod redesign_tests {
     }
 
     #[test]
-    fn cancel_current_task_uses_live_runtime_without_store_cancel_rows() -> Result<()> {
+    fn cancel_current_task_marks_store_cancelled_for_live_runtime() -> Result<()> {
         let temp = tempfile::tempdir()?;
         let mut app = ready_app(&temp)?;
         let session = app.store.create_session(None, temp.path())?;
@@ -10341,10 +10359,16 @@ mod redesign_tests {
             .any(|event| event.event_type == "agent.cancel_requested"));
         assert!(events
             .iter()
-            .all(|event| event.event_type != "session.cancel_requested"));
+            .any(|event| event.event_type == "session.cancel_requested"));
         assert!(events
             .iter()
-            .all(|event| event.event_type != "session.cancelled"));
+            .any(|event| event.event_type == "session.cancelled"));
+        assert_eq!(
+            app.store
+                .load_session(&session.id)?
+                .map(|session| session.status),
+            Some(SessionStatus::Cancelled)
+        );
         Ok(())
     }
 
