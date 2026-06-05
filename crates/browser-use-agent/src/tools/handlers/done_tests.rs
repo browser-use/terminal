@@ -87,27 +87,55 @@ async fn done_without_text_yields_empty_summary() {
     assert_eq!(out.stdout, DONE_STDOUT_PREFIX);
 }
 
-// ---- (3) the wire args deserialize from the model's `{ "text": ... }` ----
+// ---- (3) the wire args deserialize from Browser Use-style and legacy payloads ----
 
 #[test]
 fn done_wire_args_round_trip() {
-    // Full form.
-    let req: DoneRequest = serde_json::from_value(serde_json::json!({ "text": "done now" }))
+    // Browser Use-style final result form.
+    let req: DoneRequest = serde_json::from_value(serde_json::json!({ "result": "done now" }))
         .expect("done deserialize");
-    assert_eq!(req.text.as_deref(), Some("done now"));
+    assert_eq!(req.result.as_deref(), Some("done now"));
     assert_eq!(req.summary(), "done now");
 
-    // Minimal: `text` omitted -> None (the model may declare done with no message).
+    // Legacy `text` remains accepted.
+    let legacy: DoneRequest = serde_json::from_value(serde_json::json!({ "text": "legacy done" }))
+        .expect("legacy done deserialize");
+    assert_eq!(legacy.text.as_deref(), Some("legacy done"));
+    assert_eq!(legacy.summary(), "legacy done");
+
+    // `result` wins if both canonical and legacy fields are present.
+    let both: DoneRequest =
+        serde_json::from_value(serde_json::json!({ "result": "canonical", "text": "legacy" }))
+            .expect("combined done deserialize");
+    assert_eq!(both.summary(), "canonical");
+
+    // File-only completion still produces a visible host summary.
+    let file_only: DoneRequest =
+        serde_json::from_value(serde_json::json!({ "result_file": "outputs/answer.json" }))
+            .expect("file done deserialize");
+    assert_eq!(file_only.summary(), "Result file: outputs/answer.json");
+
+    // Minimal: fields omitted -> None (the model may declare done with no message).
     let empty: DoneRequest =
         serde_json::from_value(serde_json::json!({})).expect("empty done deserialize");
+    assert_eq!(empty.result, None);
     assert_eq!(empty.text, None);
+    assert_eq!(empty.result_file, None);
     assert_eq!(empty.summary(), "");
 
-    // `text` is skipped on serialize when None.
+    // Empty fields are skipped on serialize.
     let json = serde_json::to_value(&DoneRequest::default()).unwrap();
+    assert!(
+        json.get("result").is_none(),
+        "None result is skipped on serialize"
+    );
     assert!(
         json.get("text").is_none(),
         "None text is skipped on serialize"
+    );
+    assert!(
+        json.get("result_file").is_none(),
+        "None result_file is skipped on serialize"
     );
 }
 

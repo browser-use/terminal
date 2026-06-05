@@ -12,9 +12,11 @@ import math
 import os
 import pathlib
 import sys
+import threading
 import time as _time
 import urllib.error
 import urllib.request
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from urllib.parse import urlparse
 
 
@@ -23,13 +25,50 @@ PROFILE_MARKER = "browser-use-profile-target"
 __last_domain_skills = []
 
 
+_bridge_call_lock = threading.RLock()
+_TRANSIENT_BRIDGE_ERRORS = (
+    "browser is not connected or is busy",
+    "browser session is busy",
+    "browser bridge closed before response",
+    "cdp runtime.evaluate timed out",
+    "runtime.evaluate timed out",
+    "temporarily unavailable",
+)
+
+
+def _is_transient_bridge_error(exc):
+    message = str(exc).lower()
+    return any(part in message for part in _TRANSIENT_BRIDGE_ERRORS)
+
+
+def _bridge_with_retry(payload, *, attempts=4):
+    delay = 0.25
+    last_exc = None
+    for attempt in range(attempts):
+        try:
+            with _bridge_call_lock:
+                return _bridge(payload)
+        except (OSError, TimeoutError, RuntimeError) as exc:
+            last_exc = exc
+            if attempt + 1 >= attempts or not _is_transient_bridge_error(exc):
+                raise
+            print(
+                f"browser_script bridge retry {attempt + 2}/{attempts} after transient error: {exc}",
+                file=sys.stderr,
+                flush=True,
+            )
+            _time.sleep(delay)
+            delay = min(delay * 2, 2.0)
+    raise last_exc
+
+
 def _send_meta(meta, **params):
-    return _bridge({"kind": "meta", "meta": meta, **params})
+    return _bridge_with_retry({"kind": "meta", "meta": meta, **params})
 
 
 def cdp(method, session_id=None, **params):
     """Raw CDP. Example: cdp("Page.navigate", url="https://example.com")."""
-    return _bridge({"kind": "cdp", "method": method, "session_id": session_id, "params": params})
+    return _bridge_with_retry({"kind": "cdp", "method": method, "session_id": session_id, "params": params})
 
 
 def cdp_batch(calls):
@@ -386,6 +425,10 @@ def goto_url(url):
 
 def page_info():
     """Return url, title, viewport, scroll position, page size, and target info."""
+    try:
+        ensure_real_tab()
+    except Exception:
+        pass
     dialog = _send_meta("pending_dialog").get("dialog")
     if dialog:
         return {"dialog": dialog}
@@ -563,10 +606,21 @@ def _timeout_seconds(timeout):
 def wait_for_load(timeout=3.0):
     timeout = _timeout_seconds(timeout)
     deadline = _time.time() + timeout
+    interactive_since = None
     while _time.time() < deadline:
         try:
-            if js("document.readyState") == "complete":
+            state = js("document.readyState")
+            if state == "complete":
                 return True
+            if state == "interactive":
+                has_body = js("!!document.body && !!location.href && !location.href.startsWith('about:')")
+                if has_body:
+                    if interactive_since is None:
+                        interactive_since = _time.time()
+                    if _time.time() - interactive_since >= 1.0:
+                        return True
+            else:
+                interactive_since = None
         except Exception:
             pass
         _time.sleep(0.3)
@@ -630,9 +684,53 @@ def _write_b64_artifact(label, data_b64, suffix=".png", mime_type="image/png"):
     return str(path)
 
 
+def _positive_int_env(names, default=None):
+    for name in names:
+        raw = os.environ.get(name)
+        if raw is None:
+            continue
+        try:
+            value = int(str(raw).strip())
+        except ValueError:
+            continue
+        if value > 0:
+            return value
+        if value == 0:
+            return None
+    return default
+
+
+def _screenshot_max_dim(max_dim):
+    if max_dim is not None:
+        try:
+            value = int(max_dim)
+        except (TypeError, ValueError):
+            return None
+        return value if value > 0 else None
+    return _positive_int_env(("BU_BROWSER_SCREENSHOT_MAX_DIM", "BROWSER_USE_SCREENSHOT_MAX_DIM"), 7600)
+
+
+def _downscale_image_artifact(path, max_dim):
+    if not max_dim:
+        return None
+    try:
+        from PIL import Image
+
+        img = Image.open(path)
+        original_size = img.size
+        if max(original_size) > max_dim:
+            img.thumbnail((max_dim, max_dim))
+            img.save(path)
+            return {"width": img.size[0], "height": img.size[1], "downscaled": True, "original_size": original_size}
+        return {"width": original_size[0], "height": original_size[1], "downscaled": False}
+    except Exception:
+        return None
+
+
 def capture_screenshot(label="screenshot", full=False, attach=True, max_dim=None, **kwargs):
     """Save a PNG of the current viewport and return its local artifact path."""
     try:
+        ensure_real_tab()
         target_id = (current_tab() or {}).get("targetId")
         if target_id:
             cdp("Target.activateTarget", session_id=None, targetId=target_id)
@@ -647,27 +745,33 @@ def capture_screenshot(label="screenshot", full=False, attach=True, max_dim=None
     if full:
         params["captureBeyondViewport"] = True
     params.update(kwargs)
-    result = cdp("Page.captureScreenshot", **params)
+    last_error = None
+    for attempt in range(3):
+        try:
+            result = cdp("Page.captureScreenshot", **params)
+            break
+        except Exception as exc:
+            last_error = exc
+            if attempt == 2:
+                raise
+            _time.sleep(0.35 * (attempt + 1))
+    else:
+        raise last_error
     if not attach:
         return result
     path = _write_b64_artifact(label, result["data"], ".png", "image/png")
-    if max_dim:
-        try:
-            from PIL import Image
-
-            img = Image.open(path)
-            if max(img.size) > max_dim:
-                img.thumbnail((max_dim, max_dim))
-                img.save(path)
-        except Exception:
-            pass
+    image_info = _downscale_image_artifact(path, _screenshot_max_dim(max_dim))
+    if image_info and __images:
+        __images[-1].update(image_info)
+    if image_info and __artifacts:
+        __artifacts[-1].update({key: image_info[key] for key in ("width", "height") if key in image_info})
     return path
 
 
 def note(caption):
     """Mark the current moment as important for the recording, with a short
     human-readable caption (e.g. note("Delta $209 - cheapest fare details")).
-    Cheap: it just timestamps a caption; the 2fps session capture already has the
+    Cheap: it just timestamps a caption; when enabled, session capture already has the
     frame. Call it at each meaningful step so the end-of-run highlight GIF can be
     captioned. Returns the recorded note."""
     record = {"ts_ms": int(_time.time() * 1000), "caption": str(caption)}
@@ -992,3 +1096,240 @@ def http_get(url, headers=None, timeout=20.0, binary=None):
         raise RuntimeError(
             f"http_get failed for {url}: {exc}. Try a shorter timeout, browser js(fetch(...)), or a configured proxy if the site blocks direct HTTP."
         ) from exc
+
+
+def http_get_many(urls, headers=None, timeout=20.0, binary=None, max_workers=8, return_errors=True):
+    """Fetch many independent URLs with http_get while preserving input order.
+
+    By default one failed URL becomes {"ok": False, "url": ..., "error": ...}
+    instead of failing the whole batch. Set return_errors=False when every URL is
+    required and the caller should abort on the first failure.
+    """
+    items = list(urls)
+    if not items:
+        return []
+    workers = max(1, min(int(max_workers or 1), len(items)))
+    results = [None] * len(items)
+
+    def fetch_one(index, item):
+        if isinstance(item, dict):
+            request_url = item["url"]
+            request_headers = dict(headers or {})
+            request_headers.update(item.get("headers") or {})
+            request_timeout = item.get("timeout", timeout)
+            request_binary = item.get("binary", binary)
+        else:
+            request_url = str(item)
+            request_headers = headers
+            request_timeout = timeout
+            request_binary = binary
+        return index, request_url, http_get(
+            request_url,
+            headers=request_headers,
+            timeout=request_timeout,
+            binary=request_binary,
+        )
+
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        futures = [pool.submit(fetch_one, index, item) for index, item in enumerate(items)]
+        for future in as_completed(futures):
+            try:
+                index, _url, response = future.result()
+                results[index] = response
+            except Exception as exc:
+                index = futures.index(future)
+                item = items[index]
+                request_url = item.get("url") if isinstance(item, dict) else str(item)
+                if not return_errors:
+                    raise
+                results[index] = {"ok": False, "url": request_url, "error": str(exc)}
+    return results
+
+
+def _normalize_browser_fetch_request(
+    url,
+    method="GET",
+    headers=None,
+    body=None,
+    json_body=None,
+    timeout=20.0,
+    binary=None,
+):
+    request_headers = dict(headers or {})
+    request_body = body
+    if json_body is not None:
+        request_body = json.dumps(json_body)
+        if not any(k.lower() == "content-type" for k in request_headers):
+            request_headers["Content-Type"] = "application/json"
+    if isinstance(request_body, (dict, list)):
+        request_body = json.dumps(request_body)
+        if not any(k.lower() == "content-type" for k in request_headers):
+            request_headers["Content-Type"] = "application/json"
+    if isinstance(request_body, bytes):
+        request_body = request_body.decode("latin1")
+    return {
+        "url": str(url),
+        "method": str(method or "GET").upper(),
+        "headers": request_headers,
+        "body": request_body,
+        "timeout_ms": int(float(timeout) * 1000),
+        "binary": bool(binary),
+    }
+
+
+def _browser_fetch_response(result, return_error=False):
+    if not isinstance(result, dict):
+        if return_error:
+            return {"ok": False, "url": None, "error": f"invalid browser_fetch result: {result!r}"}
+        raise RuntimeError(f"invalid browser_fetch result: {result!r}")
+    if not result.get("ok"):
+        if return_error:
+            return {
+                "ok": False,
+                "url": result.get("url"),
+                "error": result.get("error", "browser_fetch failed"),
+            }
+        raise RuntimeError(f"browser_fetch failed for {result.get('url')}: {result.get('error')}")
+    headers = result.get("headers") or {}
+    status = result.get("status")
+    url = result.get("url")
+    if result.get("binary"):
+        body = base64.b64decode(result.get("body_b64") or "")
+        return _HttpGetBytes(body, status, headers, url)
+    return _HttpGetText(result.get("body") or "", status, headers, url)
+
+
+def browser_fetch(
+    url,
+    method="GET",
+    headers=None,
+    body=None,
+    json_body=None,
+    timeout=20.0,
+    binary=None,
+    return_error=True,
+):
+    """Fetch from the current page context with browser cookies/session state.
+
+    By default a failed page-context fetch returns
+    {"ok": False, "url": ..., "error": ...} instead of failing the entire
+    browser_script call. Pass return_error=False when the caller wants a hard
+    exception for required URLs.
+    """
+    request = _normalize_browser_fetch_request(
+        url,
+        method=method,
+        headers=headers,
+        body=body,
+        json_body=json_body,
+        timeout=timeout,
+        binary=binary,
+    )
+    return browser_fetch_many([request], timeout=timeout, return_errors=return_error)[0]
+
+
+def browser_fetch_many(requests, timeout=20.0, max_concurrency=6, return_errors=True):
+    """Fetch many URLs from the current page context, preserving order.
+
+    Each item may be a URL string or a dict with url/method/headers/body/json_body/
+    timeout/binary. This is useful after the page reveals stable endpoints but
+    direct http_get lacks cookies, auth headers, or browser-only access.
+    """
+    normalized = []
+    for item in list(requests):
+        if isinstance(item, dict):
+            normalized.append(
+                _normalize_browser_fetch_request(
+                    item["url"],
+                    method=item.get("method", "GET"),
+                    headers=item.get("headers"),
+                    body=item.get("body"),
+                    json_body=item.get("json_body"),
+                    timeout=item.get("timeout", timeout),
+                    binary=item.get("binary"),
+                )
+            )
+        else:
+            normalized.append(_normalize_browser_fetch_request(item, timeout=timeout))
+    if not normalized:
+        return []
+
+    expression = f"""
+(async () => {{
+  const requests = {json.dumps(normalized)};
+  const maxConcurrency = Math.max(1, Math.min({int(max_concurrency or 1)}, requests.length));
+  function arrayBufferToBase64(buffer) {{
+    const bytes = new Uint8Array(buffer);
+    let binary = "";
+    const chunkSize = 0x8000;
+    for (let i = 0; i < bytes.length; i += chunkSize) {{
+      const chunk = bytes.subarray(i, i + chunkSize);
+      binary += String.fromCharCode.apply(null, chunk);
+    }}
+    return btoa(binary);
+  }}
+  async function fetchOne(request) {{
+    const controller = new AbortController();
+    const timeoutMs = Math.max(1, Number(request.timeout_ms || 20000));
+    const timer = setTimeout(() => controller.abort(), timeoutMs);
+    try {{
+      const options = {{
+        method: request.method || "GET",
+        headers: request.headers || {{}},
+        credentials: "include",
+        signal: controller.signal
+      }};
+      if (request.body !== null && request.body !== undefined) {{
+        options.body = request.body;
+      }}
+      const response = await fetch(request.url, options);
+      const headers = {{}};
+      response.headers.forEach((value, key) => {{ headers[key] = value; }});
+      if (request.binary) {{
+        const buffer = await response.arrayBuffer();
+        return {{
+          ok: true,
+          response_ok: response.ok,
+          status: response.status,
+          statusText: response.statusText,
+          url: response.url,
+          headers,
+          binary: true,
+          body_b64: arrayBufferToBase64(buffer)
+        }};
+      }}
+      const body = await response.text();
+      return {{
+        ok: true,
+        response_ok: response.ok,
+        status: response.status,
+        statusText: response.statusText,
+        url: response.url,
+        headers,
+        binary: false,
+        body
+      }};
+    }} catch (error) {{
+      return {{
+        ok: false,
+        url: request.url,
+        error: String(error && (error.message || error))
+      }};
+    }} finally {{
+      clearTimeout(timer);
+    }}
+  }}
+  const results = new Array(requests.length);
+  let next = 0;
+  async function worker() {{
+    while (next < requests.length) {{
+      const index = next++;
+      results[index] = await fetchOne(requests[index]);
+    }}
+  }}
+  await Promise.all(Array.from({{length: maxConcurrency}}, worker));
+  return results;
+}})()
+"""
+    raw_results = _runtime_evaluate(expression, await_promise=True, return_by_value=True)
+    return [_browser_fetch_response(result, return_error=return_errors) for result in raw_results]

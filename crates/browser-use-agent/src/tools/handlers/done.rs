@@ -31,9 +31,10 @@
 //!
 //! * **Tool name** — `done` (the completion tool key). Mirrors the codex/legacy
 //!   completion/`done` tool the agent calls to declare it has finished.
-//! * **Args** — `{ "text"?: string }`: an optional free-text final summary
-//!   message. Codex's completion carries the final assistant text; we model the
-//!   summary as the single optional `text` field (omittable on the wire).
+//! * **Args** — `{ "result"?: string, "text"?: string, "result_file"?: string }`:
+//!   an optional user-facing final answer, a legacy `text` alias, and an optional
+//!   result file pointer. Codex's completion carries the final assistant text;
+//!   Browser Use prompts call this `result`, so both names are accepted.
 //! * **no approval / benign** — like `update_plan`, this is a pure state echo: it
 //!   needs no approval and touches no sandbox. We leave
 //!   [`exec_approval_requirement`](Approvable::exec_approval_requirement) at its
@@ -64,14 +65,21 @@ pub const DONE_STDOUT_PREFIX: &str = "done:";
 
 /// Typed request for the `done` tool.
 ///
-/// `text` is the optional final summary message the model carries when it
-/// declares the task finished. `#[serde(default)]` so it may be omitted on the
-/// wire; skipped on serialize when `None` to keep the echoed JSON tidy.
+/// `result` is the canonical final answer. `text` remains accepted for legacy
+/// callers, and `result_file` can point at a persisted artifact when the answer
+/// is intentionally file-backed. All fields are optional so the model may still
+/// declare done with no message.
 #[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct DoneRequest {
-    /// The final summary message (optional).
+    /// Canonical user-facing final answer.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub result: Option<String>,
+    /// Legacy final summary alias.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub text: Option<String>,
+    /// Optional relative or absolute result artifact path.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub result_file: Option<String>,
 }
 
 impl DoneRequest {
@@ -79,12 +87,49 @@ impl DoneRequest {
     pub fn with_text(text: impl Into<String>) -> Self {
         Self {
             text: Some(text.into()),
+            ..Self::default()
         }
     }
 
-    /// The final summary message, trimmed; empty when no (or blank) text.
-    pub fn summary(&self) -> &str {
-        self.text.as_deref().map(str::trim).unwrap_or("")
+    /// Convenience constructor with the canonical final answer field.
+    pub fn with_result(result: impl Into<String>) -> Self {
+        Self {
+            result: Some(result.into()),
+            ..Self::default()
+        }
+    }
+
+    /// The user-facing final answer, trimmed.
+    ///
+    /// `result` wins over legacy `text`. If both are blank and only a
+    /// `result_file` was supplied, expose a compact file-pointer summary so the
+    /// host has a visible completion result.
+    pub fn summary(&self) -> String {
+        if let Some(result) = self
+            .result
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
+            return result.to_string();
+        }
+        if let Some(text) = self
+            .text
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
+            return text.to_string();
+        }
+        if let Some(result_file) = self
+            .result_file
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
+            return format!("Result file: {result_file}");
+        }
+        String::new()
     }
 }
 
@@ -106,7 +151,9 @@ impl DoneTool {
 /// so the key is rarely consulted; it exists to satisfy [`Approvable`] uniformly.
 #[derive(serde::Serialize, Clone, Debug, Eq, PartialEq, Hash)]
 pub struct DoneApprovalKey {
+    result: Option<String>,
     text: Option<String>,
+    result_file: Option<String>,
 }
 
 impl Approvable<DoneRequest> for DoneTool {
@@ -114,7 +161,9 @@ impl Approvable<DoneRequest> for DoneTool {
 
     fn approval_keys(&self, req: &DoneRequest) -> Vec<Self::ApprovalKey> {
         vec![DoneApprovalKey {
+            result: req.result.clone(),
             text: req.text.clone(),
+            result_file: req.result_file.clone(),
         }]
     }
 

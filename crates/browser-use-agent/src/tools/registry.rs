@@ -1109,22 +1109,29 @@ to the single frame that proves the task succeeded."
     }
 
     /// `done`: the completion tool the model calls to declare the task finished,
-    /// carrying its final summary. Parity: codex/legacy completion (`done`) tool
-    /// (`{ "text"?: string }`). The handler's
-    /// [`DoneRequest`](crate::tools::handlers::done::DoneRequest) accepts an
-    /// optional `text` summary.
+    /// carrying its final answer. The handler accepts Browser Use-style
+    /// `{ "result"?: string, "result_file"?: string }` and the legacy
+    /// `{ "text"?: string }` alias.
     pub fn done() -> ToolDefinition {
         ToolDefinition {
             name: "done".to_string(),
             description:
-                "Signal that the task is finished, with an optional final summary message."
+                "Signal that the task is finished, carrying the complete user-facing final answer."
                     .to_string(),
             input_schema: json!({
                 "type": "object",
                 "properties": {
+                    "result": {
+                        "type": "string",
+                        "description": "The complete final answer to show the user or evaluator. Include all requested data here when the task asks for inline JSON, CSV, markdown, a table, links, or a schema-shaped response."
+                    },
                     "text": {
                         "type": "string",
-                        "description": "The final summary message describing what was accomplished."
+                        "description": "Legacy alias for result. Prefer result for new calls."
+                    },
+                    "result_file": {
+                        "type": "string",
+                        "description": "Optional path to a saved final-result artifact when a file pointer satisfies the task or supplements the inline result."
                     }
                 },
                 "additionalProperties": false

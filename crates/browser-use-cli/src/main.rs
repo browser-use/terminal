@@ -16,11 +16,12 @@ use browser_use_agent::config_model::{
     model_catalog_for_cwd_with_options,
 };
 use browser_use_agent::config_overrides::{
-    apply_child_request_runtime_config, load_mcp_servers_for_profile, parse_config_overrides,
-    resolve_agent_roles_for_profile, resolve_approval_policy_for_profile,
-    resolve_collab_for_profile, resolve_guardian_for_profile, resolve_multi_agent_v2_for_profile,
-    AgentRunOptions, ChildAgentRunCompletion, ChildAgentRunRequest, ChildAgentRunner,
-    ConfigOverrides, ProviderBackend, ProviderRunConfig, RunConfigValueSource,
+    apply_child_request_runtime_config, apply_runtime_config_overrides,
+    load_mcp_servers_for_profile, parse_config_overrides, resolve_agent_roles_for_profile,
+    resolve_approval_policy_for_profile, resolve_collab_for_profile, resolve_guardian_for_profile,
+    resolve_multi_agent_v2_for_profile, AgentRunOptions, ChildAgentRunCompletion,
+    ChildAgentRunRequest, ChildAgentRunner, ConfigOverrides, ProviderBackend, ProviderRunConfig,
+    RunConfigValueSource,
 };
 use browser_use_agent::context::{
     append_user_shell_command_context_event, typed_user_input_payload_from_items_for_cwd,
@@ -199,6 +200,11 @@ enum Command {
     /// `~/.codex/auth.json`.
     RunCodex {
         text: String,
+        #[arg(long, default_value = "gpt-5.1-codex")]
+        model: String,
+    },
+    RunCodexSession {
+        task_id: String,
         #[arg(long, default_value = "gpt-5.1-codex")]
         model: String,
     },
@@ -750,6 +756,15 @@ fn main() -> Result<()> {
             collaboration_mode,
             &runtime_options,
         ),
+        Command::RunCodexSession { task_id, model } => run_codex_session(
+            &store,
+            &task_id,
+            model,
+            config_profile.as_deref(),
+            &config_overrides,
+            collaboration_mode,
+            &runtime_options,
+        ),
         Command::RunOpenaiSession { task_id, model } => run_openai_session(
             &store,
             &task_id,
@@ -1066,6 +1081,7 @@ fn command_name(command: &Command) -> &'static str {
         Command::RunOpenrouter { .. } => "run_openrouter",
         Command::RunDeepseek { .. } => "run_deepseek",
         Command::RunCodex { .. } => "run_codex",
+        Command::RunCodexSession { .. } => "run_codex_session",
         Command::RunOpenaiSession { .. } => "run_openai_session",
         Command::RunAnthropicSession { .. } => "run_anthropic_session",
         Command::RunOpenrouterSession { .. } => "run_openrouter_session",
@@ -1960,6 +1976,7 @@ fn cli_agent_options(
         options = options.with_mcp_servers(mcp_servers);
     }
     if !config_overrides.is_empty() {
+        apply_runtime_config_overrides(&mut options, &config_overrides)?;
         options = options.with_config_overrides(config_overrides);
     }
     Ok(options)
@@ -2169,6 +2186,28 @@ fn run_codex(
             runtime_options,
         )?);
     run_new_session_from_config(store, text, config)
+}
+
+fn run_codex_session(
+    store: &Store,
+    task_id: &str,
+    model: String,
+    config_profile: Option<&str>,
+    raw_config_overrides: &[String],
+    collaboration_mode: CollaborationModeKind,
+    runtime_options: &CliRuntimeOptions,
+) -> Result<()> {
+    ensure_task_exists(store, task_id)?;
+    let config =
+        ProviderRunConfig::new(ProviderBackend::Codex, model).with_options(cli_agent_options(
+            config_profile,
+            raw_config_overrides,
+            collaboration_mode,
+            runtime_options,
+        )?);
+    let session_id = run_existing_session_from_config_and_notify(store, task_id, config, None)?;
+    println!("{session_id}");
+    Ok(())
 }
 
 fn run_openai_session(
@@ -2803,15 +2842,12 @@ fn python(store: &Store, task_id: &str, code: String) -> Result<()> {
 fn browser_script(store: &Store, task_id: &str, code: String) -> Result<()> {
     let task = ensure_task_exists(store, task_id)?;
     let tool_call_id = format!("browser_script-cli-{task_id}");
-    if let Some(cdp_url) = std::env::var("BU_CDP_URL")
-        .ok()
-        .filter(|url| !url.trim().is_empty())
-    {
+    if let Some(connect_command) = remote_cdp_connect_command_from_env() {
         let connect = browser_use_browser::run_browser_command(
             task_id,
             &task.cwd,
             &task.artifact_root,
-            &format!("browser connect remote-cdp --url {}", cdp_url.trim()),
+            &connect_command,
         )?;
         if connect.content.get("status").and_then(Value::as_str) != Some("connected") {
             bail!("browser connect remote-cdp failed: {}", connect.content);
@@ -2858,6 +2894,30 @@ fn browser_script(store: &Store, task_id: &str, code: String) -> Result<()> {
             .error
             .unwrap_or_else(|| "browser_script failed".to_string())
     )
+}
+
+fn remote_cdp_connect_command_from_env() -> Option<String> {
+    std::env::var("BU_CDP_WS")
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .or_else(|| {
+            std::env::var("BU_CDP_URL")
+                .ok()
+                .map(|value| value.trim().to_string())
+                .filter(|value| !value.is_empty())
+        })
+        .map(|endpoint| {
+            let flag = if endpoint.starts_with("ws://") || endpoint.starts_with("wss://") {
+                "--ws"
+            } else {
+                "--url"
+            };
+            format!(
+                "browser connect remote-cdp {flag} {}",
+                shell_quote_arg(&endpoint)
+            )
+        })
 }
 
 #[derive(Clone, Debug)]
@@ -6872,6 +6932,27 @@ command = "test-mcp"
                 && event.payload["child_session_id"] == child.id));
 
         std::fs::remove_dir_all(temp)?;
+        Ok(())
+    }
+
+    #[test]
+    fn run_codex_session_command_accepts_task_id_and_model() -> Result<()> {
+        let parsed = Args::try_parse_from([
+            "browser-use-terminal",
+            "run-codex-session",
+            "session-123",
+            "--model",
+            "gpt-test",
+        ])?;
+
+        match &parsed.command {
+            Command::RunCodexSession { task_id, model } => {
+                assert_eq!(task_id, "session-123");
+                assert_eq!(model, "gpt-test");
+                assert_eq!(command_name(&parsed.command), "run_codex_session");
+            }
+            other => panic!("expected run-codex-session command, got {other:?}"),
+        }
         Ok(())
     }
 

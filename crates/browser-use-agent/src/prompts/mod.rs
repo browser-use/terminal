@@ -209,6 +209,13 @@ pub fn browser_mode_instruction(mode: &str) -> String {
             "Remote start means start and connect; use `browser remote live-url` to retrieve the watch URL."
         )
         .to_string(),
+        "remote-cdp" | "cdp" => concat!(
+            "Selected browser mode: Remote CDP. The evaluation harness already provides the browser endpoint. ",
+            "Do not call `browser connect managed`, `browser connect local`, or `browser remote start`. ",
+            "Start page work directly with `browser_script` using `goto_url(...)`, then call explicit waits such as `wait_for_load(...)` only when the next page state matters. ",
+            "Use `browser status --json` only if you need to inspect the current connection."
+        )
+        .to_string(),
         other => format!(
             "Selected browser mode: {other}. Use `browser status --json` first, then choose an explicit browser connect command."
         ),

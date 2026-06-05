@@ -1154,15 +1154,22 @@ fn response_input_item_output_content(item: &Value) -> Value {
 fn value_to_tool_output_text(value: &Value) -> String {
     match value {
         Value::String(text) => text.clone(),
-        Value::Array(parts) => parts
-            .iter()
-            .filter_map(|part| {
-                part.get("text")
-                    .and_then(Value::as_str)
-                    .map(ToOwned::to_owned)
-            })
-            .collect::<Vec<_>>()
-            .join(""),
+        Value::Array(parts) => {
+            let text = parts
+                .iter()
+                .filter_map(|part| {
+                    part.get("text")
+                        .and_then(Value::as_str)
+                        .map(ToOwned::to_owned)
+                })
+                .collect::<Vec<_>>()
+                .join("");
+            if text.trim().is_empty() {
+                value.to_string()
+            } else {
+                text
+            }
+        }
         Value::Null => String::new(),
         other => other.to_string(),
     }
@@ -1473,15 +1480,33 @@ fn tool_output_event_content(payload: &Value) -> Value {
 
 fn tool_output_event_text(payload: &Value) -> String {
     if let Some(text) = payload.get("text").and_then(Value::as_str) {
-        return text.to_string();
+        if !text.trim().is_empty() {
+            return text.to_string();
+        }
     }
     if let Some(output) = payload.get("output") {
-        return value_to_tool_output_text(output);
+        let text = value_to_tool_output_text(output);
+        if !text.trim().is_empty() {
+            return text;
+        }
     }
     if let Some(content) = payload.get("content") {
-        return value_to_tool_output_text(content);
+        let text = value_to_tool_output_text(content);
+        if !text.trim().is_empty() {
+            return text;
+        }
     }
-    String::new()
+    let mut parts = Vec::new();
+    for key in ["summary", "data", "outputs"] {
+        let Some(value) = payload.get(key) else {
+            continue;
+        };
+        if value.is_null() || value == &serde_json::json!({}) || value == &serde_json::json!([]) {
+            continue;
+        }
+        parts.push(format!("{key}: {}", value_to_tool_output_text(value)));
+    }
+    parts.join("\n")
 }
 
 fn synthetic_tool_result_text(name: &str) -> String {

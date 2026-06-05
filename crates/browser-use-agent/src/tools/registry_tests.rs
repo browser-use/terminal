@@ -1096,7 +1096,7 @@ async fn done_dispatches_through_the_registry() {
     let out = reg
         .dispatch(
             "done",
-            &serde_json::json!({ "text": "task finished" }),
+            &serde_json::json!({ "result": "task finished" }),
             &ctx("done"),
             &env(),
             AskForApproval::Never,
@@ -1114,4 +1114,14 @@ async fn done_dispatches_through_the_registry() {
     );
     // done is serial (terminal).
     assert_eq!(reg.parallel_safe("done"), Some(false));
+
+    let done_def = reg
+        .model_visible_definitions()
+        .into_iter()
+        .find(|definition| definition.name == "done")
+        .expect("done definition");
+    let properties = &done_def.input_schema["properties"];
+    assert!(properties.get("result").is_some());
+    assert!(properties.get("text").is_some());
+    assert!(properties.get("result_file").is_some());
 }

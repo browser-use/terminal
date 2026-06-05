@@ -28,7 +28,7 @@ use tungstenite::{connect, Message, WebSocket};
 const BU_API: &str = "https://api.browser-use.com/api/v3";
 const LOG_LIMIT: usize = 250;
 const SCRIPT_MAX_OUTPUT_CHARS: usize = 120_000;
-const BROWSER_SCRIPT_INITIAL_WAIT_MS: u64 = 750;
+const BROWSER_SCRIPT_DEFAULT_INITIAL_WAIT_MS: u64 = 7_000;
 const BROWSER_SCRIPT_DEFAULT_OBSERVE_MS: u64 = 1_000;
 const BROWSER_SCRIPT_HELPERS: &str = include_str!("browser_script_helpers.py");
 const BROWSER_CONNECT_LOCAL_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(120);
@@ -196,11 +196,17 @@ struct BrowserSession {
     last_target_id: Option<String>,
     last_session_id: Option<String>,
     last_emitted_browser_payload: Option<Value>,
+    browser_profile_runtime: BrowserProfileRuntimeState,
     preferred_target_marker: Option<String>,
     preferred_profile_id: Option<String>,
     active_local_profile_id: Option<String>,
     preferred_browser_context_id: Option<String>,
     logs: VecDeque<String>,
+}
+
+#[derive(Default)]
+struct BrowserProfileRuntimeState {
+    applied_setup_keys: HashSet<String>,
 }
 
 impl Default for BrowserSession {
@@ -224,6 +230,7 @@ impl Default for BrowserSession {
             last_target_id: None,
             last_session_id: None,
             last_emitted_browser_payload: None,
+            browser_profile_runtime: BrowserProfileRuntimeState::default(),
             preferred_target_marker: None,
             preferred_profile_id: None,
             active_local_profile_id: None,
@@ -558,6 +565,97 @@ fn active_browser_script_next_step(active_scripts: &Value) -> Option<String> {
         .map(ToOwned::to_owned)
 }
 
+fn is_browser_recovery_command(argv: &[String]) -> bool {
+    argv.first().map(String::as_str) == Some("recover")
+}
+
+fn busy_recovery_status_json(
+    session_id: &str,
+    argv: &[String],
+    mut status: Value,
+    script_registry: &BrowserScriptRunRegistry,
+) -> Value {
+    let requested_command = format!("browser {}", argv.join(" "));
+    let live_active_scripts =
+        active_browser_script_runs_json_with_registry(session_id, script_registry);
+    let active_scripts = if live_active_scripts
+        .as_array()
+        .is_some_and(|scripts| !scripts.is_empty())
+    {
+        live_active_scripts
+    } else {
+        status
+            .get("active_scripts")
+            .cloned()
+            .unwrap_or(live_active_scripts)
+    };
+    let next_step = busy_recovery_next_step(&active_scripts, &requested_command);
+
+    if let Some(object) = status.as_object_mut() {
+        object.insert("status".to_string(), Value::String("busy".to_string()));
+        object.insert("busy".to_string(), Value::Bool(true));
+        object.insert("recovery_deferred".to_string(), Value::Bool(true));
+        object.insert(
+            "reason".to_string(),
+            Value::String(
+                "Browser recovery was requested while an active browser_script owned the browser session."
+                    .to_string(),
+            ),
+        );
+        object.insert(
+            "requested_command".to_string(),
+            Value::String(requested_command.clone()),
+        );
+        object.insert("active_scripts".to_string(), active_scripts);
+        object.insert("next_step".to_string(), Value::String(next_step.clone()));
+        object.insert(
+            "model_instruction".to_string(),
+            Value::String(format!(
+                "The browser session is busy, not failed. Follow next_step, then retry {requested_command}."
+            )),
+        );
+        return status;
+    }
+
+    json!({
+        "status": "busy",
+        "busy": true,
+        "recovery_deferred": true,
+        "reason": "Browser recovery was requested while an active browser_script owned the browser session.",
+        "requested_command": requested_command,
+        "active_scripts": active_scripts,
+        "next_step": next_step,
+        "model_instruction": format!(
+            "The browser session is busy, not failed. Follow next_step, then retry {requested_command}."
+        ),
+    })
+}
+
+fn busy_recovery_next_step(active_scripts: &Value, requested_command: &str) -> String {
+    let Some(script) = active_scripts
+        .as_array()
+        .and_then(|scripts| scripts.first())
+    else {
+        return format!(
+            "Wait for the in-flight browser_script to return, run browser status --json, then retry {requested_command}."
+        );
+    };
+    let Some(run_id) = script.get("run_id").and_then(Value::as_str) else {
+        return format!(
+            "Wait for the in-flight browser_script to return, run browser status --json, then retry {requested_command}."
+        );
+    };
+    let status = script
+        .get("status")
+        .and_then(Value::as_str)
+        .unwrap_or("running");
+    if matches!(status, "finished" | "timed_out") {
+        format!("browser_script action=observe run_id={run_id}; then retry {requested_command}.")
+    } else {
+        format!("browser_script action=observe run_id={run_id}; if it is still stuck without progress, browser_script action=cancel run_id={run_id}; then retry {requested_command}.")
+    }
+}
+
 pub fn run_browser_command(
     session_id: &str,
     cwd: impl AsRef<Path>,
@@ -656,6 +754,12 @@ pub fn run_browser_command_with_options_and_registries(
             return Ok(BrowserCommandOutput {
                 events: Vec::new(),
                 content,
+            });
+        }
+        if is_browser_recovery_command(&argv) {
+            return Ok(BrowserCommandOutput {
+                events: Vec::new(),
+                content: busy_recovery_status_json(session_id, &argv, content, script_registry),
             });
         }
         bail!(
@@ -789,7 +893,7 @@ pub fn start_browser_script_with_registries(
         timeout_seconds,
         session_registry,
     )?;
-    let initial_deadline = Instant::now() + Duration::from_millis(BROWSER_SCRIPT_INITIAL_WAIT_MS);
+    let initial_deadline = Instant::now() + Duration::from_millis(browser_script_initial_wait_ms());
     loop {
         if run.child.try_wait()?.is_some() {
             return finish_browser_script_run(run, false);
@@ -836,6 +940,22 @@ pub fn start_browser_script_with_registries(
         }
         thread::sleep(Duration::from_millis(50));
     }
+}
+
+fn browser_script_initial_wait_ms() -> u64 {
+    [
+        "BU_BROWSER_SCRIPT_INITIAL_WAIT_MS",
+        "BROWSER_SCRIPT_INITIAL_WAIT_MS",
+    ]
+    .iter()
+    .find_map(|name| {
+        std::env::var(name)
+            .ok()
+            .and_then(|value| value.trim().parse::<u64>().ok())
+            .filter(|value| *value > 0)
+    })
+    .map(|value| value.clamp(250, 30_000))
+    .unwrap_or(BROWSER_SCRIPT_DEFAULT_INITIAL_WAIT_MS)
 }
 
 pub fn observe_browser_script(
@@ -1019,6 +1139,16 @@ fn spawn_browser_script_with_session_registry(
         code,
     )?;
     let mut command = browser_script_python_command();
+    if browser_script_session_outputs_enabled() {
+        let outputs_dir = artifact_dir.as_ref().join("outputs");
+        fs::create_dir_all(&outputs_dir).with_context(|| {
+            format!(
+                "create browser_script outputs dir {}",
+                outputs_dir.display()
+            )
+        })?;
+        command.env("BH_OUTPUTS_DIR", outputs_dir);
+    }
     let mut child = command
         .arg("-c")
         .arg(prelude)
@@ -1457,6 +1587,10 @@ fn browser_script_python_command() -> Command {
 
 fn nonempty_os_var(name: &str) -> Option<std::ffi::OsString> {
     std::env::var_os(name).filter(|value| !value.is_empty())
+}
+
+fn browser_script_session_outputs_enabled() -> bool {
+    env_bool("BU_BROWSER_SCRIPT_SESSION_OUTPUTS").unwrap_or(false)
 }
 
 fn venv_python_path(venv: &Path) -> PathBuf {
@@ -1954,7 +2088,9 @@ fn dispatch_connect(session: &mut BrowserSession, argv: &[String]) -> Result<Val
                 None | Some("temp") => ManagedProfile::Temp,
                 Some(path) => ManagedProfile::Path(PathBuf::from(path)),
             };
-            let extra_args = option_values(argv, "--arg");
+            let profile = managed_browser_profile_from_env(profile);
+            let mut extra_args = option_values(argv, "--arg");
+            extra_args.extend(managed_browser_extra_args_from_env());
             session.connect_managed(headless, profile, extra_args)
         }
         Some("remote-cdp") => {
@@ -1969,6 +2105,358 @@ fn dispatch_connect(session: &mut BrowserSession, argv: &[String]) -> Result<Val
         Some(other) => bail!("unknown browser connect mode: {other}"),
         None => bail!("browser connect requires local, managed, or remote-cdp"),
     }
+}
+
+#[derive(Debug)]
+struct BrowserProfileSetupCall {
+    key: String,
+    method: &'static str,
+    session_id: Option<String>,
+    params: Value,
+}
+
+fn env_trimmed(name: &str) -> Option<String> {
+    std::env::var(name)
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
+fn env_bool(name: &str) -> Option<bool> {
+    match env_trimmed(name)?.to_ascii_lowercase().as_str() {
+        "1" | "true" | "yes" | "on" => Some(true),
+        "0" | "false" | "no" | "off" => Some(false),
+        _ => None,
+    }
+}
+
+fn env_json_string_list(name: &str) -> Vec<String> {
+    let Some(raw) = env_trimmed(name) else {
+        return Vec::new();
+    };
+    let Ok(value) = serde_json::from_str::<Value>(&raw) else {
+        return Vec::new();
+    };
+    let Some(items) = value.as_array() else {
+        return Vec::new();
+    };
+    let mut seen = HashSet::new();
+    let mut out = Vec::new();
+    for item in items {
+        let Some(value) = item
+            .as_str()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        else {
+            continue;
+        };
+        if seen.insert(value.to_string()) {
+            out.push(value.to_string());
+        }
+    }
+    out
+}
+
+fn expand_browser_profile_path(value: &str) -> PathBuf {
+    if let Some(rest) = value.strip_prefix("~/") {
+        if let Some(home) = home_dir() {
+            return home.join(rest);
+        }
+    }
+    PathBuf::from(value)
+}
+
+fn managed_browser_profile_from_env(fallback: ManagedProfile) -> ManagedProfile {
+    env_trimmed("BU_MANAGED_BROWSER_PROFILE")
+        .map(|path| ManagedProfile::Path(expand_browser_profile_path(&path)))
+        .unwrap_or(fallback)
+}
+
+fn managed_browser_extra_args_from_env() -> Vec<String> {
+    let Some(raw) = env_trimmed("BU_MANAGED_BROWSER_ARGS") else {
+        return Vec::new();
+    };
+    let Ok(value) = serde_json::from_str::<Value>(&raw) else {
+        return Vec::new();
+    };
+    value
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+        .filter(|arg| !arg.is_empty())
+        .map(ToOwned::to_owned)
+        .collect()
+}
+
+fn browser_viewport_launch_args() -> Vec<String> {
+    if env_bool("BU_BROWSER_NO_VIEWPORT") == Some(true) {
+        return Vec::new();
+    }
+    let Some(raw) = env_trimmed("BU_BROWSER_VIEWPORT") else {
+        return Vec::new();
+    };
+    let Ok(value) = serde_json::from_str::<Value>(&raw) else {
+        return Vec::new();
+    };
+    let Some(width) = value.get("width").and_then(Value::as_i64) else {
+        return Vec::new();
+    };
+    let Some(height) = value.get("height").and_then(Value::as_i64) else {
+        return Vec::new();
+    };
+    if width <= 0 || height <= 0 {
+        return Vec::new();
+    }
+    let mut args = vec![format!("--window-size={width},{height}")];
+    if let Some(scale) = value
+        .get("deviceScaleFactor")
+        .and_then(Value::as_f64)
+        .filter(|scale| *scale > 0.0)
+    {
+        args.push(format!("--force-device-scale-factor={scale}"));
+    }
+    args
+}
+
+fn browser_download_behavior() -> Option<(String, Value)> {
+    if env_bool("BU_BROWSER_ACCEPT_DOWNLOADS") == Some(false) {
+        return Some(("downloads:false".to_string(), json!({ "behavior": "deny" })));
+    }
+    let raw_path = env_trimmed("BU_BROWSER_DOWNLOADS_PATH")?;
+    let path = expand_browser_profile_path(&raw_path);
+    let _ = fs::create_dir_all(&path);
+    Some((
+        format!("downloads:true:{}", path.display()),
+        json!({
+            "behavior": "allow",
+            "downloadPath": path.display().to_string(),
+            "eventsEnabled": true,
+        }),
+    ))
+}
+
+fn browser_storage_state_raw() -> Option<String> {
+    env_trimmed("BU_BROWSER_STORAGE_STATE")
+}
+
+fn browser_storage_state() -> Option<Value> {
+    serde_json::from_str::<Value>(&browser_storage_state_raw()?).ok()
+}
+
+fn browser_storage_cookies(storage_state: &Value) -> Vec<Value> {
+    storage_state
+        .get("cookies")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(cookie_to_cdp_param)
+        .collect()
+}
+
+fn browser_storage_init_scripts(storage_state: &Value) -> Vec<String> {
+    let Some(origins) = storage_state.get("origins").and_then(Value::as_array) else {
+        return Vec::new();
+    };
+    let mut scripts = Vec::new();
+    for origin_state in origins {
+        let Some(origin_state) = origin_state.as_object() else {
+            continue;
+        };
+        let origin = origin_state.get("origin").and_then(Value::as_str);
+        let mut statements = Vec::new();
+        for storage_name in ["localStorage", "sessionStorage"] {
+            let Some(items) = origin_state.get(storage_name).and_then(Value::as_array) else {
+                continue;
+            };
+            for item in items {
+                let Some(name) = item.get("name").and_then(Value::as_str) else {
+                    continue;
+                };
+                let Some(value) = item.get("value").and_then(Value::as_str) else {
+                    continue;
+                };
+                statements.push(format!(
+                    "window.{storage_name}.setItem({}, {});",
+                    serde_json::to_string(name).unwrap_or_else(|_| "\"\"".to_string()),
+                    serde_json::to_string(value).unwrap_or_else(|_| "\"\"".to_string())
+                ));
+            }
+        }
+        if statements.is_empty() {
+            continue;
+        }
+        let body = statements.join("\n    ");
+        if let Some(origin) = origin.filter(|origin| !origin.trim().is_empty()) {
+            scripts.push(format!(
+                "try {{\n  if (window.location.origin === {}) {{\n    {body}\n  }}\n}} catch (error) {{}}",
+                serde_json::to_string(origin).unwrap_or_else(|_| "\"\"".to_string())
+            ));
+        } else {
+            scripts.push(format!("try {{\n  {body}\n}} catch (error) {{}}"));
+        }
+    }
+    scripts
+}
+
+fn browser_profile_setup_calls(session_id: Option<&str>) -> Vec<BrowserProfileSetupCall> {
+    let mut calls = Vec::new();
+
+    let permissions = env_json_string_list("BU_BROWSER_PERMISSIONS");
+    if !permissions.is_empty() {
+        calls.push(BrowserProfileSetupCall {
+            key: format!("permissions:{}", permissions.join("\0")),
+            method: "Browser.grantPermissions",
+            session_id: None,
+            params: json!({ "permissions": permissions }),
+        });
+    }
+
+    if let Some((key, params)) = browser_download_behavior() {
+        calls.push(BrowserProfileSetupCall {
+            key,
+            method: "Browser.setDownloadBehavior",
+            session_id: None,
+            params,
+        });
+    }
+
+    if let Some(storage_state) = browser_storage_state() {
+        if let Some(raw) = browser_storage_state_raw() {
+            let cookies = browser_storage_cookies(&storage_state);
+            if !cookies.is_empty() {
+                calls.push(BrowserProfileSetupCall {
+                    key: format!("storage-cookies:{raw}"),
+                    method: "Storage.setCookies",
+                    session_id: None,
+                    params: json!({ "cookies": cookies }),
+                });
+            }
+            if let Some(session_id) = session_id {
+                for (index, source) in browser_storage_init_scripts(&storage_state)
+                    .into_iter()
+                    .enumerate()
+                {
+                    calls.push(BrowserProfileSetupCall {
+                        key: format!("storage-script:{session_id}:{index}:{raw}"),
+                        method: "Page.addScriptToEvaluateOnNewDocument",
+                        session_id: Some(session_id.to_string()),
+                        params: json!({ "source": source, "runImmediately": true }),
+                    });
+                }
+            }
+        }
+    }
+
+    if let (Some(session_id), Some(user_agent)) = (session_id, env_trimmed("BU_BROWSER_USER_AGENT"))
+    {
+        calls.push(BrowserProfileSetupCall {
+            key: format!("user-agent:{session_id}:{user_agent}"),
+            method: "Network.setUserAgentOverride",
+            session_id: Some(session_id.to_string()),
+            params: json!({ "userAgent": user_agent }),
+        });
+    }
+
+    calls
+}
+
+fn is_root_domain_pattern(pattern: &str) -> bool {
+    !pattern.contains('*') && !pattern.contains("://") && pattern.matches('.').count() == 1
+}
+
+fn wildcard_match(pattern: &str, value: &str) -> bool {
+    if !pattern.contains('*') {
+        return pattern == value;
+    }
+    let mut remainder = value;
+    let mut first = true;
+    for part in pattern.split('*') {
+        if part.is_empty() {
+            continue;
+        }
+        if first && !pattern.starts_with('*') {
+            let Some(stripped) = remainder.strip_prefix(part) else {
+                return false;
+            };
+            remainder = stripped;
+        } else if let Some(index) = remainder.find(part) {
+            remainder = &remainder[index + part.len()..];
+        } else {
+            return false;
+        }
+        first = false;
+    }
+    pattern.ends_with('*') || remainder.is_empty()
+}
+
+fn browser_domain_pattern_matches(url: &str, host: &str, scheme: &str, pattern: &str) -> bool {
+    let pattern = pattern.trim();
+    if pattern.is_empty() {
+        return false;
+    }
+    let host_lower = host.to_ascii_lowercase();
+    let pattern_lower = pattern.to_ascii_lowercase();
+    if let Some(domain) = pattern_lower.strip_prefix("*.") {
+        return matches!(scheme, "http" | "https")
+            && (host_lower == domain || host_lower.ends_with(&format!(".{domain}")));
+    }
+    if pattern_lower.ends_with("/*") {
+        return url
+            .to_ascii_lowercase()
+            .starts_with(pattern_lower.trim_end_matches('*'));
+    }
+    if pattern_lower.contains('*') {
+        let value = if pattern_lower.contains("://") {
+            format!("{scheme}://{host_lower}")
+        } else {
+            host_lower.clone()
+        };
+        return wildcard_match(&pattern_lower, &value);
+    }
+    if pattern_lower.contains("://") {
+        return url.to_ascii_lowercase().starts_with(&pattern_lower);
+    }
+    host_lower == pattern_lower
+        || (is_root_domain_pattern(&pattern_lower) && host_lower == format!("www.{pattern_lower}"))
+}
+
+fn browser_profile_url_allowed(raw_url: &str) -> bool {
+    if matches!(
+        raw_url,
+        "about:blank" | "chrome://new-tab-page/" | "chrome://new-tab-page" | "chrome://newtab/"
+    ) {
+        return true;
+    }
+    let block_ip_addresses = env_bool("BU_BROWSER_BLOCK_IP_ADDRESSES") == Some(true);
+    let allowed_domains = env_json_string_list("BU_BROWSER_ALLOWED_DOMAINS");
+    let prohibited_domains = env_json_string_list("BU_BROWSER_PROHIBITED_DOMAINS");
+    let constraints_active =
+        block_ip_addresses || !allowed_domains.is_empty() || !prohibited_domains.is_empty();
+    let Ok(url) = reqwest::Url::parse(raw_url) else {
+        return !constraints_active;
+    };
+    if matches!(url.scheme(), "data" | "blob") {
+        return true;
+    }
+    let Some(host) = url.host_str() else {
+        return !constraints_active;
+    };
+    if block_ip_addresses && host.parse::<IpAddr>().is_ok() {
+        return false;
+    }
+
+    if !allowed_domains.is_empty() {
+        return allowed_domains
+            .iter()
+            .any(|pattern| browser_domain_pattern_matches(raw_url, host, url.scheme(), pattern));
+    }
+    if !prohibited_domains.is_empty() {
+        return !prohibited_domains
+            .iter()
+            .any(|pattern| browser_domain_pattern_matches(raw_url, host, url.scheme(), pattern));
+    }
+    true
 }
 
 fn dispatch_local(
@@ -3211,6 +3699,7 @@ impl BrowserSession {
                 "browser is not connected. Run `browser status --json` or `browser connect ...`."
             );
         }
+        self.prepare_browser_profile_runtime(method, session_id, &params)?;
         browser_session_prepare_cdp_visuals(self, method, session_id, &params);
         let Some(connection) = self.connection.as_mut() else {
             bail!(
@@ -3345,6 +3834,47 @@ impl BrowserSession {
                 bail!(message);
             }
         }
+    }
+
+    fn prepare_browser_profile_runtime(
+        &mut self,
+        method: &str,
+        session_id: Option<&str>,
+        params: &Value,
+    ) -> Result<()> {
+        if method == "Page.navigate" {
+            if let Some(url) = params.get("url").and_then(Value::as_str) {
+                if !browser_profile_url_allowed(url) {
+                    bail!("BrowserProfile domain constraints blocked navigation to {url}");
+                }
+            }
+        }
+
+        let setup_calls = browser_profile_setup_calls(session_id);
+        if setup_calls.is_empty() {
+            return Ok(());
+        }
+        let Some(connection) = self.connection.as_mut() else {
+            return Ok(());
+        };
+        for call in setup_calls {
+            if self
+                .browser_profile_runtime
+                .applied_setup_keys
+                .contains(&call.key)
+            {
+                continue;
+            }
+            if connection
+                .call(&call.method, call.session_id.as_deref(), call.params)
+                .is_ok()
+            {
+                self.browser_profile_runtime
+                    .applied_setup_keys
+                    .insert(call.key);
+            }
+        }
+        Ok(())
     }
 
     fn attach_first_page(&mut self) -> Result<()> {
@@ -4870,15 +5400,19 @@ fn launch_managed_browser(launch: ManagedLaunch) -> Result<(ManagedBrowser, Stri
         "--no-first-run".to_string(),
         "--no-default-browser-check".to_string(),
     ];
+    let viewport_args = browser_viewport_launch_args();
     if launch.headless {
         args.push("--headless=new".to_string());
-        args.push("--window-size=1280,720".to_string());
+        if viewport_args.is_empty() && env_bool("BU_BROWSER_NO_VIEWPORT") != Some(true) {
+            args.push("--window-size=1280,720".to_string());
+        }
     } else {
-        args.extend([
-            "--new-window".to_string(),
-            "--window-size=1512,900".to_string(),
-        ]);
+        args.push("--new-window".to_string());
+        if viewport_args.is_empty() {
+            args.push("--window-size=1512,900".to_string());
+        }
     }
+    args.extend(viewport_args);
     args.extend(launch.extra_args.clone());
     args.push("about:blank".to_string());
     let mut child = Command::new(&launch.executable)
@@ -6499,7 +7033,7 @@ ARTIFACT_DIR.mkdir(parents=True, exist_ok=True)
 STREAM_PATH.parent.mkdir(parents=True, exist_ok=True)
 FRAMES_DIR.mkdir(parents=True, exist_ok=True)
 FRAMES_MANIFEST = FRAMES_DIR / "frames.ndjson"
-OUTPUTS_DIR = CWD
+OUTPUTS_DIR = pathlib.Path(os.environ.get("BH_OUTPUTS_DIR") or {cwd:?}).expanduser().resolve()
 OUTPUTS_DIR.mkdir(parents=True, exist_ok=True)
 __USER_CODE = base64.b64decode({encoded_code:?}).decode()
 
@@ -6508,7 +7042,7 @@ __USER_CODE = base64.b64decode({encoded_code:?}).decode()
 # are written as JPEGs plus a sidecar manifest, kept OUT of STREAM_PATH so the
 # event drain never sees partial/interleaved lines.
 try:
-    CAPTURE_FPS = float(os.environ.get("LLM_BROWSER_CAPTURE_FPS", "2") or "2")
+    CAPTURE_FPS = float(os.environ.get("LLM_BROWSER_CAPTURE_FPS", "0") or "0")
 except (TypeError, ValueError):
     CAPTURE_FPS = 2.0
 try:
@@ -7574,7 +8108,7 @@ fn session_capture_fps() -> f64 {
     std::env::var("LLM_BROWSER_CAPTURE_FPS")
         .ok()
         .and_then(|v| v.trim().parse::<f64>().ok())
-        .unwrap_or(2.0)
+        .unwrap_or(0.0)
 }
 fn session_capture_quality() -> i64 {
     std::env::var("LLM_BROWSER_CAPTURE_QUALITY")
@@ -8773,6 +9307,57 @@ mod tests {
     }
 
     #[test]
+    fn browser_recovery_while_checked_out_returns_busy_guidance() {
+        let temp = tempfile::tempdir().unwrap();
+        let registry = BrowserSessionRegistry::new();
+        let script_registry = BrowserScriptRunRegistry::new();
+        let session_id = "checked-out-recover";
+        registry
+            .checked_out_statuses
+            .lock()
+            .expect("browser checked-out session registry poisoned")
+            .insert(
+                session_id.to_string(),
+                json!({
+                    "mode": "remote-cloud",
+                    "connection": "connected",
+                    "active_scripts": [{
+                        "run_id": "script-1",
+                        "status": "running",
+                        "next_step": "browser_script action=observe run_id=script-1"
+                    }],
+                    "page": {
+                        "target_id": "target-1",
+                        "session_id": "session-1"
+                    }
+                }),
+            );
+
+        let output = run_browser_command_with_options_and_registries(
+            session_id,
+            temp.path(),
+            temp.path().join("artifacts"),
+            "browser recover reconnect-websocket",
+            BrowserCommandOptions::default(),
+            &script_registry,
+            &registry,
+        )
+        .expect("busy recovery should return structured guidance");
+
+        assert_eq!(output.content["status"], "busy");
+        assert_eq!(output.content["busy"], true);
+        assert_eq!(output.content["recovery_deferred"], true);
+        assert_eq!(
+            output.content["requested_command"],
+            "browser recover reconnect-websocket"
+        );
+        assert_eq!(output.content["active_scripts"][0]["run_id"], "script-1");
+        let next_step = output.content["next_step"].as_str().unwrap();
+        assert!(next_step.contains("browser_script action=observe run_id=script-1"));
+        assert!(next_step.contains("retry browser recover reconnect-websocket"));
+    }
+
+    #[test]
     fn browser_help_is_cli_like() {
         let help = browser_help();
         assert!(help.contains("browser status --json"));
@@ -8873,6 +9458,48 @@ print(session_metadata()["outputs_dir"])
                 "artifact path should be absolute: {artifact}"
             );
         }
+    }
+
+    #[test]
+    fn browser_script_session_outputs_dir_isolates_parallel_cwd_files() {
+        let _env = EnvRestore::set(&[("BU_BROWSER_SCRIPT_SESSION_OUTPUTS", "1")]);
+        let temp = tempfile::tempdir().unwrap();
+        let artifacts = temp.path().join("artifacts");
+        let output = run_browser_script(
+            "script-session-outputs",
+            temp.path(),
+            &artifacts,
+            r#"
+shared = pathlib.Path.cwd() / 'parallel-task-leak.txt'
+shared.write_text('from another parallel task', encoding='utf-8')
+answer = pathlib.Path(outputs_dir()) / 'answer.json'
+answer.write_text(json.dumps({'ok': True}), encoding='utf-8')
+print(session_metadata()["outputs_dir"])
+"#,
+            10,
+        )
+        .unwrap();
+        assert!(output.ok, "{:?}", output.error);
+        let artifact_paths = output
+            .artifacts
+            .iter()
+            .filter_map(|artifact| artifact["path"].as_str())
+            .collect::<Vec<_>>();
+        assert!(
+            artifact_paths
+                .iter()
+                .any(|path| path.ends_with("/outputs/answer.json")),
+            "expected outputs artifact, got {artifact_paths:?}"
+        );
+        assert!(
+            artifact_paths
+                .iter()
+                .all(|path| !path.ends_with("parallel-task-leak.txt")),
+            "cwd file leaked into artifacts: {artifact_paths:?}"
+        );
+        assert!(output
+            .text
+            .contains(artifacts.join("outputs").to_str().unwrap()));
     }
 
     #[test]
@@ -9084,6 +9711,163 @@ print("navigation helpers do not auto wait")
 
         assert!(output.ok, "{:?}\n{}", output.error, output.text);
         assert!(output.text.contains("navigation helpers do not auto wait"));
+    }
+
+    #[test]
+    fn browser_profile_runtime_setup_calls_read_env() {
+        let temp = tempfile::tempdir().unwrap();
+        let downloads = temp.path().join("downloads");
+        let downloads_text = downloads.display().to_string();
+        let storage_state = json!({
+            "cookies": [{
+                "name": "sid",
+                "value": "secret",
+                "domain": ".example.com",
+                "path": "/"
+            }],
+            "origins": [{
+                "origin": "https://example.com",
+                "localStorage": [{"name": "theme", "value": "dark"}],
+                "sessionStorage": [{"name": "step", "value": "one"}]
+            }]
+        })
+        .to_string();
+        let _env = EnvRestore::set(&[
+            (
+                "BU_BROWSER_PERMISSIONS",
+                r#"["clipboardReadWrite","notifications","clipboardReadWrite",3]"#,
+            ),
+            ("BU_BROWSER_ACCEPT_DOWNLOADS", "true"),
+            ("BU_BROWSER_DOWNLOADS_PATH", &downloads_text),
+            ("BU_BROWSER_STORAGE_STATE", &storage_state),
+            ("BU_BROWSER_USER_AGENT", "BrowserUseRuntime/6.0"),
+        ]);
+
+        let calls = browser_profile_setup_calls(Some("session-1"));
+        let methods = calls.iter().map(|call| call.method).collect::<Vec<_>>();
+
+        assert_eq!(
+            methods,
+            vec![
+                "Browser.grantPermissions",
+                "Browser.setDownloadBehavior",
+                "Storage.setCookies",
+                "Page.addScriptToEvaluateOnNewDocument",
+                "Network.setUserAgentOverride",
+            ]
+        );
+        assert_eq!(
+            calls[0].params["permissions"],
+            json!(["clipboardReadWrite", "notifications"])
+        );
+        assert_eq!(calls[1].params["behavior"], "allow");
+        assert_eq!(calls[1].params["downloadPath"], downloads_text);
+        assert!(downloads.exists());
+        assert_eq!(calls[2].params["cookies"][0]["name"], "sid");
+        assert!(calls[3]
+            .params
+            .get("source")
+            .and_then(Value::as_str)
+            .is_some_and(|source| source
+                .contains("window.localStorage.setItem(\"theme\", \"dark\");")
+                && source.contains("window.sessionStorage.setItem(\"step\", \"one\");")));
+        assert_eq!(calls[4].session_id.as_deref(), Some("session-1"));
+        assert_eq!(calls[4].params["userAgent"], "BrowserUseRuntime/6.0");
+    }
+
+    #[test]
+    fn managed_browser_launch_reads_browser_profile_env() {
+        let temp = tempfile::tempdir().unwrap();
+        let profile = temp.path().join("profile");
+        let profile_text = profile.display().to_string();
+        let _env = EnvRestore::set(&[
+            ("BU_MANAGED_BROWSER_PROFILE", &profile_text),
+            (
+                "BU_MANAGED_BROWSER_ARGS",
+                r#"["--proxy-server=http://proxy.example:8080","--user-agent=BrowserUseManaged/1.0",3,""]"#,
+            ),
+            (
+                "BU_BROWSER_VIEWPORT",
+                r#"{"width":960,"height":720,"deviceScaleFactor":2}"#,
+            ),
+            ("BU_BROWSER_NO_VIEWPORT", "false"),
+        ]);
+
+        let ManagedProfile::Path(resolved_profile) =
+            managed_browser_profile_from_env(ManagedProfile::Temp)
+        else {
+            panic!("expected managed profile path from env");
+        };
+        assert_eq!(resolved_profile, profile);
+        assert_eq!(
+            managed_browser_extra_args_from_env(),
+            vec![
+                "--proxy-server=http://proxy.example:8080".to_string(),
+                "--user-agent=BrowserUseManaged/1.0".to_string(),
+            ]
+        );
+        assert_eq!(
+            browser_viewport_launch_args(),
+            vec![
+                "--window-size=960,720".to_string(),
+                "--force-device-scale-factor=2".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn browser_profile_runtime_domain_constraints_read_env() {
+        {
+            let _env = EnvRestore::set(&[
+                (
+                    "BU_BROWSER_ALLOWED_DOMAINS",
+                    r#"["example.com","*.browser-use.com"]"#,
+                ),
+                ("BU_BROWSER_PROHIBITED_DOMAINS", r#"["*.tracking.example"]"#),
+                ("BU_BROWSER_BLOCK_IP_ADDRESSES", "true"),
+            ]);
+
+            assert!(browser_profile_url_allowed("https://www.example.com/path"));
+            assert!(browser_profile_url_allowed("https://docs.browser-use.com/"));
+            assert!(browser_profile_url_allowed("about:blank"));
+            assert!(!browser_profile_url_allowed("https://iana.org/"));
+            assert!(!browser_profile_url_allowed("http://127.0.0.1/"));
+        }
+
+        {
+            let _env = EnvRestore::set(&[
+                ("BU_BROWSER_ALLOWED_DOMAINS", "[]"),
+                ("BU_BROWSER_PROHIBITED_DOMAINS", r#"["*.tracking.example"]"#),
+                ("BU_BROWSER_BLOCK_IP_ADDRESSES", "false"),
+            ]);
+
+            assert!(!browser_profile_url_allowed(
+                "https://ads.tracking.example/"
+            ));
+            assert!(browser_profile_url_allowed("https://example.com/"));
+        }
+    }
+
+    #[test]
+    fn browser_profile_domain_constraints_are_passive_without_env() {
+        let _env = EnvRestore::unset(&[
+            "BU_BROWSER_ALLOWED_DOMAINS",
+            "BU_BROWSER_PROHIBITED_DOMAINS",
+            "BU_BROWSER_BLOCK_IP_ADDRESSES",
+        ]);
+
+        assert!(browser_profile_url_allowed(""));
+        assert!(browser_profile_url_allowed("/relative-path"));
+
+        drop(_env);
+        let _env = EnvRestore::set(&[
+            ("BU_BROWSER_ALLOWED_DOMAINS", r#"["example.com"]"#),
+            ("BU_BROWSER_PROHIBITED_DOMAINS", "[]"),
+            ("BU_BROWSER_BLOCK_IP_ADDRESSES", "false"),
+        ]);
+
+        assert!(!browser_profile_url_allowed(""));
+        assert!(!browser_profile_url_allowed("/relative-path"));
     }
 
     #[test]
@@ -9745,6 +10529,172 @@ print("http_get parity ok")
     }
 
     #[test]
+    fn browser_script_http_get_many_preserves_order_and_errors() {
+        let temp = tempfile::tempdir().unwrap();
+        let output = run_browser_script(
+            "script-http-get-many",
+            temp.path(),
+            temp.path().join("artifacts"),
+            r#"
+import http.server
+import socketserver
+import threading
+
+class Handler(http.server.BaseHTTPRequestHandler):
+    def log_message(self, fmt, *args):
+        pass
+
+    def do_GET(self):
+        if self.path in ("/one", "/two"):
+            assert self.headers.get("X-Shared") == "yes", dict(self.headers)
+            if self.path == "/one":
+                assert self.headers.get("X-Item") == "one", dict(self.headers)
+            body = self.path.strip("/").encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "text/plain; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+            return
+        self.send_response(404)
+        self.end_headers()
+
+server = socketserver.ThreadingTCPServer(("127.0.0.1", 0), Handler)
+thread = threading.Thread(target=server.serve_forever, daemon=True)
+thread.start()
+base = f"http://127.0.0.1:{server.server_address[1]}"
+try:
+    results = http_get_many(
+        [base + "/two", {"url": base + "/one", "headers": {"X-Item": "one"}}, base + "/missing"],
+        headers={"X-Shared": "yes"},
+        max_workers=3,
+    )
+    assert len(results) == 3, results
+    assert results[0] == "two", results
+    assert results[0].status_code == 200
+    assert results[1] == "one", results
+    assert results[1].url.endswith("/one")
+    assert results[2]["ok"] is False, results[2]
+    assert results[2]["url"].endswith("/missing"), results[2]
+    try:
+        http_get_many([base + "/missing"], return_errors=False)
+    except RuntimeError:
+        pass
+    else:
+        raise AssertionError("return_errors=False should raise")
+finally:
+    server.shutdown()
+    server.server_close()
+
+assert callable(browser_fetch)
+assert callable(browser_fetch_many)
+print("http_get_many parity ok")
+"#,
+            10,
+        )
+        .unwrap();
+
+        assert!(output.ok, "{:?}\n{}", output.error, output.text);
+        assert!(output.text.contains("http_get_many parity ok"));
+    }
+
+    #[test]
+    fn browser_script_browser_fetch_single_returns_structured_errors_by_default() {
+        let temp = tempfile::tempdir().unwrap();
+        let output = run_browser_script(
+            "script-browser-fetch-single-error",
+            temp.path(),
+            temp.path().join("artifacts"),
+            r#"
+def fake_runtime_evaluate(expression, await_promise=False, return_by_value=False):
+    return [{"ok": False, "url": "https://example.test/api", "error": "Failed to fetch"}]
+
+globals()["_runtime_evaluate"] = fake_runtime_evaluate
+
+result = browser_fetch("https://example.test/api")
+assert result["ok"] is False, result
+assert result["url"] == "https://example.test/api", result
+assert "Failed to fetch" in result["error"], result
+
+try:
+    browser_fetch("https://example.test/api", return_error=False)
+except RuntimeError as exc:
+    assert "browser_fetch failed" in str(exc), exc
+else:
+    raise AssertionError("return_error=False should raise")
+
+print("browser_fetch single structured error ok")
+"#,
+            10,
+        )
+        .unwrap();
+
+        assert!(output.ok, "{:?}\n{}", output.error, output.text);
+        assert!(output
+            .text
+            .contains("browser_fetch single structured error ok"));
+    }
+
+    #[test]
+    fn browser_script_bridge_retries_transient_busy_errors() {
+        let temp = tempfile::tempdir().unwrap();
+        let output = run_browser_script(
+            "script-bridge-retry-busy",
+            temp.path(),
+            temp.path().join("artifacts"),
+            r#"
+attempts = {"n": 0}
+
+class FakeSock:
+    def __init__(self, payload):
+        self.payload = bytearray(payload)
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        return False
+
+    def sendall(self, data):
+        pass
+
+    def recv(self, n):
+        if not self.payload:
+            return b""
+        chunk = self.payload[:n]
+        del self.payload[:n]
+        return bytes(chunk)
+
+original_create_connection = socket.create_connection
+
+def fake_create_connection(*args, **kwargs):
+    attempts["n"] += 1
+    if attempts["n"] < 3:
+        return FakeSock(b'{"ok":false,"error":"browser is not connected or is busy; run `browser status --json`"}\n')
+    return FakeSock(b'{"ok":true,"result":{"targetInfos":[]}}\n')
+
+socket.create_connection = fake_create_connection
+try:
+    result = cdp("Target.getTargets")
+finally:
+    socket.create_connection = original_create_connection
+
+assert result == {"targetInfos": []}, result
+assert attempts["n"] == 3, attempts
+print("bridge retry ok")
+"#,
+            10,
+        )
+        .unwrap();
+
+        assert!(output.ok, "{:?}\n{}", output.error, output.text);
+        assert!(output.text.contains("bridge retry ok"));
+        assert!(output
+            .text
+            .contains("browser_script bridge retry 2/4 after transient error"));
+    }
+
+    #[test]
     fn browser_script_timeout_returns_tool_failure() {
         let temp = tempfile::tempdir().unwrap();
         let output = run_browser_script(
@@ -9783,9 +10733,45 @@ print("http_get parity ok")
     }
 
     #[test]
+    fn browser_script_initial_wait_defaults_to_seven_seconds_and_clamps_env() {
+        {
+            let _env = EnvRestore::unset(&[
+                "BU_BROWSER_SCRIPT_INITIAL_WAIT_MS",
+                "BROWSER_SCRIPT_INITIAL_WAIT_MS",
+            ]);
+            assert_eq!(browser_script_initial_wait_ms(), 7_000);
+        }
+        {
+            let _env = EnvRestore::set(&[("BU_BROWSER_SCRIPT_INITIAL_WAIT_MS", "1500")]);
+            assert_eq!(browser_script_initial_wait_ms(), 1_500);
+        }
+        {
+            let _env = EnvRestore::set(&[("BU_BROWSER_SCRIPT_INITIAL_WAIT_MS", "50")]);
+            assert_eq!(browser_script_initial_wait_ms(), 250);
+        }
+        {
+            let _env = EnvRestore::set(&[("BU_BROWSER_SCRIPT_INITIAL_WAIT_MS", "45000")]);
+            assert_eq!(browser_script_initial_wait_ms(), 30_000);
+        }
+    }
+
+    #[test]
+    fn session_capture_is_opt_in_for_eval_speed() {
+        {
+            let _env = EnvRestore::unset(&["LLM_BROWSER_CAPTURE_FPS"]);
+            assert_eq!(session_capture_fps(), 0.0);
+        }
+        {
+            let _env = EnvRestore::set(&[("LLM_BROWSER_CAPTURE_FPS", "2")]);
+            assert_eq!(session_capture_fps(), 2.0);
+        }
+    }
+
+    #[test]
     fn browser_script_start_observe_finishes_slow_scripts() {
         let temp = tempfile::tempdir().unwrap();
         let session_id = "script-start-observe";
+        let _env = EnvRestore::set(&[("BU_BROWSER_SCRIPT_INITIAL_WAIT_MS", "500")]);
         let started = start_browser_script(
             session_id,
             temp.path(),

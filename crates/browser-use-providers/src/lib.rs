@@ -2450,6 +2450,7 @@ impl AnthropicMessagesProvider {
         let mut body = json!({
             "model": self.model,
             "max_tokens": 16000,
+            "cache_control": { "type": "ephemeral" },
             "system": anthropic_system_blocks_with_developer_context(&instructions, &turn.messages, is_oauth),
             "messages": messages_to_anthropic_messages(&turn.messages, is_oauth)?,
         });
@@ -5306,7 +5307,7 @@ fn chat_tool_description(tool: &ToolSpec) -> String {
 }
 
 fn tool_specs_to_anthropic_tools(tools: &[ToolSpec], is_oauth: bool) -> Vec<Value> {
-    tools
+    let mut anthropic_tools: Vec<Value> = tools
         .iter()
         .map(|tool| {
             json!({
@@ -5315,7 +5316,11 @@ fn tool_specs_to_anthropic_tools(tools: &[ToolSpec], is_oauth: bool) -> Vec<Valu
                 "input_schema": tool.input_schema,
             })
         })
-        .collect()
+        .collect();
+    if let Some(Value::Object(last_tool)) = anthropic_tools.last_mut() {
+        last_tool.insert("cache_control".to_string(), json!({ "type": "ephemeral" }));
+    }
+    anthropic_tools
 }
 
 fn anthropic_tool_description(tool: &ToolSpec) -> String {
@@ -5923,7 +5928,19 @@ fn messages_to_anthropic_messages(messages: &[Value], is_oauth: bool) -> Result<
             })),
         }
     }
+    drop_trailing_anthropic_assistant_prefill(&mut out);
     Ok(out)
+}
+
+fn drop_trailing_anthropic_assistant_prefill(messages: &mut Vec<Value>) {
+    while messages
+        .last()
+        .and_then(|message| message.get("role"))
+        .and_then(Value::as_str)
+        == Some("assistant")
+    {
+        messages.pop();
+    }
 }
 
 fn should_skip_raw_response_item_for_fallback_provider(message: &Value) -> bool {
@@ -7051,10 +7068,33 @@ fn parse_usage(usage: Option<&Value>, model: &str) -> Option<ModelUsage> {
         .or_else(|| usage.get("total_cost"))
         .or_else(|| usage.get("cost_usd"))
         .and_then(value_f64);
-    let input_tokens = usage
+    let raw_input_tokens = usage
         .get("input_tokens")
         .or_else(|| usage.get("prompt_tokens"))
         .and_then(Value::as_i64);
+    let cached_input_tokens = usage
+        .get("input_tokens_details")
+        .and_then(|details| details.get("cached_tokens"))
+        .or_else(|| {
+            usage
+                .get("prompt_tokens_details")
+                .and_then(|details| details.get("cached_tokens"))
+        })
+        .or_else(|| usage.get("cache_read_input_tokens"))
+        .and_then(Value::as_i64);
+    let cache_creation_tokens = usage
+        .get("cache_creation_input_tokens")
+        .or_else(|| usage.get("prompt_cache_creation_tokens"))
+        .and_then(Value::as_i64);
+    let input_tokens = raw_input_tokens.map(|tokens| {
+        if usage.get("cache_read_input_tokens").is_some()
+            || usage.get("cache_creation_input_tokens").is_some()
+        {
+            tokens + cached_input_tokens.unwrap_or(0)
+        } else {
+            tokens
+        }
+    });
     let output_tokens = usage
         .get("output_tokens")
         .or_else(|| usage.get("completion_tokens"))
@@ -7068,26 +7108,21 @@ fn parse_usage(usage: Option<&Value>, model: &str) -> Option<ModelUsage> {
                 .and_then(|details| details.get("reasoning_tokens"))
         })
         .and_then(Value::as_i64);
-    let total_tokens = usage
-        .get("total_tokens")
-        .and_then(Value::as_i64)
-        .or_else(|| Some(input_tokens? + output_tokens?));
+    let has_anthropic_cache_fields = usage.get("cache_read_input_tokens").is_some()
+        || usage.get("cache_creation_input_tokens").is_some();
+    let computed_total_tokens = input_tokens? + cache_creation_tokens.unwrap_or(0) + output_tokens?;
+    let total_tokens = if has_anthropic_cache_fields {
+        Some(computed_total_tokens)
+    } else {
+        usage
+            .get("total_tokens")
+            .and_then(Value::as_i64)
+            .or(Some(computed_total_tokens))
+    };
     let usage = ModelUsage {
         input_tokens,
-        input_cached_tokens: usage
-            .get("input_tokens_details")
-            .and_then(|details| details.get("cached_tokens"))
-            .or_else(|| {
-                usage
-                    .get("prompt_tokens_details")
-                    .and_then(|details| details.get("cached_tokens"))
-            })
-            .or_else(|| usage.get("cache_read_input_tokens"))
-            .and_then(Value::as_i64),
-        input_cache_creation_tokens: usage
-            .get("cache_creation_input_tokens")
-            .or_else(|| usage.get("prompt_cache_creation_tokens"))
-            .and_then(Value::as_i64),
+        input_cached_tokens: cached_input_tokens,
+        input_cache_creation_tokens: cache_creation_tokens,
         output_tokens,
         reasoning_output_tokens,
         total_tokens,
@@ -8167,6 +8202,27 @@ mod tests {
         assert_eq!(anthropic.len(), 1);
         assert_eq!(anthropic[0]["role"], "user");
         assert_eq!(anthropic[0]["content"][0]["text"], "next prompt");
+        Ok(())
+    }
+
+    #[test]
+    fn anthropic_messages_drop_trailing_assistant_prefill() -> Result<()> {
+        let messages = [
+            json!({
+                "role": "user",
+                "content": "do the browser task"
+            }),
+            json!({
+                "role": "assistant",
+                "content": "premature final answer"
+            }),
+        ];
+
+        let anthropic = messages_to_anthropic_messages(&messages, false)?;
+
+        assert_eq!(anthropic.len(), 1);
+        assert_eq!(anthropic[0]["role"], "user");
+        assert_eq!(anthropic[0]["content"][0]["text"], "do the browser task");
         Ok(())
     }
 
@@ -9424,6 +9480,52 @@ mod tests {
             }
         }));
         assert!(matches!(events.last(), Some(ModelEvent::Done)));
+        Ok(())
+    }
+
+    #[test]
+    fn anthropic_messages_request_marks_last_tool_cacheable() -> Result<()> {
+        let provider = AnthropicMessagesProvider::new("anthropic-key", "claude-test");
+        let body = provider.messages_request_body(
+            &ProviderTurn {
+                instructions: Some("Stable system prompt".to_string()),
+                messages: vec![json!({"role": "user", "content": "finish"})],
+                tools: vec![
+                    ToolSpec {
+                        name: "browser".to_string(),
+                        namespace: None,
+                        namespace_description: None,
+                        description: "Inspect a page".to_string(),
+                        input_schema: json!({"type": "object"}),
+                        output_schema: None,
+                        freeform: None,
+                    },
+                    ToolSpec {
+                        name: "done".to_string(),
+                        namespace: None,
+                        namespace_description: None,
+                        description: "Finish the task".to_string(),
+                        input_schema: json!({"type": "object"}),
+                        output_schema: None,
+                        freeform: None,
+                    },
+                ],
+                ..ProviderTurn::default()
+            },
+            false,
+            true,
+        )?;
+
+        assert!(body["tools"][0].get("cache_control").is_none());
+        assert_eq!(body["cache_control"], json!({"type": "ephemeral"}));
+        assert_eq!(
+            body["tools"][1]["cache_control"],
+            json!({"type": "ephemeral"})
+        );
+        assert_eq!(
+            body["system"][0]["cache_control"],
+            json!({"type": "ephemeral"})
+        );
         Ok(())
     }
 

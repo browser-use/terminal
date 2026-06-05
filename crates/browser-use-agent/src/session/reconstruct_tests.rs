@@ -141,6 +141,58 @@ fn turn_with_tool_call_and_output() {
 }
 
 #[test]
+fn tool_output_event_uses_structured_browser_script_fallback_text() {
+    let events = vec![
+        event(1, "session.input", json!({ "text": "open page" })),
+        event(
+            2,
+            "model.tool_call",
+            json!({
+                "id": "call_browser",
+                "name": "browser_script",
+                "arguments": { "code": "emit_output(page_info(), label='page_info')" }
+            }),
+        ),
+        event(
+            3,
+            "tool.output",
+            json!({
+                "tool_call_id": "call_browser",
+                "name": "browser_script",
+                "text": "",
+                "summary": [{
+                    "kind": "page",
+                    "output_label": "page_info",
+                    "title": "Example Domain",
+                    "url": "https://example.com"
+                }],
+                "outputs": [{
+                    "label": "page_info",
+                    "value": {
+                        "title": "Example Domain",
+                        "url": "https://example.com"
+                    }
+                }]
+            }),
+        ),
+        event(4, "session.done", json!({})),
+    ];
+
+    let messages = provider_messages_from_events(&events);
+    assert_eq!(messages.len(), 3, "messages: {messages:#?}");
+    let tool = &messages[2];
+    assert_eq!(tool.get("role").and_then(Value::as_str), Some("tool"));
+    let content = tool
+        .get("content")
+        .and_then(Value::as_str)
+        .expect("structured fallback content");
+    assert!(content.contains("summary:"));
+    assert!(content.contains("outputs:"));
+    assert!(content.contains("Example Domain"));
+    assert!(!content.trim().is_empty());
+}
+
+#[test]
 fn tool_output_event_preserves_image_content() {
     let events = vec![
         event(1, "session.input", json!({ "text": "load image" })),
