@@ -3176,4 +3176,24 @@ mod browser_mode_tests {
         )
         .unwrap();
     }
+
+    #[test]
+    fn stored_cloud_preference_rejects_managed_only_recovery() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path()).unwrap();
+        store.set_setting(BROWSER_PREF_MODE, "cloud").unwrap();
+
+        let err = resolve_browser_command_for_selected_mode(
+            Some(&store),
+            "browser recover restart-owned-browser",
+            None,
+        )
+        .unwrap_err();
+
+        assert!(
+            err.to_string()
+                .contains("restart-owned-browser only applies to managed Chromium"),
+            "{err:#}"
+        );
+    }
 }

@@ -2401,40 +2401,15 @@ fn media_content_part_for_provider(
     }
 }
 
-/// A [`TurnObserver`] that maps loop lifecycle into the durable UI event log.
+/// A [`TurnObserver`] for lifecycle hooks that must not decide terminal status.
 ///
-/// On turn completion it emits the final agent message as a `session.done`
-/// event through the durable UI sink, so the run's result is visible to the TUI
-/// and protocol reducers. The streaming text deltas are emitted by the sampling
-/// driver through the same durable sink.
-struct StoreObserver {
-    sink: Arc<dyn EventSink>,
-    session_id: String,
-}
-
-impl StoreObserver {
-    fn new(sink: Arc<dyn EventSink>, session_id: String) -> Self {
-        Self { sink, session_id }
-    }
-}
+/// Runtime-owned runs accept `session.done` only after the turn loop has returned
+/// and runtime resources have been quiesced. Streaming model/tool events are
+/// still persisted by the sampling driver through [`RuntimeStoreSink`].
+struct StoreObserver;
 
 impl TurnObserver for StoreObserver {
-    fn on_lifecycle(&self, ev: TurnLifecycleEvent) {
-        // Phase-E seam: started/aborted lifecycle markers are not surfaced as
-        // store events yet (the legacy stack had richer turn-lifecycle telemetry).
-        // We persist the terminal session result, which is what readers need today.
-        if let TurnLifecycleEvent::TurnComplete {
-            last_agent_message: Some(text),
-            ..
-        } = ev
-        {
-            self.sink.emit(PendingEvent::new(
-                self.session_id.clone(),
-                names::SESSION_DONE,
-                session_done_payload(Some(&text), None),
-            ));
-        }
-    }
+    fn on_lifecycle(&self, _ev: TurnLifecycleEvent) {}
 }
 
 /// A network-free scripted driver for the `Fake` backend.
@@ -2588,15 +2563,7 @@ impl<Sd: SamplingDriver> RuntimeTurnLoopDriver<Sd> {
         }
         *state.pre_turn_replay_from_seq.lock().unwrap() = None;
 
-        // The observer persists the terminal agent message through the runtime so
-        // `session.done` is journaled and projected by the same live authority as
-        // model/tool events.
-        let sink: Arc<dyn EventSink> = Arc::new(RuntimeStoreSink {
-            runtime: runtime_handle,
-            store: Arc::clone(&store),
-            model_context_window: None,
-        });
-        let observer = StoreObserver::new(sink, session_id.as_str().to_string());
+        let observer = StoreObserver;
 
         let turn_loop = TurnLoop::new(state, driver, observer);
         let result = match max_turns {
@@ -2611,10 +2578,26 @@ impl<Sd: SamplingDriver> RuntimeTurnLoopDriver<Sd> {
                     .await
             }
         };
-        if result.is_ok() {
-            ensure_fallback_capture_recording(&store, session_id.as_str());
+        let runtime_session_id = RuntimeSessionId::from_string(session_id.as_str().to_string())?;
+        match result {
+            Ok(last_agent_message) => {
+                ensure_fallback_capture_recording(&store, session_id.as_str());
+                runtime_handle.cleanup_session_resources(&runtime_session_id)?;
+                if let Some(text) = last_agent_message.as_deref() {
+                    runtime_handle.append_observed_session_event(
+                        runtime_session_id,
+                        names::SESSION_DONE,
+                        session_done_payload(Some(text), None),
+                        RuntimeDurability::Barrier,
+                    )?;
+                }
+                Ok(last_agent_message)
+            }
+            Err(error) => {
+                let _ = runtime_handle.cleanup_session_resources(&runtime_session_id);
+                Err(error)
+            }
         }
-        result
     }
 }
 
@@ -4399,6 +4382,75 @@ mod tests {
         assert!(
             saw_session_done,
             "runtime-backed terminal observer must publish session.done through runtime projection"
+        );
+    }
+
+    #[tokio::test]
+    async fn runtime_backed_done_is_journaled_after_resource_cleanup() {
+        let (dir, store, session_id) = store_with_session();
+        seed_user_input(&store, &session_id, "initial").await;
+        let journal = Arc::new(SqliteJournal::from_store(
+            Store::open(dir.path()).expect("open runtime store"),
+        ));
+        let persistence: Arc<dyn LiveThreadPersistence> = journal.clone();
+        let state_index: Arc<dyn StateIndex> = journal;
+        let runtime = BrowserUseRuntime::new(persistence, state_index).handle();
+        let runtime_session_id =
+            RuntimeSessionId::from_string(session_id.clone()).expect("runtime session id");
+        runtime
+            .attach_root_agent(AttachRootAgentRequest {
+                session_id: runtime_session_id.clone(),
+                cwd: std::path::PathBuf::from("/work"),
+                task: "root".to_string(),
+                max_concurrent_threads_per_session: 3,
+            })
+            .expect("attach root");
+
+        let cleanup_store = Arc::clone(&store);
+        let cleanup_session_id = session_id.clone();
+        runtime
+            .get_or_insert_session_resource(
+                &runtime_session_id,
+                "test.cleanup_before_done",
+                || 1usize,
+                move |_resource: Arc<usize>| {
+                    let store = cleanup_store.lock().expect("store mutex poisoned");
+                    store
+                        .append_event(
+                            &cleanup_session_id,
+                            "test.cleanup",
+                            json!({ "phase": "terminal_barrier" }),
+                        )
+                        .expect("append cleanup marker");
+                    1
+                },
+            )
+            .expect("register cleanup marker");
+
+        run_session_with_config_with_cancel_and_runtime(
+            Arc::clone(&store),
+            &session_id,
+            fake_config(),
+            CancellationToken::new(),
+            Some(runtime),
+        )
+        .await
+        .expect("runtime-backed run");
+
+        let log = events(&store, &session_id);
+        let cleanup_seq = log
+            .iter()
+            .find(|event| event.event_type == "test.cleanup")
+            .map(|event| event.seq)
+            .expect("cleanup marker");
+        let done_seq = log
+            .iter()
+            .find(|event| event.event_type == names::SESSION_DONE)
+            .map(|event| event.seq)
+            .expect("session.done");
+        assert!(
+            cleanup_seq < done_seq,
+            "terminal cleanup must be durable before session.done: cleanup={cleanup_seq}, done={done_seq}"
         );
     }
 
