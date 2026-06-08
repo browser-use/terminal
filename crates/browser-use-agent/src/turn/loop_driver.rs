@@ -82,8 +82,8 @@ use crate::task::{TurnAbortReason, TurnLifecycleEvent};
 use browser_use_llm::schema::{ContentPart, Message, MessageRole};
 use tokio_util::sync::CancellationToken;
 
-const FINAL_MAX_TURNS_WINDOW: usize = 8;
-const FINAL_MAX_TURNS_NUDGE: &str = "This run is almost out of allowed steps. Do not start broad new exploration. If you have any verified answer, saved artifact, or usable partial result, call the done tool now with the best user-facing answer you can provide. Include unknown, unavailable, or incomplete items explicitly. Only call another non-done tool when one short targeted check is strictly necessary to turn already gathered evidence into the final answer.";
+const FINAL_MAX_TURNS_WINDOW: usize = 12;
+const FINAL_MAX_TURNS_NUDGE: &str = "This run is almost out of allowed steps. Stop exploration now and call the done tool with the best user-facing answer you can provide from gathered evidence, saved artifacts, and verified partial results. Do not call more non-done tools. Do not answer with a plan like \"I will compile/read/verify next\". Deliver the actual table, JSON, links, counts, or narrative answer now, marking unknown, unavailable, or incomplete items explicitly.";
 const PROGRESS_MAX_TURNS_NUDGE: &str = "Progress checkpoint: If you have enough evidence, a saved artifact, or a complete-enough answer, stop further exploration and call the done tool now. Continue only for clearly missing required information that is likely to change the final answer.";
 
 /// The async, unbounded turn-loop driver. Generic over the three frozen turn
@@ -275,8 +275,9 @@ fn should_emit_progress_nudge(max_turns: usize, next_turn: usize) -> bool {
 }
 
 fn should_emit_final_nudge(max_turns: usize, next_turn: usize) -> bool {
+    let final_window = FINAL_MAX_TURNS_WINDOW.min(max_turns.saturating_sub(2).max(1));
     let final_window_start = max_turns
-        .saturating_sub(FINAL_MAX_TURNS_WINDOW)
+        .saturating_sub(final_window)
         .saturating_add(1)
         .max(1);
     next_turn >= final_window_start && next_turn <= max_turns

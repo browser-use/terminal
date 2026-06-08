@@ -804,7 +804,7 @@ async fn bounded_loop_adds_final_nudge_before_last_turn() {
             );
         };
         assert!(
-            matches!(content.first(), Some(ContentPart::Text { text }) if text.contains("call the done tool now")),
+            matches!(content.first(), Some(ContentPart::Text { text }) if text.contains("Stop exploration now") && text.contains("Do not call more non-done tools")),
             "final-window nudge should be present before the last turn"
         );
     }
