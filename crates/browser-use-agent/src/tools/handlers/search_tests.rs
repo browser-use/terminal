@@ -6,9 +6,12 @@
 
 use std::sync::Arc;
 
+use base64::Engine as _;
+
 use super::search::{
-    classify_response, format_results, normalize_whitespace, parse_results, SearchBackend,
-    SearchError, SearchRequest, SearchResult, SearchTool, SEARCH_PARALLEL_SAFE, SEARCH_TOOL_NAME,
+    classify_response, format_results, normalize_whitespace, parse_bing_html_results,
+    parse_results, SearchBackend, SearchError, SearchRequest, SearchResult, SearchTool,
+    SEARCH_PARALLEL_SAFE, SEARCH_TOOL_NAME,
 };
 use crate::tools::approval::AskForApproval;
 use crate::tools::orchestrator::{ToolOrchestrator, TurnEnv};
@@ -76,6 +79,16 @@ struct UnauthorizedBackend;
 impl SearchBackend for UnauthorizedBackend {
     async fn fetch(&self, _query: &str) -> Result<String, SearchError> {
         Err(SearchError::Unauthorized)
+    }
+}
+
+/// A fake backend failing like a transient transport/server problem.
+struct RequestFailBackend;
+
+#[async_trait::async_trait]
+impl SearchBackend for RequestFailBackend {
+    async fn fetch(&self, _query: &str) -> Result<String, SearchError> {
+        Err(SearchError::Request("connection closed".to_string()))
     }
 }
 
@@ -417,6 +430,86 @@ async fn run_surfaces_malformed_body_as_soft_error() {
         out.stderr.contains("Search failed:") && out.stderr.contains("unexpected response body"),
         "got: {}",
         out.stderr
+    );
+}
+
+#[tokio::test]
+async fn run_falls_back_after_transport_failure() {
+    let tool = SearchTool::with_backend_and_fallback(
+        Arc::new(RequestFailBackend),
+        Some(Arc::new(StubBackend(FIXTURE.to_string()))),
+    );
+    let launch = none_launch();
+    let attempt = none_attempt(&launch);
+    let out = tool
+        .run(&SearchRequest::new("parallel"), &attempt, &ctx())
+        .await
+        .unwrap();
+
+    assert_eq!(out.exit_code, 0);
+    assert!(out.stderr.is_empty());
+    assert!(
+        out.stdout
+            .contains("Search results for \"parallel\" (3 results):"),
+        "got: {}",
+        out.stdout
+    );
+    assert!(
+        out.stdout
+            .contains("https://www.prnewswire.com/news-releases/genpact-parallel-302736563.html"),
+        "got: {}",
+        out.stdout
+    );
+}
+
+#[tokio::test]
+async fn run_does_not_fallback_on_auth_failure() {
+    let tool = SearchTool::with_backend_and_fallback(
+        Arc::new(UnauthorizedBackend),
+        Some(Arc::new(StubBackend(FIXTURE.to_string()))),
+    );
+    let launch = none_launch();
+    let attempt = none_attempt(&launch);
+    let out = tool
+        .run(&SearchRequest::new("parallel"), &attempt, &ctx())
+        .await
+        .unwrap();
+
+    assert_eq!(out.exit_code, 1);
+    assert!(out.stdout.is_empty());
+    assert!(
+        out.stderr
+            .contains("invalid or missing browser-use API key"),
+        "got: {}",
+        out.stderr
+    );
+}
+
+#[test]
+fn parse_bing_html_results_decodes_redirect_urls() {
+    let encoded = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .encode("https://example.com/pricing?country=au");
+    let html = format!(
+        r#"
+        <ol id="b_results">
+          <li class="b_algo" data-id iid=SERP.1>
+            <h2><a href="https://www.bing.com/ck/a?!&amp;u=a1{encoded}&amp;ntb=1">
+              Example &amp; Pricing <strong>Page</strong>
+            </a></h2>
+            <p>Current &quot;AUD&quot; pricing for the requested product.</p>
+          </li>
+        </ol>
+        "#
+    );
+
+    let results = parse_bing_html_results(&html);
+
+    assert_eq!(results.len(), 1);
+    assert_eq!(results[0].url, "https://example.com/pricing?country=au");
+    assert_eq!(results[0].title, "Example & Pricing Page");
+    assert_eq!(
+        results[0].description,
+        "Current \"AUD\" pricing for the requested product."
     );
 }
 

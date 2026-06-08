@@ -44,6 +44,7 @@
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
+use base64::Engine as _;
 use regex::Regex;
 
 use crate::tools::runtime::{
@@ -82,6 +83,18 @@ const SEARCH_API_KEY_HEADER: &str = "X-Browser-Use-API-Key";
 /// is 30s (`UPSTREAM_TIMEOUT`); 60s gives it room to answer — including with a
 /// `502` — before we cut the connection.
 const SEARCH_REQUEST_TIMEOUT_SECS: u64 = 60;
+
+/// Fallback search endpoint used only when the browser-use search service has a
+/// transport/server failure. The browser-use service remains the primary path
+/// because it carries our normal auth, billing, and quality contract.
+const BING_SEARCH_URL: &str = "https://www.bing.com/search";
+
+/// Fallback HTTP timeout. Keep it lower than the primary service timeout so a
+/// bad fallback cannot dominate a step.
+const FALLBACK_SEARCH_TIMEOUT_SECS: u64 = 20;
+
+/// Max fallback results to expose to the model.
+const MAX_FALLBACK_RESULTS: usize = 8;
 
 /// Max characters of a result title in the formatted output. Titles are trimmed
 /// (with an ellipsis counted within the cap) to keep the model-facing text token
@@ -174,6 +187,31 @@ pub struct HttpSearchBackend {
     api_key: Option<String>,
 }
 
+/// Lightweight HTML-search fallback used when the browser-use search service is
+/// temporarily unreachable. It returns the same JSON shape as the primary
+/// service so the tool's parser/formatter stays unchanged.
+pub struct BingHtmlSearchBackend {
+    client: reqwest::Client,
+}
+
+impl BingHtmlSearchBackend {
+    /// Construct the fallback backend.
+    pub fn new() -> Self {
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(FALLBACK_SEARCH_TIMEOUT_SECS))
+            .user_agent("Mozilla/5.0 (compatible; browser-use-terminal/search-fallback)")
+            .build()
+            .unwrap_or_else(|_| reqwest::Client::new());
+        Self { client }
+    }
+}
+
+impl Default for BingHtmlSearchBackend {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl HttpSearchBackend {
     /// Construct the backend from the environment: the base URL from
     /// [`BROWSER_USE_SEARCH_URL`](SEARCH_BASE_URL_ENV) (defaulting to the
@@ -241,6 +279,39 @@ impl SearchBackend for HttpSearchBackend {
     }
 }
 
+#[async_trait::async_trait]
+impl SearchBackend for BingHtmlSearchBackend {
+    async fn fetch(&self, query: &str) -> Result<String, SearchError> {
+        let response = self
+            .client
+            .get(BING_SEARCH_URL)
+            .query(&[("q", query)])
+            .send()
+            .await
+            .map_err(|err| SearchError::Request(format!("Bing fallback request failed: {err}")))?;
+
+        let status = response.status().as_u16();
+        let body = response
+            .text()
+            .await
+            .map_err(|err| SearchError::Request(format!("Bing fallback body failed: {err}")))?;
+
+        classify_response(status, &body)?;
+        let wire_results: Vec<serde_json::Value> = parse_bing_html_results(&body)
+            .into_iter()
+            .map(|result| {
+                serde_json::json!({
+                    "title": result.title,
+                    "url": result.url,
+                    "published_date": result.published_date,
+                    "content": result.description,
+                })
+            })
+            .collect();
+        Ok(serde_json::json!({ "results": wire_results }).to_string())
+    }
+}
+
 /// Classify an HTTP response per the service's documented statuses: `401` and
 /// `402` get named, actionable errors; any other `>= 400` (400 invalid query,
 /// 422 upstream rejected, 502 upstream failed, 503 auth backend down) carries
@@ -264,6 +335,7 @@ pub fn classify_response(status: u16, body: &str) -> Result<(), SearchError> {
 #[derive(Clone)]
 pub struct SearchTool {
     backend: Arc<dyn SearchBackend>,
+    fallback_backend: Option<Arc<dyn SearchBackend>>,
 }
 
 impl Default for SearchTool {
@@ -282,12 +354,30 @@ impl std::fmt::Debug for SearchTool {
 impl SearchTool {
     /// Construct the tool backed by the real [`HttpSearchBackend`].
     pub fn new() -> Self {
-        Self::with_backend(Arc::new(HttpSearchBackend::new()))
+        Self {
+            backend: Arc::new(HttpSearchBackend::new()),
+            fallback_backend: Some(Arc::new(BingHtmlSearchBackend::new())),
+        }
     }
 
     /// Construct the tool with a custom backend (used by tests).
     pub fn with_backend(backend: Arc<dyn SearchBackend>) -> Self {
-        Self { backend }
+        Self {
+            backend,
+            fallback_backend: None,
+        }
+    }
+
+    /// Construct the tool with custom primary and fallback backends (used by
+    /// focused tests).
+    pub fn with_backend_and_fallback(
+        backend: Arc<dyn SearchBackend>,
+        fallback_backend: Option<Arc<dyn SearchBackend>>,
+    ) -> Self {
+        Self {
+            backend,
+            fallback_backend,
+        }
     }
 
     /// The tool name surfaced to the model.
@@ -369,12 +459,34 @@ impl ToolRuntime<SearchRequest, ExecOutput> for SearchTool {
         // A fetch/parse failure is surfaced to the model as a soft error
         // (nonzero exit with the message on stderr), mirroring the MCP
         // handler's model-facing error mapping — not a hard tool error.
-        match self
+        let results = match self
             .backend
             .fetch(query)
             .await
             .and_then(|body| parse_results(&body))
         {
+            Ok(results) => Ok(results),
+            Err(primary_error) => {
+                if !search_error_allows_fallback(&primary_error) {
+                    Err(primary_error)
+                } else if let Some(fallback) = self.fallback_backend.as_ref() {
+                    match fallback
+                        .fetch(query)
+                        .await
+                        .and_then(|body| parse_results(&body))
+                    {
+                        Ok(results) => Ok(results),
+                        Err(fallback_error) => Err(SearchError::Request(format!(
+                            "{primary_error}; fallback search also failed: {fallback_error}"
+                        ))),
+                    }
+                } else {
+                    Err(primary_error)
+                }
+            }
+        };
+
+        match results {
             Ok(results) => {
                 let stdout = if results.is_empty() {
                     format!("No results found for \"{query}\".")
@@ -448,6 +560,64 @@ pub fn parse_results(body: &str) -> Result<Vec<SearchResult>, SearchError> {
         .collect())
 }
 
+fn search_error_allows_fallback(err: &SearchError) -> bool {
+    match err {
+        SearchError::Request(_) => true,
+        SearchError::Http { status, .. } if *status >= 500 => true,
+        _ => false,
+    }
+}
+
+/// Parse Bing HTML result blocks into normalized search results. This fallback
+/// parser is intentionally small and skip-on-malformed; the primary search API
+/// remains authoritative whenever it is reachable.
+pub(crate) fn parse_bing_html_results(body: &str) -> Vec<SearchResult> {
+    let mut results = Vec::new();
+    let starts: Vec<usize> = bing_result_start_regex()
+        .find_iter(body)
+        .map(|m| m.start())
+        .collect();
+    for (index, start) in starts.iter().copied().enumerate() {
+        let end = starts
+            .get(index + 1)
+            .copied()
+            .or_else(|| body[start..].find("</ol>").map(|offset| start + offset))
+            .unwrap_or(body.len());
+        let block = &body[start..end];
+        let Some(link) = bing_link_regex().captures(block) else {
+            continue;
+        };
+        let Some(raw_href) = link.get(1).map(|m| m.as_str()) else {
+            continue;
+        };
+        let Some(url) = normalize_bing_href(raw_href) else {
+            continue;
+        };
+        let title = link
+            .get(2)
+            .map(|m| clean_html_text(m.as_str()))
+            .filter(|text| !text.is_empty())
+            .unwrap_or_else(|| url.clone());
+        let description = bing_snippet_regex()
+            .captures(block)
+            .and_then(|snippet| snippet.get(1))
+            .map(|m| clean_html_text(m.as_str()))
+            .unwrap_or_default();
+
+        results.push(SearchResult {
+            title,
+            url,
+            published_date: None,
+            description,
+        });
+
+        if results.len() >= MAX_FALLBACK_RESULTS {
+            break;
+        }
+    }
+    results
+}
+
 /// Format parsed results into the readable text block the model sees.
 ///
 /// A header (count + the "you already have the results" guidance), then a
@@ -508,7 +678,156 @@ pub fn normalize_whitespace(text: &str) -> String {
         .into_owned()
 }
 
+fn clean_html_text(text: &str) -> String {
+    normalize_whitespace(&decode_html_entities(
+        &html_tag_regex().replace_all(text, " "),
+    ))
+}
+
+fn normalize_bing_href(raw_href: &str) -> Option<String> {
+    let href = decode_html_entities(raw_href);
+    if let Some(encoded) = query_param(&href, "u") {
+        let decoded = percent_decode_query_component(&encoded);
+        if let Some(rest) = decoded.strip_prefix("a1") {
+            if let Ok(bytes) = base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(rest) {
+                if let Ok(url) = String::from_utf8(bytes) {
+                    return normalize_search_url(&url);
+                }
+            }
+        }
+        if let Some(url) = normalize_search_url(&decoded) {
+            return Some(url);
+        }
+    }
+    normalize_search_url(&href)
+}
+
+fn normalize_search_url(url: &str) -> Option<String> {
+    let url = url.trim();
+    if url.starts_with("https://") || url.starts_with("http://") {
+        Some(url.to_string())
+    } else if url.starts_with("//") {
+        Some(format!("https:{url}"))
+    } else {
+        None
+    }
+}
+
+fn query_param(url: &str, name: &str) -> Option<String> {
+    let query = url.split_once('?')?.1;
+    for part in query.split('&') {
+        let (key, value) = part.split_once('=').unwrap_or((part, ""));
+        if key == name {
+            return Some(value.to_string());
+        }
+    }
+    None
+}
+
+fn percent_decode_query_component(value: &str) -> String {
+    let bytes = value.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'+' => {
+                out.push(b' ');
+                i += 1;
+            }
+            b'%' if i + 2 < bytes.len() => {
+                if let (Some(high), Some(low)) = (hex_value(bytes[i + 1]), hex_value(bytes[i + 2]))
+                {
+                    out.push((high << 4) | low);
+                    i += 3;
+                } else {
+                    out.push(bytes[i]);
+                    i += 1;
+                }
+            }
+            byte => {
+                out.push(byte);
+                i += 1;
+            }
+        }
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+fn hex_value(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        b'A'..=b'F' => Some(byte - b'A' + 10),
+        _ => None,
+    }
+}
+
+fn decode_html_entities(text: &str) -> String {
+    html_entity_regex()
+        .replace_all(text, |captures: &regex::Captures<'_>| {
+            decode_html_entity(captures.get(1).map(|m| m.as_str()).unwrap_or_default())
+        })
+        .into_owned()
+}
+
+fn decode_html_entity(entity: &str) -> String {
+    match entity {
+        "amp" => "&".to_string(),
+        "quot" => "\"".to_string(),
+        "apos" | "#39" => "'".to_string(),
+        "lt" => "<".to_string(),
+        "gt" => ">".to_string(),
+        "nbsp" => " ".to_string(),
+        _ if entity.starts_with("#x") || entity.starts_with("#X") => {
+            u32::from_str_radix(&entity[2..], 16)
+                .ok()
+                .and_then(char::from_u32)
+                .map(|ch| ch.to_string())
+                .unwrap_or_else(|| format!("&{entity};"))
+        }
+        _ if entity.starts_with('#') => entity[1..]
+            .parse::<u32>()
+            .ok()
+            .and_then(char::from_u32)
+            .map(|ch| ch.to_string())
+            .unwrap_or_else(|| format!("&{entity};")),
+        _ => format!("&{entity};"),
+    }
+}
+
 fn whitespace_regex() -> &'static Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
     RE.get_or_init(|| Regex::new(r"\s+").expect("valid whitespace regex"))
+}
+
+fn bing_result_start_regex() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| {
+        Regex::new(r#"(?is)<li\s+class="b_algo"[^>]*>"#).expect("valid Bing result start regex")
+    })
+}
+
+fn bing_link_regex() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| {
+        Regex::new(r#"(?is)<h2[^>]*>.*?<a[^>]+href="([^"]+)"[^>]*>(.*?)</a>"#)
+            .expect("valid Bing link regex")
+    })
+}
+
+fn bing_snippet_regex() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| Regex::new(r#"(?is)<p[^>]*>(.*?)</p>"#).expect("valid snippet regex"))
+}
+
+fn html_tag_regex() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| Regex::new(r"(?is)<[^>]+>").expect("valid HTML tag regex"))
+}
+
+fn html_entity_regex() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| {
+        Regex::new(r"&(#x?[0-9A-Fa-f]+|[A-Za-z][A-Za-z0-9]+);").expect("valid HTML entity regex")
+    })
 }
