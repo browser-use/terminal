@@ -982,11 +982,11 @@ impl<T: SamplingTransport + 'static, R: CallRunner + 'static> SamplingDriver
                         // the run with `None`.
                         let terminal_done_summary = done_summary(&tool_calls);
                         let is_terminal = terminal_done_summary.is_some();
-                        // Surface the `done` summary as the turn result when the model
-                        // declared completion via `done` and streamed no other text, so
-                        // the loop returns the summary (codex keeps the final message).
-                        if is_terminal && last_agent_message.is_none() {
-                            last_agent_message = terminal_done_summary;
+                        // Surface the `done` summary as the canonical turn result when
+                        // the model declared completion via `done`. Any streamed text in
+                        // the same response is transcript context, not the final answer.
+                        if let Some(done_text) = terminal_done_summary.clone() {
+                            last_agent_message = Some(done_text);
                             acc.defers_mailbox_delivery_to_next_turn = true;
                         }
 

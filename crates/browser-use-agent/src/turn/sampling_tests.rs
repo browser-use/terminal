@@ -1188,6 +1188,7 @@ async fn fused_done_result_becomes_final_message_without_follow_up() {
         NoopRunner, /* model_supports */ true, specs,
     ));
     let (transport, _opens) = ScriptedTransport::new(vec![OpenScript::Stream(vec![
+        text_delta("I have the answer and will finish now."),
         tool_call_with_input(
             "done",
             serde_json::json!({
@@ -1215,7 +1216,7 @@ async fn fused_done_result_becomes_final_message_without_follow_up() {
     assert_eq!(
         out.last_agent_message.as_deref(),
         Some("full table answer"),
-        "canonical done.result must be surfaced over the legacy text alias"
+        "canonical done.result must be surfaced over streamed preamble and the legacy text alias"
     );
     assert!(
         out.defers_mailbox_delivery_to_next_turn,
