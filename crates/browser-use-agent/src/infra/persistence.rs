@@ -204,14 +204,15 @@ fn browser_script_output_content_parts(
                 continue;
             }
         };
-        let mime_type = image
+        let declared_mime_type = image
             .get("mime_type")
             .or_else(|| image.get("mime"))
             .and_then(Value::as_str)
             .unwrap_or("image/png");
-        if !mime_type.starts_with("image/") {
+        if !declared_mime_type.starts_with("image/") {
             continue;
         };
+        let mime_type = image_mime_type_from_bytes(&bytes).unwrap_or(declared_mime_type);
         let mut part = serde_json::json!({
             "type": "input_image",
             "image_url": format!(
@@ -234,6 +235,22 @@ fn browser_script_output_content_parts(
     }
     parts.extend(image_parts);
     Some(Value::Array(parts))
+}
+
+fn image_mime_type_from_bytes(bytes: &[u8]) -> Option<&'static str> {
+    if bytes.starts_with(b"\x89PNG\r\n\x1a\n") {
+        return Some("image/png");
+    }
+    if bytes.starts_with(&[0xff, 0xd8, 0xff]) {
+        return Some("image/jpeg");
+    }
+    if bytes.starts_with(b"GIF87a") || bytes.starts_with(b"GIF89a") {
+        return Some("image/gif");
+    }
+    if bytes.len() >= 12 && bytes.starts_with(b"RIFF") && &bytes[8..12] == b"WEBP" {
+        return Some("image/webp");
+    }
+    None
 }
 
 fn append_browser_script_image_warnings(mut text: String, warnings: &[String]) -> String {
@@ -881,6 +898,44 @@ mod tests {
         assert!(content[1]["image_url"]
             .as_str()
             .is_some_and(|url| url.starts_with("data:image/png;base64,")));
+    }
+
+    #[test]
+    fn record_browser_script_failure_uses_image_signature_mime() {
+        let (dir, store) = store();
+        let session = new_session(&store);
+        let image_path = dir.path().join("failure.png");
+        std::fs::write(&image_path, [0xff, 0xd8, 0xff, 0xe0, 0, 1]).expect("write jpeg");
+
+        let response = BrowserScriptOutput {
+            ok: false,
+            error: Some("RuntimeError: failed after screenshot".to_string()),
+            images: vec![serde_json::json!({
+                "path": image_path,
+                "mime_type": "image/png",
+                "detail": "high",
+            })],
+            ..Default::default()
+        };
+
+        record_browser_script_response_events_for_tool(
+            &store,
+            &session,
+            "browser_script",
+            "call-image-failed",
+            &response,
+        )
+        .unwrap();
+
+        let events = store.events_for_session(&session).unwrap();
+        let failed = events
+            .iter()
+            .find(|e| e.event_type == "tool.failed")
+            .expect("tool.failed");
+        let content = failed.payload["content"].as_array().expect("content array");
+        assert!(content[1]["image_url"]
+            .as_str()
+            .is_some_and(|url| url.starts_with("data:image/jpeg;base64,")));
     }
 
     #[test]

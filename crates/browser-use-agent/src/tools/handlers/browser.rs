@@ -2359,14 +2359,15 @@ fn browser_script_image_part(image: &Value) -> Result<Option<ContentPart>, Strin
     };
     let bytes = fs::read(path)
         .map_err(|error| format!("Warning: image artifact could not be read: {path} ({error})"))?;
-    let mime_type = image
+    let declared_mime_type = image
         .get("mime_type")
         .or_else(|| image.get("mime"))
         .and_then(Value::as_str)
         .unwrap_or("image/png");
-    if !mime_type.starts_with("image/") {
+    if !declared_mime_type.starts_with("image/") {
         return Ok(None);
     }
+    let mime_type = image_mime_type_from_bytes(&bytes).unwrap_or(declared_mime_type);
     if let Some((width, height)) = png_dimensions(&bytes) {
         if width > BROWSER_SCRIPT_MAX_IMAGE_DIMENSION || height > BROWSER_SCRIPT_MAX_IMAGE_DIMENSION
         {
@@ -2381,6 +2382,22 @@ fn browser_script_image_part(image: &Value) -> Result<Option<ContentPart>, Strin
         url: None,
         detail: None,
     }))
+}
+
+fn image_mime_type_from_bytes(bytes: &[u8]) -> Option<&'static str> {
+    if bytes.starts_with(b"\x89PNG\r\n\x1a\n") {
+        return Some("image/png");
+    }
+    if bytes.starts_with(&[0xff, 0xd8, 0xff]) {
+        return Some("image/jpeg");
+    }
+    if bytes.starts_with(b"GIF87a") || bytes.starts_with(b"GIF89a") {
+        return Some("image/gif");
+    }
+    if bytes.len() >= 12 && bytes.starts_with(b"RIFF") && &bytes[8..12] == b"WEBP" {
+        return Some("image/webp");
+    }
+    None
 }
 
 fn png_dimensions(bytes: &[u8]) -> Option<(u32, u32)> {

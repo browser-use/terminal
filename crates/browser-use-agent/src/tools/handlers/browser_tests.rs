@@ -1361,6 +1361,38 @@ async fn script_images_are_appended_as_structured_stdout_payload() {
 }
 
 #[tokio::test]
+async fn script_image_mime_uses_file_signature_when_metadata_is_wrong() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let image_path = temp.path().join("shot.png");
+    std::fs::write(&image_path, [0xff, 0xd8, 0xff, 0xe0, 0, 1]).expect("write jpeg");
+
+    let backend = Arc::new(FakeBackend::default());
+    backend.script_images.lock().unwrap().push(json!({
+        "path": image_path,
+        "mime_type": "image/png",
+        "detail": "auto",
+        "label": "viewport",
+    }));
+    let tool = tool_with(Arc::clone(&backend));
+
+    let req = BrowserRequest::execute("sess-1", "capture_screenshot()", false);
+    let out = run_direct(&tool, &req).await.unwrap();
+    let (_, payload) = out
+        .stdout
+        .rsplit_once(BROWSER_SCRIPT_CONTENT_STDOUT_PREFIX)
+        .expect("browser_script content marker");
+    let parts: Vec<ContentPart> = serde_json::from_str(payload).expect("content parts");
+    let media_type = parts
+        .iter()
+        .find_map(|part| match part {
+            ContentPart::Media { mime_type, .. } => Some(mime_type.as_str()),
+            _ => None,
+        })
+        .expect("image media part");
+    assert_eq!(media_type, "image/jpeg");
+}
+
+#[tokio::test]
 async fn script_oversized_stdout_is_truncated_for_model_output() {
     let backend = Arc::new(FakeBackend::default());
     backend.set_script_text("x".repeat(MAX_INLINE_BROWSER_SCRIPT_STDOUT_BYTES + 5_000));
