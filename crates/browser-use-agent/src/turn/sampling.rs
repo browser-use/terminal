@@ -61,7 +61,7 @@ use std::time::Instant;
 use browser_use_llm::route::{ModelClient, Route};
 use browser_use_llm::schema::{
     CacheHint, ContentPart, FinishReason, LlmError, LlmErrorReason, LlmEvent, LlmRequest, Message,
-    MessageRole, SystemPart, TextPhase, Usage,
+    MessageRole, SystemPart, TextPhase, ToolChoice, Usage,
 };
 use futures_util::{Stream, StreamExt};
 use serde_json::Value;
@@ -71,6 +71,7 @@ use crate::decision::{self, RetryAction, SamplingOutcome};
 use crate::events::{self, names, EventSink, PendingEvent, TurnCtx};
 use crate::tools::handlers::goal::GoalStore;
 use crate::turn::dispatch::ToolDispatcher;
+use crate::turn::loop_driver::FINAL_REQUIRED_DONE_MARKER;
 use crate::turn::{CallRunner, SamplingDriver};
 use crate::AgentError;
 
@@ -892,6 +893,7 @@ impl<T: SamplingTransport + 'static, R: CallRunner + 'static> SamplingDriver
         if let Some(dispatcher) = &self.dispatcher {
             req.tools = dispatcher.tool_specs().to_vec();
         }
+        force_done_on_marked_final_turn(&mut req);
         // Measure the REAL assembled request so the /context view can attribute
         // the window dynamically: the system prompt and per-tool schemas only
         // exist here (they are never persisted as message events). Uses the same
@@ -1072,6 +1074,39 @@ fn build_request(ctx: &TurnCtx, input: Vec<Message>) -> LlmRequest {
     }
     mark_message_cache_breakpoints(&mut req.messages);
     req
+}
+
+fn force_done_on_marked_final_turn(req: &mut LlmRequest) {
+    if !request_has_final_done_marker(&req.messages) {
+        return;
+    }
+    if !req.tools.iter().any(|tool| tool.name == DONE_TOOL_NAME) {
+        return;
+    }
+    req.tools.retain(|tool| tool.name == DONE_TOOL_NAME);
+    req.tool_choice = Some(ToolChoice::Tool {
+        name: DONE_TOOL_NAME.to_string(),
+    });
+}
+
+fn request_has_final_done_marker(messages: &[Message]) -> bool {
+    messages.iter().any(|message| {
+        message.role == MessageRole::Developer
+            && message
+                .content
+                .iter()
+                .any(|part| content_part_contains_text(part, FINAL_REQUIRED_DONE_MARKER))
+    })
+}
+
+fn content_part_contains_text(part: &ContentPart, needle: &str) -> bool {
+    match part {
+        ContentPart::Text { text } | ContentPart::Reasoning { text, .. } => text.contains(needle),
+        ContentPart::ToolResult { content, .. } => content
+            .iter()
+            .any(|part| content_part_contains_text(part, needle)),
+        ContentPart::Media { .. } | ContentPart::ToolCall { .. } => false,
+    }
 }
 
 fn mark_message_cache_breakpoints(messages: &mut [Message]) {

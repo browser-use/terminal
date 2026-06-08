@@ -24,6 +24,7 @@ use crate::events::{EventSink, TurnCtx};
 use crate::goals::{GOAL_ACCOUNTED_EVENT, GOAL_SET_EVENT};
 use crate::testkit::RecordingSink;
 use crate::tools::handlers::goal::GoalStore;
+use crate::turn::loop_driver::FINAL_REQUIRED_DONE_MARKER;
 use crate::turn::sampling::{EventStream, ModelSamplingDriver, SamplingTransport};
 use crate::turn::SamplingDriver;
 use crate::AgentError;
@@ -1138,6 +1139,53 @@ async fn fused_driver_advertises_dispatcher_tool_specs_on_request() {
     assert_eq!(
         llm_tools[0]["input_schema"],
         serde_json::json!({"type": "object"})
+    );
+}
+
+#[tokio::test]
+async fn fused_driver_forces_done_on_marked_final_turn() {
+    use crate::turn::dispatch::ToolDispatcher;
+    use crate::turn::sampling::FusionRecorder;
+    use browser_use_llm::schema::ToolChoice;
+
+    let specs = vec![tool_def("browser"), tool_def("done"), tool_def("search")];
+    let dispatcher = Arc::new(ToolDispatcher::with_runner_and_specs(
+        NoopRunner, /* model_supports */ true, specs,
+    ));
+    let (transport, seen) =
+        RecordingTransport::new(vec![text_delta("ok"), finish(FinishReason::Stop)]);
+    let sink: Arc<dyn EventSink> = Arc::new(RecordingSink::default());
+    let recorder: Arc<dyn FusionRecorder> = Arc::new(NoopRecorder);
+    let driver = ModelSamplingDriver::new(transport, sink, ctx(), 5)
+        .without_jitter()
+        .with_fusion(dispatcher, recorder);
+
+    let mut input = user_input();
+    input.push(Message::new(
+        MessageRole::Developer,
+        vec![ContentPart::text(format!(
+            "{FINAL_REQUIRED_DONE_MARKER}: final turn"
+        ))],
+    ));
+
+    let _ = driver
+        .run_sampling_request(input, CancellationToken::new())
+        .await
+        .expect("sampling should succeed");
+
+    let captured = seen.lock().unwrap();
+    let req = &captured[0];
+    let tool_names: Vec<&str> = req.tools.iter().map(|tool| tool.name.as_str()).collect();
+    assert_eq!(
+        tool_names,
+        vec!["done"],
+        "marked final turn must not let the model spend its last request on exploration tools"
+    );
+    assert_eq!(
+        req.tool_choice,
+        Some(ToolChoice::Tool {
+            name: "done".to_string()
+        })
     );
 }
 
