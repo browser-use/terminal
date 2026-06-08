@@ -138,6 +138,18 @@ fn prompts_avoid_screenshots_for_text_heavy_extraction() {
 }
 
 #[test]
+fn base_prompt_guides_source_discovery_to_search_and_read_url() {
+    assert!(BASE_SYSTEM_PROMPT.contains("first use `search` or `web_search`"));
+    assert!(BASE_SYSTEM_PROMPT.contains("Then use `read_url`"));
+    assert!(BASE_SYSTEM_PROMPT.contains("Do not spend repeated `browser_script` navigation steps"));
+    assert!(BASE_SYSTEM_PROMPT.contains("broad search-result pages"));
+
+    let script = browser_script_tool_description();
+    assert!(script.contains("model-level `read_url` tool"));
+    assert!(script.contains("compact text from public/static pages"));
+}
+
+#[test]
 fn dataset_prompt_enforces_timeboxed_finalization() {
     let prompt = include_str!("../../../../prompts/dataset-case-user.md");
 
@@ -155,6 +167,7 @@ fn dataset_prompt_authorizes_bounded_source_discovery_helpers() {
         .contains("dataset/eval instructions explicitly authorize bounded read-only helper work"));
     assert!(prompt.contains("Source-discovery contract"));
     assert!(prompt.contains("first consider `search` or `web_search`"));
+    assert!(prompt.contains("then use `read_url`"));
     assert!(prompt.contains("Do not spend repeated browser navigation steps"));
     assert!(prompt.contains("Helper-agent contract"));
     assert!(prompt.contains("three or more independent sources"));

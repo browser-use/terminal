@@ -13,6 +13,7 @@ pub mod done;
 pub mod goal;
 pub mod mcp;
 pub mod python;
+pub mod read_url;
 pub mod search;
 pub mod shell;
 pub mod subagent;
@@ -31,6 +32,8 @@ mod done_tests;
 mod mcp_tests;
 #[cfg(test)]
 mod python_tests;
+#[cfg(test)]
+mod read_url_tests;
 #[cfg(test)]
 mod search_tests;
 #[cfg(test)]
@@ -55,6 +58,10 @@ pub use mcp::{
     MCP_ERROR_EXIT_CODE, MCP_EVENT_RESULT_MAX_CHARS,
 };
 pub use python::{PythonApprovalKey, PythonBackend, PythonRequest, PythonTool};
+pub use read_url::{
+    HttpReadUrlBackend, ReadUrlApprovalKey, ReadUrlBackend, ReadUrlError, ReadUrlPage,
+    ReadUrlRequest, ReadUrlTool, READ_URL_PARALLEL_SAFE, READ_URL_TOOL_NAME,
+};
 pub use search::{
     classify_response, format_results, normalize_whitespace, parse_results, HttpSearchBackend,
     SearchApprovalKey, SearchBackend, SearchError, SearchRequest, SearchResult, SearchTool,

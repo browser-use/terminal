@@ -1237,6 +1237,7 @@ fn build_tool_dispatcher_with_cwd_and_goal_store(
     use crate::tools::handlers::done::{DoneRequest, DoneTool};
     use crate::tools::handlers::mcp::McpToolCallRequest;
     use crate::tools::handlers::python::{PythonRequest, PythonTool};
+    use crate::tools::handlers::read_url::{ReadUrlRequest, ReadUrlTool, READ_URL_PARALLEL_SAFE};
     use crate::tools::handlers::search::{SearchRequest, SearchTool, SEARCH_PARALLEL_SAFE};
     use crate::tools::handlers::shell::{
         ExecCommandRequest, ExecCommandTool, ShellRequest, ShellTool, WriteStdinRequest,
@@ -1340,6 +1341,12 @@ fn build_tool_dispatcher_with_cwd_and_goal_store(
         definitions::search(),
         SEARCH_PARALLEL_SAFE,
         SearchTool::new(),
+    );
+    reg.register::<_, ReadUrlRequest>(
+        "read_url",
+        definitions::read_url(),
+        READ_URL_PARALLEL_SAFE,
+        ReadUrlTool::new(),
     );
     let browser_backend = browser_backend_for_runtime_or_config(
         config,
@@ -3306,6 +3313,10 @@ mod tests {
         assert!(
             names.contains(&"search"),
             "the locally-executed `search` tool must be reachable by the live model"
+        );
+        assert!(
+            names.contains(&"read_url"),
+            "the locally-executed `read_url` tool must be reachable by the live model"
         );
     }
 

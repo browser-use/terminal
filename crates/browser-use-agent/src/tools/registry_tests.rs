@@ -28,6 +28,7 @@ use crate::tools::handlers::mcp::{
     McpCallResult, McpClient, McpTool, McpToolCallRequest, McpWireArgs,
 };
 use crate::tools::handlers::python::{PythonBackend, PythonRequest, PythonTool};
+use crate::tools::handlers::read_url::{ReadUrlBackend, ReadUrlError, ReadUrlPage, ReadUrlTool};
 use crate::tools::handlers::search::{SearchBackend, SearchError, SearchTool};
 use crate::tools::handlers::shell::{ShellRequest, ShellTool};
 use crate::tools::handlers::tool_search::{ToolSearchEntry, ToolSearchRequest, ToolSearchTool};
@@ -500,6 +501,28 @@ impl SearchBackend for FakeSearchBackend {
     }
 }
 
+struct FakeReadUrlBackend;
+
+#[async_trait::async_trait]
+impl ReadUrlBackend for FakeReadUrlBackend {
+    async fn fetch(
+        &self,
+        url: &str,
+        _timeout: std::time::Duration,
+    ) -> Result<ReadUrlPage, ReadUrlError> {
+        Ok(ReadUrlPage {
+            status: 200,
+            final_url: url.to_string(),
+            content_type: Some("text/html".to_string()),
+            body: format!(
+                "<html><head><title>Read URL fixture</title></head><body><p>fetched {url}</p></body></html>"
+            )
+            .into_bytes(),
+            truncated: false,
+        })
+    }
+}
+
 /// Build a registry holding all handlers via [`default_registry`], using
 /// fake backends for browser/python/mcp so no OS resource is touched.
 fn full_registry() -> ToolRegistry {
@@ -518,6 +541,7 @@ fn full_registry() -> ToolRegistry {
         )]),
         WebSearchTool::new(WebSearchConfig::enabled()),
         SearchTool::with_backend(Arc::new(FakeSearchBackend)),
+        ReadUrlTool::with_backend(Arc::new(FakeReadUrlBackend)),
         DoneTool::new(),
     )
 }
@@ -535,11 +559,11 @@ fn ctx_at(name: &str, cwd: PathBuf) -> ToolCtx {
 #[test]
 fn default_registry_registers_all_tools() {
     let reg = full_registry();
-    assert_eq!(reg.len(), 13, "all tools must register");
+    assert_eq!(reg.len(), 14, "all tools must register");
     let defs = reg.model_visible_definitions();
     assert_eq!(
         defs.len(),
-        13,
+        14,
         "model_visible_definitions must list all tools"
     );
     let mut names: Vec<&str> = defs.iter().map(|d| d.name.as_str()).collect();
@@ -553,6 +577,7 @@ fn default_registry_registers_all_tools() {
             "exec_command",
             "mcp",
             "python",
+            "read_url",
             "search",
             "shell",
             "tool_search",
@@ -580,6 +605,7 @@ fn parallel_safe_flags_match_registration() {
     assert_eq!(reg.parallel_safe("tool_search"), Some(true));
     assert_eq!(reg.parallel_safe("web_search"), Some(true));
     assert_eq!(reg.parallel_safe("search"), Some(true));
+    assert_eq!(reg.parallel_safe("read_url"), Some(true));
     // Everything else is serial.
     for name in [
         "shell",
@@ -851,6 +877,29 @@ async fn search_dispatches_to_the_fake_backend() {
     assert!(
         out.stdout.contains("snippet for rust lang"),
         "search stdout: {:?}",
+        out.stdout
+    );
+}
+
+#[tokio::test]
+async fn read_url_dispatches_to_the_fake_backend() {
+    let reg = full_registry();
+    let orch = ToolOrchestrator::stub();
+    let out = reg
+        .dispatch(
+            "read_url",
+            &serde_json::json!({ "url": "https://example.com/source" }),
+            &ctx("read_url"),
+            &env(),
+            AskForApproval::Never,
+            &orch,
+        )
+        .await
+        .expect("read_url should dispatch");
+    assert_eq!(out.exit_code, 0);
+    assert!(
+        out.stdout.contains("fetched https://example.com/source"),
+        "read_url stdout: {:?}",
         out.stdout
     );
 }

@@ -1147,13 +1147,53 @@ to the single frame that proves the task succeeded."
     pub fn web_search() -> ToolDefinition {
         ToolDefinition {
             name: "web_search".to_string(),
-            description: "Search the web for a free-text query.".to_string(),
+            description: "Search the web for likely source/result URLs from a free-text query. Use this before browser_script navigation for broad source discovery; inspect selected result URLs directly afterward."
+                .to_string(),
             input_schema: json!({
                 "type": "object",
                 "properties": {
                     "query": { "type": "string", "description": "The free-text search query." }
                 },
                 "required": ["query"],
+                "additionalProperties": false
+            }),
+            output_schema: None,
+            namespace: None,
+            namespace_description: None,
+        }
+    }
+
+    /// `read_url`: fetch public URLs and return compact readable text.
+    pub fn read_url() -> ToolDefinition {
+        ToolDefinition {
+            name: "read_url".to_string(),
+            description: "Fetch one or more public http/https URLs and return compact readable text plus useful links. Use this after search to inspect static/source pages cheaply before opening a browser tab. If a page needs cookies, login, user interaction, or visual verification, use browser_script instead."
+                .to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "url": {
+                        "type": "string",
+                        "description": "Single URL to fetch."
+                    },
+                    "urls": {
+                        "type": "array",
+                        "description": "Several independent URLs to fetch in one call.",
+                        "items": { "type": "string" }
+                    },
+                    "max_chars_per_url": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "maximum": 20000,
+                        "description": "Maximum readable text characters returned per URL. Defaults to 8000."
+                    },
+                    "timeout_ms": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "maximum": 60000,
+                        "description": "Per-URL timeout in milliseconds. Defaults to 20000."
+                    }
+                },
                 "additionalProperties": false
             }),
             output_schema: None,
@@ -1963,8 +2003,8 @@ Agent-role guidance below only helps choose which agent to use after spawning is
 /// (they would otherwise reach the OS), so those are supplied by the caller.
 ///
 /// `parallel_safe` per tool: `exec_command` / `tool_search` / `web_search` /
-/// `search` = `true`; `shell` / `apply_patch` / `view_image` / `browser` /
-/// `python` / `update_plan` / `done` = `false` (serial). `mcp` is registered
+/// `search` / `read_url` = `true`; `shell` / `apply_patch` / `view_image` /
+/// `browser` / `python` / `update_plan` / `done` = `false` (serial). `mcp` is registered
 /// `false` here
 /// (a serial default); its per-request read-only hint still drives the handler's
 /// own [`ToolRuntime::parallel_safe`](crate::tools::ToolRuntime::parallel_safe).
@@ -1980,6 +2020,7 @@ pub fn default_registry<S, A>(
     tool_search: crate::tools::handlers::tool_search::ToolSearchTool,
     web_search: crate::tools::handlers::web_search::WebSearchTool,
     search: crate::tools::handlers::search::SearchTool,
+    read_url: crate::tools::handlers::read_url::ReadUrlTool,
     done: crate::tools::handlers::done::DoneTool,
 ) -> ToolRegistry<S, A>
 where
@@ -1991,6 +2032,7 @@ where
     use crate::tools::handlers::done::DoneRequest;
     use crate::tools::handlers::mcp::McpToolCallRequest;
     use crate::tools::handlers::python::PythonRequest;
+    use crate::tools::handlers::read_url::{ReadUrlRequest, READ_URL_PARALLEL_SAFE};
     use crate::tools::handlers::search::{SearchRequest, SEARCH_PARALLEL_SAFE};
     use crate::tools::handlers::shell::{
         ExecCommandRequest, ExecCommandTool, ShellRequest, WriteStdinRequest, WriteStdinTool,
@@ -2050,6 +2092,14 @@ where
         definitions::search(),
         SEARCH_PARALLEL_SAFE,
         search,
+    );
+    // `read_url`: source/result URL reader. Read-only and parallel-safe so
+    // several candidate URLs can be inspected in one turn.
+    reg.register::<_, ReadUrlRequest>(
+        "read_url",
+        definitions::read_url(),
+        READ_URL_PARALLEL_SAFE,
+        read_url,
     );
     // `done`: the completion tool. Serial (terminal; must not be reordered).
     reg.register::<_, DoneRequest>("done", definitions::done(), false, done);
