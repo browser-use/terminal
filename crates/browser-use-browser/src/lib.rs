@@ -741,7 +741,11 @@ fn active_browser_script_start_guard_output(
         .get("status")
         .and_then(Value::as_str)
         .unwrap_or("running");
-    if matches!(status, "finished" | "timed_out") {
+    let observe_in_progress = script
+        .get("observe_in_progress")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    if matches!(status, "finished" | "timed_out" | "running") && !observe_in_progress {
         return observe_browser_script_with_registry(
             session_id,
             &run_id,
@@ -12727,17 +12731,17 @@ print("data restored without callable")
     }
 
     #[test]
-    fn browser_script_start_defers_when_session_has_active_run() {
+    fn browser_script_start_observes_when_session_has_active_run() {
         let temp = tempfile::tempdir().unwrap();
         let registry = BrowserScriptRunRegistry::new();
         let session_id = "script-start-active-guard";
-        let _env = EnvRestore::set(&[("BU_BROWSER_SCRIPT_INITIAL_WAIT_MS", "500")]);
+        let _env = EnvRestore::set(&[("BU_BROWSER_SCRIPT_INITIAL_WAIT_MS", "50")]);
         let started = start_browser_script_with_registry(
             session_id,
             temp.path(),
             temp.path().join("artifacts"),
-            "import time\nprint('first started')\ntime.sleep(2.0)\nprint('first done')",
-            5,
+            "import time\nprint('first started')\ntime.sleep(0.2)\nprint('first done')",
+            2,
             &registry,
         )
         .unwrap();
@@ -12747,30 +12751,30 @@ print("data restored without callable")
         let run_id = started.run_id.as_deref().unwrap().to_string();
         assert_eq!(registry.active_run_count_for_session(session_id), 1);
 
-        let deferred = start_browser_script_with_registry(
+        let observed = start_browser_script_with_registry(
             session_id,
             temp.path(),
             temp.path().join("artifacts"),
             "print('second should not spawn')",
-            5,
+            2,
             &registry,
         )
         .unwrap();
 
-        assert!(deferred.ok);
-        assert_eq!(deferred.status.as_deref(), Some("running"));
-        assert_eq!(deferred.run_id.as_deref(), Some(run_id.as_str()));
-        assert_eq!(registry.active_run_count_for_session(session_id), 1);
+        assert!(observed.ok);
+        assert_eq!(observed.status.as_deref(), Some("finished"));
+        assert_eq!(observed.run_id.as_deref(), Some(run_id.as_str()));
+        assert_eq!(registry.active_run_count_for_session(session_id), 0);
         assert!(
-            deferred.text.contains("already active")
-                && deferred
-                    .text
-                    .contains("Do not start another browser_script"),
-            "deferred text: {}",
-            deferred.text
+            observed.text.contains("first done"),
+            "observed text: {}",
+            observed.text
         );
-        assert_eq!(deferred.data["attempted_start_deferred"], true);
-        let _ = cancel_browser_script_with_registry(session_id, &run_id, &registry);
+        assert!(
+            !observed.text.contains("second should not spawn"),
+            "second script should not run: {}",
+            observed.text
+        );
     }
 
     #[test]
