@@ -137,6 +137,15 @@ fn browser_script_call(id: &str) -> ContentPart {
     named_tool_call(id, "browser_script")
 }
 
+fn browser_script_call_with_input(id: &str, input: serde_json::Value) -> ContentPart {
+    ContentPart::ToolCall {
+        id: id.to_string(),
+        name: "browser_script".to_string(),
+        input,
+        provider_metadata: None,
+    }
+}
+
 /// Extract the call id from a `ToolCall` content part.
 fn call_id(call: &ContentPart) -> String {
     match call {
@@ -478,6 +487,50 @@ async fn repeated_running_browser_script_output_gets_recovery_guidance() {
             assert!(
                 text.contains("observe once with a longer timeout"),
                 "guidance should address active browser_script runs: {text}"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn repeated_browser_script_call_gets_recovery_guidance_even_when_output_changes() {
+    let runner = ScriptedRunner::new(vec![
+        script_with_output("repeat-1", "page snapshot version 1", 1, false),
+        script_with_output("repeat-2", "page snapshot version 2", 1, false),
+        script_with_output("repeat-3", "page snapshot version 3", 1, false),
+    ]);
+    let dispatcher = ToolDispatcher::with_runner(runner, true);
+    let input = serde_json::json!({
+        "action": "execute",
+        "code": "page_info()",
+    });
+
+    for attempt in 1..=3 {
+        let out = dispatcher
+            .dispatch_ordered(
+                vec![browser_script_call_with_input(
+                    &format!("repeat-{attempt}"),
+                    input.clone(),
+                )],
+                CancellationToken::new(),
+            )
+            .await;
+        assert_eq!(out.outputs_in_order.len(), 1);
+        let (text, is_error) = output_text_and_error(&out.outputs_in_order[0]);
+        assert!(!is_error);
+        if attempt < 3 {
+            assert!(
+                !text.contains("Repeated browser_script output detected"),
+                "attempt {attempt} should not warn yet: {text}"
+            );
+        } else {
+            assert!(
+                text.contains("Repeated browser_script output detected"),
+                "third repeated browser_script call should steer recovery: {text}"
+            );
+            assert!(
+                text.contains("Do not repeat the same page_info"),
+                "guidance should call out passive browser loops: {text}"
             );
         }
     }

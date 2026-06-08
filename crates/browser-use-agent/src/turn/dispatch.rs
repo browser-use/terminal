@@ -516,12 +516,16 @@ impl<R: CallRunner + 'static> ToolDispatcher<R> {
         outputs: &mut [Message],
     ) {
         for (call, output) in calls.iter().zip(outputs.iter_mut()) {
-            let Some(signature) = no_progress_signature(call, output) else {
-                continue;
-            };
             let mut state = self.no_progress_state.lock().await;
-            let repeats = state.observe(signature);
-            if repeats >= BROWSER_SCRIPT_NO_PROGRESS_REPEAT_THRESHOLD {
+            let call_repeats = no_progress_call_signature(call)
+                .map(|signature| state.observe_call(signature))
+                .unwrap_or(0);
+            let output_repeats = no_progress_output_signature(call, output)
+                .map(|signature| state.observe_output(signature))
+                .unwrap_or(0);
+            if call_repeats >= BROWSER_SCRIPT_NO_PROGRESS_REPEAT_THRESHOLD
+                || output_repeats >= BROWSER_SCRIPT_NO_PROGRESS_REPEAT_THRESHOLD
+            {
                 append_tool_result_text(output, BROWSER_SCRIPT_NO_PROGRESS_NUDGE);
             }
         }
@@ -530,23 +534,45 @@ impl<R: CallRunner + 'static> ToolDispatcher<R> {
 
 #[derive(Debug, Default)]
 struct NoProgressState {
-    last: Option<String>,
-    repeat_count: usize,
+    last_call: Option<String>,
+    call_repeat_count: usize,
+    last_output: Option<String>,
+    output_repeat_count: usize,
 }
 
 impl NoProgressState {
-    fn observe(&mut self, signature: String) -> usize {
-        if self.last.as_deref() == Some(signature.as_str()) {
-            self.repeat_count = self.repeat_count.saturating_add(1);
+    fn observe_call(&mut self, signature: String) -> usize {
+        if self.last_call.as_deref() == Some(signature.as_str()) {
+            self.call_repeat_count = self.call_repeat_count.saturating_add(1);
         } else {
-            self.last = Some(signature);
-            self.repeat_count = 1;
+            self.last_call = Some(signature);
+            self.call_repeat_count = 1;
         }
-        self.repeat_count
+        self.call_repeat_count
+    }
+
+    fn observe_output(&mut self, signature: String) -> usize {
+        if self.last_output.as_deref() == Some(signature.as_str()) {
+            self.output_repeat_count = self.output_repeat_count.saturating_add(1);
+        } else {
+            self.last_output = Some(signature);
+            self.output_repeat_count = 1;
+        }
+        self.output_repeat_count
     }
 }
 
-fn no_progress_signature(call: &ContentPart, output: &Message) -> Option<String> {
+fn no_progress_call_signature(call: &ContentPart) -> Option<String> {
+    let ContentPart::ToolCall { name, input, .. } = call else {
+        return None;
+    };
+    if name != "browser_script" {
+        return None;
+    }
+    Some(normalize_no_progress_text(&input.to_string()))
+}
+
+fn no_progress_output_signature(call: &ContentPart, output: &Message) -> Option<String> {
     let ContentPart::ToolCall { name, .. } = call else {
         return None;
     };
