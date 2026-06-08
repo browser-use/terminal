@@ -34,6 +34,8 @@ struct CallScript {
     sleep: Duration,
     /// codex `ToolRuntime::parallel_safe` for this call.
     parallel_safe: bool,
+    /// Optional canned tool output text.
+    output: Option<String>,
 }
 
 /// A [`CallRunner`] that replays a per-call script and instruments concurrency.
@@ -102,7 +104,16 @@ impl CallRunner for ScriptedRunner {
         }
 
         self.in_flight.fetch_sub(1, Ordering::SeqCst);
-        canned_output(&id)
+        let output = self
+            .scripts
+            .lock()
+            .unwrap()
+            .get(&id)
+            .and_then(|s| s.output.clone());
+        match output {
+            Some(output) => canned_output_with_text(&id, output),
+            None => canned_output(&id),
+        }
     }
 }
 
@@ -137,11 +148,15 @@ fn call_id(call: &ContentPart) -> String {
 /// The canned output message a scripted call returns, tagged with its call id so
 /// a test can assert the *output order* matches the *input order*.
 fn canned_output(id: &str) -> Message {
+    canned_output_with_text(id, format!("output:{id}"))
+}
+
+fn canned_output_with_text(id: &str, text: String) -> Message {
     Message::new(
         MessageRole::Tool,
         vec![ContentPart::ToolResult {
             tool_call_id: id.to_string(),
-            content: vec![ContentPart::text(format!("output:{id}"))],
+            content: vec![ContentPart::text(text)],
             is_error: false,
         }],
     )
@@ -182,6 +197,16 @@ fn script(id: &str, sleep_ms: u64, parallel_safe: bool) -> CallScript {
         id: id.to_string(),
         sleep: Duration::from_millis(sleep_ms),
         parallel_safe,
+        output: None,
+    }
+}
+
+fn script_with_output(id: &str, output: &str, sleep_ms: u64, parallel_safe: bool) -> CallScript {
+    CallScript {
+        id: id.to_string(),
+        sleep: Duration::from_millis(sleep_ms),
+        parallel_safe,
+        output: Some(output.to_string()),
     }
 }
 
@@ -419,6 +444,40 @@ async fn repeated_browser_script_output_gets_recovery_guidance() {
             assert!(
                 text.contains("call done with the best verified result"),
                 "guidance should encourage a user-facing result: {text}"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn repeated_running_browser_script_output_gets_recovery_guidance() {
+    let running_output = "browser_script is still running.\nrun_id: bs-123\nNext step: call browser_script with action=\"observe\", run_id=\"bs-123\", and observe_timeout_ms=15000.";
+    let runner = ScriptedRunner::new(vec![script_with_output("repeat", running_output, 1, false)]);
+    let dispatcher = ToolDispatcher::with_runner(runner, true);
+
+    for attempt in 1..=3 {
+        let out = dispatcher
+            .dispatch_ordered(
+                vec![browser_script_call("repeat")],
+                CancellationToken::new(),
+            )
+            .await;
+        assert_eq!(out.outputs_in_order.len(), 1);
+        let (text, is_error) = output_text_and_error(&out.outputs_in_order[0]);
+        assert!(!is_error);
+        if attempt < 3 {
+            assert!(
+                !text.contains("Repeated browser_script output detected"),
+                "attempt {attempt} should not warn yet: {text}"
+            );
+        } else {
+            assert!(
+                text.contains("Repeated browser_script output detected"),
+                "third repeated running browser_script result should steer recovery: {text}"
+            );
+            assert!(
+                text.contains("observe once with a longer timeout"),
+                "guidance should address active browser_script runs: {text}"
             );
         }
     }

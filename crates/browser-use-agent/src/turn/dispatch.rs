@@ -60,7 +60,7 @@ use crate::tools::runtime::{Approver, AutoApprover, ToolCtx};
 use crate::tools::sandbox::{NoneSandboxProvider, SandboxProvider};
 
 const BROWSER_SCRIPT_NO_PROGRESS_REPEAT_THRESHOLD: usize = 3;
-const BROWSER_SCRIPT_NO_PROGRESS_NUDGE: &str = "Repeated browser_script output detected: this browser state or script error has already been returned multiple times. Do not repeat the same page_info, list_tabs, or extraction script. Change strategy now: take a concrete browser action, narrow the extraction, use search/fetch for source discovery, or call done with the best verified result or partial result.";
+const BROWSER_SCRIPT_NO_PROGRESS_NUDGE: &str = "Repeated browser_script output detected: this browser state, active script, or script error has already been returned multiple times. Do not repeat the same page_info, list_tabs, observe, or extraction script. Change strategy now: take a concrete browser action, observe once with a longer timeout if an active run is still useful, narrow the extraction, use search/fetch for source discovery, cancel/change the active script, or call done with the best verified result or partial result.";
 
 /// Runs a single tool call to completion, producing the `Message` to record.
 ///
@@ -554,7 +554,7 @@ fn no_progress_signature(call: &ContentPart, output: &Message) -> Option<String>
         return None;
     }
     let text = tool_result_text(output);
-    if text.trim().is_empty() || text.contains("browser_script is still running.") {
+    if text.trim().is_empty() {
         return None;
     }
     Some(normalize_no_progress_text(&text))
