@@ -966,6 +966,7 @@ mod tests {
                 id: "call_1".into(),
                 name: "get_weather".into(),
                 namespace: None,
+                provider_metadata: None,
                 input: json!({ "city": "NYC" }),
             },
             LlmEvent::StepFinish {
@@ -1129,6 +1130,7 @@ mod tests {
             id: "call_9".into(),
             name: "do_it".into(),
             namespace: None,
+            provider_metadata: None,
             input: json!({}),
         }));
         assert!(matches!(events.last(), Some(LlmEvent::Finish { .. })));
@@ -1154,6 +1156,7 @@ mod tests {
             id: "call_9".into(),
             name: "spawn_agent".into(),
             namespace: Some("agents".into()),
+            provider_metadata: None,
             input: json!({ "task_name": "audit", "message": "check" }),
         }));
     }

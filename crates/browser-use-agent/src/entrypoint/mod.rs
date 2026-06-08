@@ -5865,6 +5865,7 @@ mod tests {
                     id: "call-1".to_string(),
                     name: "shell".to_string(),
                     namespace: None,
+                    provider_metadata: None,
                     input: serde_json::json!({ "command": ["echo", "fusion-ok"] }),
                 },
                 LlmEvent::Finish {

@@ -101,6 +101,7 @@ mod tests {
                 id: "c0".into(),
                 name: "shell".into(),
                 namespace: None,
+                provider_metadata: None,
                 input: json!({}),
             },
             LlmEvent::Finish {
