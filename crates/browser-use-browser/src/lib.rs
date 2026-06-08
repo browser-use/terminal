@@ -861,6 +861,15 @@ fn busy_recovery_next_step(active_scripts: &Value, requested_command: &str) -> S
         .get("status")
         .and_then(Value::as_str)
         .unwrap_or("running");
+    let observe_in_progress = script
+        .get("observe_in_progress")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    if observe_in_progress || status.starts_with("observing") {
+        return format!(
+            "Wait for the in-flight browser_script observe for run_id={run_id} to return, run browser status --json, then retry {requested_command}. Do not call observe or cancel for this run_id while observe_in_progress=true."
+        );
+    }
     if matches!(status, "finished" | "timed_out") {
         format!("browser_script action=observe run_id={run_id}; then retry {requested_command}.")
     } else {
@@ -10653,6 +10662,26 @@ mod tests {
     }
 
     #[test]
+    fn browser_recovery_waits_for_in_flight_observe_before_retrying() {
+        let active_scripts = json!([{
+            "run_id": "script-1",
+            "status": "observing",
+            "observe_in_progress": true
+        }]);
+
+        let next_step =
+            busy_recovery_next_step(&active_scripts, "browser recover reconnect-websocket");
+
+        assert!(next_step.contains("Wait for the in-flight browser_script observe"));
+        assert!(next_step.contains("retry browser recover reconnect-websocket"));
+        assert!(!next_step.contains("action=cancel"), "{next_step}");
+        assert!(
+            !next_step.contains("action=observe run_id=script-1"),
+            "{next_step}"
+        );
+    }
+
+    #[test]
     fn browser_status_refreshes_checked_out_local_snapshot_health() {
         let temp = tempfile::tempdir().unwrap();
         let registry = BrowserSessionRegistry::new();
@@ -13091,6 +13120,7 @@ print("finished")
     fn browser_status_marks_completed_background_scripts_for_observe() {
         let temp = tempfile::tempdir().unwrap();
         let session_id = "script-status-completed-runs";
+        let _env = EnvRestore::set(&[("BU_BROWSER_SCRIPT_INITIAL_WAIT_MS", "250")]);
         let started = start_browser_script(
             session_id,
             temp.path(),

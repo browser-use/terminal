@@ -32,6 +32,10 @@ use serde_json::Value;
 
 use crate::events::names::DEFAULT_TOOL_OUTPUT_TEXT_TOKENS;
 
+const BROWSER_SCRIPT_OUTPUT_TEXT_BYTES: usize = 4 * 1024;
+const BROWSER_SCRIPT_OUTPUT_TEXT_TOKENS: usize = BROWSER_SCRIPT_OUTPUT_TEXT_BYTES / 4;
+const BROWSER_SCRIPT_TRUNCATION_NOTICE: &str = "\n... [browser_script stdout truncated";
+
 /// Record all host-side events for a Python tool response, then the final
 /// `tool.output` event.
 ///
@@ -143,7 +147,14 @@ pub fn record_browser_script_response_events_for_tool(
             artifact,
         )?;
     }
-    let transcript_text = browser_script_transcript_text(response);
+    let raw_transcript_text = browser_script_transcript_text(response);
+    let (transcript_text, text_artifact) = spill_browser_script_transcript_output(
+        store,
+        session_id,
+        tool_name,
+        tool_call_id,
+        &raw_transcript_text,
+    )?;
     let mut payload = serde_json::json!({
         "name": tool_name,
         "tool_call_id": tool_call_id,
@@ -159,6 +170,10 @@ pub fn record_browser_script_response_events_for_tool(
         "artifacts": response.artifacts,
         "diagnosis": response.diagnosis,
     });
+    if let Some(artifact) = text_artifact.as_ref() {
+        payload["text_truncated"] = Value::Bool(true);
+        payload["text_artifact"] = artifact.clone();
+    }
     if response.ok {
         if let Some(content) = browser_script_output_content_parts(response, &transcript_text) {
             payload["content"] = content;
@@ -329,6 +344,46 @@ fn browser_script_running_transcript_text(response: &BrowserScriptOutput) -> Str
         }
     }
     lines.join("\n")
+}
+
+fn spill_browser_script_transcript_output(
+    store: &Store,
+    session_id: &str,
+    tool_name: &str,
+    tool_call_id: &str,
+    text: &str,
+) -> anyhow::Result<(String, Option<Value>)> {
+    if text.len() <= BROWSER_SCRIPT_OUTPUT_TEXT_BYTES {
+        return Ok((text.to_string(), None));
+    }
+    let artifact = write_tool_output_artifact(
+        store,
+        session_id,
+        tool_name,
+        Some(tool_call_id),
+        text,
+        BROWSER_SCRIPT_OUTPUT_TEXT_TOKENS,
+    )?;
+    Ok((
+        truncate_browser_script_transcript_text(text),
+        Some(artifact),
+    ))
+}
+
+fn truncate_browser_script_transcript_text(text: &str) -> String {
+    if text.len() <= BROWSER_SCRIPT_OUTPUT_TEXT_BYTES {
+        return text.to_string();
+    }
+    let mut end = BROWSER_SCRIPT_OUTPUT_TEXT_BYTES;
+    while end > 0 && !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    let elided = text.len() - end;
+    let mut out = text[..end].to_string();
+    out.push_str(&format!(
+        "{BROWSER_SCRIPT_TRUNCATION_NOTICE}, {elided} more bytes; full output persisted. Use a narrower browser_script extraction, the emitted summaries, or a saved artifact instead of re-reading broad page text.]"
+    ));
+    out
 }
 
 /// Whether a transcript line is a transport/progress marker to be dropped.
@@ -808,6 +863,40 @@ mod tests {
         assert_eq!(tool_output.payload["name"], "browser_script");
         assert_eq!(tool_output.payload["tool_call_id"], "call-1");
         assert_eq!(tool_output.payload["text"], "clicked button");
+    }
+
+    #[test]
+    fn record_browser_script_response_caps_replay_text_and_spills_full_output() {
+        let (_dir, store) = store();
+        let session = new_session(&store);
+        let mut response = BrowserScriptOutput::default();
+        response.ok = true;
+        response.text = "x".repeat(BROWSER_SCRIPT_OUTPUT_TEXT_BYTES + 5_000);
+
+        record_browser_script_response_events(&store, &session, "call-long", &response).unwrap();
+
+        let events = store.events_for_session(&session).unwrap();
+        let tool_output = events
+            .iter()
+            .find(|e| e.event_type == "tool.output")
+            .expect("tool.output event");
+        let replay_text = tool_output.payload["text"].as_str().expect("text");
+        assert!(
+            replay_text.len() < BROWSER_SCRIPT_OUTPUT_TEXT_BYTES + 1_000,
+            "replay text should be bounded, got {} bytes",
+            replay_text.len()
+        );
+        assert!(replay_text.contains(BROWSER_SCRIPT_TRUNCATION_NOTICE));
+        assert!(
+            !replay_text.contains(&"x".repeat(BROWSER_SCRIPT_OUTPUT_TEXT_BYTES + 100)),
+            "uncapped browser_script output leaked into replay text"
+        );
+        assert_eq!(tool_output.payload["text_truncated"], true);
+        let artifact_path = tool_output.payload["text_artifact"]["path"]
+            .as_str()
+            .expect("text artifact path");
+        let full_text = std::fs::read_to_string(artifact_path).expect("full artifact text");
+        assert_eq!(full_text.len(), BROWSER_SCRIPT_OUTPUT_TEXT_BYTES + 5_000);
     }
 
     #[test]
