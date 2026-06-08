@@ -2433,6 +2433,19 @@ impl TurnObserver for StoreObserver {
                     session_done_payload(Some(&text), None),
                 ));
             }
+            TurnLifecycleEvent::TurnComplete {
+                last_agent_message: None,
+                ..
+            } => {
+                self.sink.emit(PendingEvent::new(
+                    self.session_id.clone(),
+                    names::SESSION_FAILED,
+                    json!({
+                        "code": "no_final_answer",
+                        "error": "Rust terminal session completed without a final answer.",
+                    }),
+                ));
+            }
             TurnLifecycleEvent::TurnAborted {
                 reason: TurnAbortReason::MaxTurns,
                 last_agent_message,
@@ -4473,6 +4486,29 @@ mod tests {
         assert!(
             events[0].payload.get("partial_result").is_none(),
             "no synthetic answer should be attached when the model produced no text"
+        );
+    }
+
+    #[test]
+    fn store_observer_publishes_failure_when_complete_has_no_final_text() {
+        let sink = Arc::new(CapturingEventSink::default());
+        let observer = StoreObserver::new(sink.clone(), "session-1".to_string());
+
+        observer.on_lifecycle(TurnLifecycleEvent::TurnComplete {
+            turn_id: "session-1".to_string(),
+            last_agent_message: None,
+        });
+
+        let events = sink.events.lock().unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].event_type, names::SESSION_FAILED);
+        assert_eq!(
+            events[0].payload.get("code").and_then(Value::as_str),
+            Some("no_final_answer")
+        );
+        assert_eq!(
+            events[0].payload.get("error").and_then(Value::as_str),
+            Some("Rust terminal session completed without a final answer.")
         );
     }
 
