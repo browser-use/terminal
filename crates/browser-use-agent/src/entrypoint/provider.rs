@@ -815,6 +815,11 @@ pub fn provider_choice_for_backend(
                 base_url: env_first(&["LLM_BROWSER_BROWSER_USE_BASE_URL"])
                     .unwrap_or_else(|| "https://llm.api.browser-use.com/v1".to_string()),
                 api_key,
+                extra_headers: vec![(
+                    "x-browser-use-request-type".to_string(),
+                    env_first(&["LLM_BROWSER_BROWSER_USE_REQUEST_TYPE"])
+                        .unwrap_or_else(|| "rust_agent".to_string()),
+                )],
             }))
         }
         ProviderBackend::Anthropic => {
@@ -2741,10 +2746,18 @@ mod tests {
                 provider_id,
                 base_url,
                 api_key,
+                extra_headers,
             } => {
                 assert_eq!(provider_id, "browser-use");
                 assert_eq!(base_url, "https://llm.api.browser-use.com/v1");
                 assert_eq!(api_key, "stored-browser-use-key");
+                assert_eq!(
+                    extra_headers,
+                    vec![(
+                        "x-browser-use-request-type".to_string(),
+                        "rust_agent".to_string()
+                    )]
+                );
             }
             other => panic!("expected browser-use gateway choice, got {other:?}"),
         }
