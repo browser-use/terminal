@@ -678,6 +678,14 @@ pub fn browser_summary_from_events(
         match event.event_type.as_str() {
             "browser.connected" | "browser.reconnected" | "browser.target_changed" => {
                 summary.status = "connected".to_string();
+                if event.payload.get("live_url").is_some() {
+                    summary.live_url = event
+                        .payload
+                        .get("live_url")
+                        .and_then(Value::as_str)
+                        .filter(|value| !value.trim().is_empty())
+                        .map(sanitize_terminal_text);
+                }
                 if let Some(url) = event.payload.get("url").and_then(Value::as_str) {
                     summary.url = Some(sanitize_terminal_text(url));
                 }
@@ -687,6 +695,7 @@ pub fn browser_summary_from_events(
             }
             "browser.disconnected" => {
                 summary.status = "disconnected".to_string();
+                summary.live_url = None;
             }
             "browser.backend_changed" => {
                 summary.status = "not connected".to_string();
@@ -738,7 +747,11 @@ pub fn browser_summary_from_events(
 }
 
 fn browser_backend_supports_live_url(backend: &str) -> bool {
-    backend.to_ascii_lowercase().contains("cloud")
+    let backend = backend.to_ascii_lowercase();
+    backend.contains("cloud")
+        || backend.contains("managed")
+        || backend.contains("headless chromium")
+        || backend.contains("managed chromium")
 }
 
 pub fn telemetry_summary_from_events(events: &[EventRecord]) -> TelemetrySummary {
@@ -1636,6 +1649,60 @@ mod tests {
     }
 
     #[test]
+    fn browser_live_url_projection_accepts_managed_chromium_backends() {
+        let events = vec![event(
+            1,
+            "browser.live_url",
+            json!({"live_url": "https://chrome-devtools-frontend.appspot.com/serve_rev/@rev/inspector.html?ws=127.0.0.1:9222/devtools/page/abc"}),
+        )];
+
+        for backend in ["managed", "Managed Chromium", "Headless Chromium"] {
+            let browser = browser_summary_from_events(&events, backend);
+            assert_eq!(
+                browser.live_url.as_deref(),
+                Some("https://chrome-devtools-frontend.appspot.com/serve_rev/@rev/inspector.html?ws=127.0.0.1:9222/devtools/page/abc"),
+                "backend {backend} should keep local DevTools live URL"
+            );
+        }
+    }
+
+    #[test]
+    fn browser_live_url_projection_keeps_local_devtools_after_done() {
+        let events = vec![
+            event(
+                1,
+                "browser.live_url",
+                json!({"live_url": "https://chrome-devtools-frontend.appspot.com/serve_rev/@rev/inspector.html?ws=127.0.0.1:9222/devtools/page/abc"}),
+            ),
+            event(2, "session.done", json!({"result": "Done"})),
+        ];
+
+        let browser = browser_summary_from_events(&events, "Headless Chromium");
+        assert_eq!(
+            browser.live_url.as_deref(),
+            Some("https://chrome-devtools-frontend.appspot.com/serve_rev/@rev/inspector.html?ws=127.0.0.1:9222/devtools/page/abc")
+        );
+    }
+
+    #[test]
+    fn browser_live_url_projection_keeps_cloud_live_url_after_done() {
+        let events = vec![
+            event(
+                1,
+                "browser.live_url",
+                json!({"live_url": "https://live.browser-use.com/watch"}),
+            ),
+            event(2, "session.done", json!({"result": "Done"})),
+        ];
+
+        let browser = browser_summary_from_events(&events, "Browser Use Cloud");
+        assert_eq!(
+            browser.live_url.as_deref(),
+            Some("https://live.browser-use.com/watch")
+        );
+    }
+
+    #[test]
     fn browser_backend_change_clears_stale_cloud_live_url() {
         let events = vec![
             event(
@@ -1653,6 +1720,31 @@ mod tests {
         assert_eq!(browser.status, "not connected");
         assert_eq!(browser.live_url, None);
         assert_eq!(browser.url, None);
+    }
+
+    #[test]
+    fn browser_state_with_null_live_url_clears_stale_cloud_live_url() {
+        let events = vec![
+            event(
+                1,
+                "browser.live_url",
+                json!({"live_url": "https://live.browser-use.com/watch-stale"}),
+            ),
+            event(
+                2,
+                "browser.target_changed",
+                json!({
+                    "backend": "remote-cloud",
+                    "status": "connected",
+                    "target_id": "target-2",
+                    "session_id": "session-2",
+                    "live_url": null,
+                }),
+            ),
+        ];
+        let browser = browser_summary_from_events(&events, "Browser Use Cloud");
+        assert_eq!(browser.status, "connected");
+        assert_eq!(browser.live_url, None);
     }
 
     #[test]

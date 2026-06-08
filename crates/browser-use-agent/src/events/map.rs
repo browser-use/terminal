@@ -95,11 +95,16 @@ pub fn usage_to_model_usage(u: &Usage) -> ModelUsage {
     ModelUsage {
         input_tokens: Some(u.input_tokens as i64),
         input_cached_tokens: Some(u.cached_input_tokens as i64),
+        input_cache_creation_tokens: positive_i64(u.cache_creation_input_tokens),
         output_tokens: Some(u.output_tokens as i64),
         reasoning_output_tokens: Some(u.reasoning_output_tokens as i64),
         total_tokens: Some(total as i64),
         ..Default::default()
     }
+}
+
+fn positive_i64(value: u64) -> Option<i64> {
+    (value > 0).then_some(value as i64)
 }
 
 /// Codex-shaped token-usage object (mirrors core `model_usage_to_codex_token_usage`):
@@ -109,6 +114,7 @@ pub fn usage_to_model_usage(u: &Usage) -> ModelUsage {
 fn codex_token_usage(usage: &ModelUsage) -> Value {
     let input_tokens = usage.input_tokens.unwrap_or(0);
     let cached_input_tokens = usage.input_cached_tokens.unwrap_or(0);
+    let cache_creation_input_tokens = usage.input_cache_creation_tokens.unwrap_or(0);
     let output_tokens = usage.output_tokens.unwrap_or(0);
     let reasoning_output_tokens = usage.reasoning_output_tokens.unwrap_or(0);
     let total_tokens = usage.total_tokens.unwrap_or_else(|| {
@@ -116,20 +122,26 @@ fn codex_token_usage(usage: &ModelUsage) -> Value {
             .saturating_add(output_tokens)
             .saturating_add(reasoning_output_tokens)
     });
-    json!({
+    let mut value = json!({
         "input_tokens": input_tokens,
         "cached_input_tokens": cached_input_tokens,
         "output_tokens": output_tokens,
         "reasoning_output_tokens": reasoning_output_tokens,
         "total_tokens": total_tokens,
-    })
+    });
+    if cache_creation_input_tokens > 0 {
+        value["input_cache_creation_tokens"] = json!(cache_creation_input_tokens);
+    }
+    value
 }
 
 /// Field-wise sum of two codex token-usage objects (mirrors core
 /// `add_codex_token_usage`). Missing keys are treated as `0`.
 fn add_codex_token_usage(previous: &Value, addition: &Value) -> Value {
     let get = |value: &Value, key: &str| value.get(key).and_then(Value::as_i64).unwrap_or(0);
-    json!({
+    let cache_creation_input_tokens =
+        get(previous, "input_cache_creation_tokens") + get(addition, "input_cache_creation_tokens");
+    let mut value = json!({
         "input_tokens": get(previous, "input_tokens") + get(addition, "input_tokens"),
         "cached_input_tokens":
             get(previous, "cached_input_tokens") + get(addition, "cached_input_tokens"),
@@ -137,7 +149,11 @@ fn add_codex_token_usage(previous: &Value, addition: &Value) -> Value {
         "reasoning_output_tokens":
             get(previous, "reasoning_output_tokens") + get(addition, "reasoning_output_tokens"),
         "total_tokens": get(previous, "total_tokens") + get(addition, "total_tokens"),
-    })
+    });
+    if cache_creation_input_tokens > 0 {
+        value["input_cache_creation_tokens"] = json!(cache_creation_input_tokens);
+    }
+    value
 }
 
 /// Build the `token_count` payload (core parity:

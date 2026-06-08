@@ -8,6 +8,7 @@ members = [
   "crates/browser-use-python-worker",
   "crates/browser-use-runtime",
   "crates/browser-use-protocol",
+  "crates/browser-use-secrets",
   "crates/browser-use-store",
   "crates/browser-use-tui",
 ]
@@ -19,9 +20,10 @@ resolver = "2"
 [workspace.package]
 edition = "2021"
 license = "MIT"
-version = "0.1.2"
+version = "0.1.4"
 
 [workspace.dependencies]
+aes-gcm = "0.10"
 anyhow = "1"
 arboard = "3.6.1"
 async-trait = "0.1"
@@ -39,6 +41,7 @@ image = { version = "0.25", default-features = false, features = ["png", "jpeg",
 ratatui = { version = "0.30", default-features = false, features = ["crossterm_0_29"] }
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }
 regex = "1"
+rpassword = "7"
 rustls = { version = "0.23", default-features = false, features = ["std", "aws_lc_rs"] }
 rusqlite = { version = "0.39", features = ["bundled"] }
 serde = { version = "1", features = ["derive"] }

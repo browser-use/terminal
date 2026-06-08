@@ -270,6 +270,10 @@ struct LiveTurnState {
     /// `Some`, it REPLACES the durable-log prompt; later recorded turns are
     /// appended after it. `None` until the first compaction.
     compacted: Mutex<Option<Vec<Message>>>,
+    /// Unit/offline seams rely on the in-memory recorder because they do not emit
+    /// durable model/tool events. Production emits those events synchronously, so
+    /// replaying both durable history and this recorder tail duplicates turns.
+    include_recorded_tail_in_prompt: bool,
 }
 
 impl LiveTurnState {
@@ -298,7 +302,19 @@ impl LiveTurnState {
             previous_model_compaction: None,
             compaction_sampler: None,
             compacted: Mutex::new(None),
+            include_recorded_tail_in_prompt: true,
         }
+    }
+
+    /// Use only the durable event log when rebuilding prompts.
+    ///
+    /// The live facade persists model/tool events as they happen, before the next
+    /// sampling iteration. The in-memory fusion recorder is therefore redundant
+    /// for production prompt replay and would duplicate the same assistant/tool
+    /// turns that the event log already reconstructs.
+    fn with_durable_prompt_replay(mut self) -> Self {
+        self.include_recorded_tail_in_prompt = false;
+        self
     }
 
     /// Enable REAL token accounting + model-based compaction against a context
@@ -359,8 +375,14 @@ impl LiveTurnState {
             Some(compacted) => compacted.clone(),
             None => self.durable_history_blocking(),
         };
-        msgs.extend(self.recorded.lock().unwrap().iter().cloned());
+        self.append_recorded_tail_if_enabled(&mut msgs);
         msgs
+    }
+
+    fn append_recorded_tail_if_enabled(&self, msgs: &mut Vec<Message>) {
+        if self.include_recorded_tail_in_prompt {
+            msgs.extend(self.recorded.lock().unwrap().iter().cloned());
+        }
     }
 
     fn runtime_session_id(&self) -> Option<RuntimeSessionId> {
@@ -396,13 +418,15 @@ impl LiveTurnState {
         events: &[browser_use_protocol::EventRecord],
     ) -> Vec<Item> {
         let mut items = provider_messages_from_events(events);
-        items.extend(
-            self.recorded
-                .lock()
-                .unwrap()
-                .iter()
-                .map(message_to_provider_item),
-        );
+        if self.include_recorded_tail_in_prompt {
+            items.extend(
+                self.recorded
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .map(message_to_provider_item),
+            );
+        }
         items
     }
 
@@ -1289,6 +1313,29 @@ fn runtime_mailbox_items_as_pending_input(
         .collect()
 }
 
+const DISABLE_FALLBACK_CAPTURE_GIF_ENV: &str = "BU_DISABLE_FALLBACK_CAPTURE_GIF";
+const ENABLE_FALLBACK_CAPTURE_GIF_ENV: &str = "BU_ENABLE_FALLBACK_CAPTURE_GIF";
+
+fn env_bool(name: &str) -> Option<bool> {
+    std::env::var(name)
+        .ok()
+        .and_then(|value| match value.trim().to_ascii_lowercase().as_str() {
+            "1" | "true" | "yes" | "on" => Some(true),
+            "0" | "false" | "no" | "off" => Some(false),
+            _ => None,
+        })
+}
+
+fn fallback_capture_recording_enabled() -> bool {
+    if matches!(env_bool(DISABLE_FALLBACK_CAPTURE_GIF_ENV), Some(true)) {
+        return false;
+    }
+    if let Some(enabled) = env_bool(ENABLE_FALLBACK_CAPTURE_GIF_ENV) {
+        return enabled;
+    }
+    matches!(env_bool(DISABLE_FALLBACK_CAPTURE_GIF_ENV), Some(false))
+}
+
 fn append_runtime_prompt_projection_event(
     runtime_handle: &RuntimeHandle,
     session_id: &str,
@@ -1347,6 +1394,9 @@ fn runtime_or_store_events(
 }
 
 fn ensure_fallback_capture_recording(store: &SharedStore, session_id: &str) {
+    if !fallback_capture_recording_enabled() {
+        return;
+    }
     let Ok(store) = store.lock() else {
         return;
     };
@@ -1937,10 +1987,10 @@ fn enrich_token_count_payload(
 impl TurnState for LiveTurnState {
     async fn clone_history_for_prompt(&self) -> Vec<Message> {
         // Once compacted, the prompt base is the compacted override (codex's
-        // replaced history); otherwise it is the lowered durable log. The recorded
-        // buffer (this run's assistant turns + the fused driver's dispatched tool
-        // outputs) is appended either way, so tool outputs always re-enter the next
-        // prompt (the fusion seam is preserved across compaction).
+        // replaced history); otherwise it is the lowered durable log. Offline
+        // tests append the recorder tail so tool outputs re-enter the next prompt
+        // without a durable sink. Production disables that tail because the same
+        // model/tool events have already been persisted and replay from the log.
         if self.compacted.lock().unwrap().is_some() {
             return self.assemble_prompt_blocking();
         }
@@ -1963,10 +2013,7 @@ impl TurnState for LiveTurnState {
         })
         .await
         .unwrap_or_default();
-        // The recorded buffer carries this run's assistant turns AND the fused
-        // driver's dispatched tool outputs (both append through the same `Arc`), so
-        // the next prompt sees everything produced so far.
-        msgs.extend(self.recorded.lock().unwrap().iter().cloned());
+        self.append_recorded_tail_if_enabled(&mut msgs);
         msgs
     }
 
@@ -2480,6 +2527,7 @@ struct RuntimeTurnLoopDriver<Sd> {
     previous_model_compaction: Option<PreviousModelCompaction>,
     runtime_handle: RuntimeHandle,
     cancel: CancellationToken,
+    max_turns: Option<usize>,
 }
 
 impl<Sd: SamplingDriver> RuntimeTurnLoopDriver<Sd> {
@@ -2499,13 +2547,15 @@ impl<Sd: SamplingDriver> RuntimeTurnLoopDriver<Sd> {
             previous_model_compaction,
             runtime_handle,
             cancel,
+            max_turns,
         } = self;
 
         let mailbox_delivery_phase =
             initial_runtime_mailbox_delivery_phase(Some(&runtime_handle), session_id.as_str());
         let state = LiveTurnState::new(Arc::clone(&store), session_id.clone(), recorded)
             .with_runtime_handle(Some(runtime_handle.clone()))
-            .with_mailbox_delivery_phase(mailbox_delivery_phase);
+            .with_mailbox_delivery_phase(mailbox_delivery_phase)
+            .with_durable_prompt_replay();
         // Enable REAL token accounting + model-based compaction when a sampler is
         // available (the real backend path). The Fake/no-credential path passes `None`
         // and keeps the inert (never-compacts) behavior.
@@ -2549,9 +2599,18 @@ impl<Sd: SamplingDriver> RuntimeTurnLoopDriver<Sd> {
         let observer = StoreObserver::new(sink, session_id.as_str().to_string());
 
         let turn_loop = TurnLoop::new(state, driver, observer);
-        let result = turn_loop
-            .run(ctx, turn_has_fresh_input, cancel.clone())
-            .await;
+        let result = match max_turns {
+            Some(max_turns) => {
+                turn_loop
+                    .run_with_max_turns(ctx, turn_has_fresh_input, cancel.clone(), max_turns)
+                    .await
+            }
+            None => {
+                turn_loop
+                    .run(ctx, turn_has_fresh_input, cancel.clone())
+                    .await
+            }
+        };
         if result.is_ok() {
             ensure_fallback_capture_recording(&store, session_id.as_str());
         }
@@ -2579,6 +2638,7 @@ async fn drive_run<Sd: SamplingDriver>(
     previous_model_compaction: Option<PreviousModelCompaction>,
     runtime_handle: RuntimeHandle,
     cancel: CancellationToken,
+    max_turns: Option<usize>,
 ) -> Result<Option<String>, AgentError> {
     RuntimeTurnLoopDriver {
         store,
@@ -2595,6 +2655,7 @@ async fn drive_run<Sd: SamplingDriver>(
         previous_model_compaction,
         runtime_handle,
         cancel,
+        max_turns,
     }
     .run()
     .await
@@ -2880,7 +2941,18 @@ async fn run_session_once_with_config_with_cancel(
     cancel: CancellationToken,
     runtime_handle: RuntimeHandle,
 ) -> anyhow::Result<()> {
-    let ctx = turn_ctx(&session_id, &config);
+    let mut ctx = turn_ctx(&session_id, &config);
+
+    // Tell the model which saved credentials exist (names only) and that it can
+    // use them securely, so it logs in via `<secret>` placeholders instead of
+    // refusing. Built once per session; secret values are never included.
+    if let Ok(store_guard) = store.lock() {
+        if let Some(block) =
+            crate::tools::handlers::secrets_admin::secrets_prompt_context(&store_guard)
+        {
+            ctx.base_instructions.push_str(&block);
+        }
+    }
 
     // The single in-run conversation buffer, shared (by `Arc`) between the fused
     // driver's `FusionRecorder` (which records the assistant message + dispatched
@@ -3010,6 +3082,7 @@ async fn run_session_once_with_config_with_cancel(
                 previous_model_compaction,
                 runtime_handle.clone(),
                 cancel.clone(),
+                Some(config.options.max_turns),
             )
             .await?;
         }
@@ -3035,6 +3108,7 @@ async fn run_session_once_with_config_with_cancel(
                 None,
                 runtime_handle.clone(),
                 cancel.clone(),
+                Some(config.options.max_turns),
             )
             .await?;
         }
@@ -3127,7 +3201,65 @@ mod tests {
     use browser_use_store::Store;
     use serde_json::Value;
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Mutex as StdMutex, MutexGuard as StdMutexGuard, OnceLock as StdOnceLock};
     use tempfile::TempDir;
+
+    static ENTRYPOINT_ENV_LOCK: StdOnceLock<StdMutex<()>> = StdOnceLock::new();
+
+    struct EnvRestore {
+        _guard: StdMutexGuard<'static, ()>,
+        values: Vec<(&'static str, Option<String>)>,
+    }
+
+    impl EnvRestore {
+        fn set(vars: &[(&'static str, &str)]) -> Self {
+            let guard = ENTRYPOINT_ENV_LOCK
+                .get_or_init(|| StdMutex::new(()))
+                .lock()
+                .expect("env lock poisoned");
+            let values = vars
+                .iter()
+                .map(|(key, _)| (*key, std::env::var(key).ok()))
+                .collect::<Vec<_>>();
+            for (key, value) in vars {
+                std::env::set_var(key, value);
+            }
+            Self {
+                _guard: guard,
+                values,
+            }
+        }
+
+        fn unset(keys: &[&'static str]) -> Self {
+            let guard = ENTRYPOINT_ENV_LOCK
+                .get_or_init(|| StdMutex::new(()))
+                .lock()
+                .expect("env lock poisoned");
+            let values = keys
+                .iter()
+                .map(|key| (*key, std::env::var(key).ok()))
+                .collect::<Vec<_>>();
+            for key in keys {
+                std::env::remove_var(key);
+            }
+            Self {
+                _guard: guard,
+                values,
+            }
+        }
+    }
+
+    impl Drop for EnvRestore {
+        fn drop(&mut self) {
+            for (key, value) in self.values.drain(..) {
+                if let Some(value) = value {
+                    std::env::set_var(key, value);
+                } else {
+                    std::env::remove_var(key);
+                }
+            }
+        }
+    }
 
     /// A tempdir-backed `SharedStore` with a fresh session row (the `events` table
     /// has a FK on `sessions(id)`, so the session must exist before we append).
@@ -3260,6 +3392,32 @@ mod tests {
         ProviderRunConfig::new(ProviderBackend::Fake, "fake-model").with_fake_result("hi from fake")
     }
 
+    #[test]
+    fn fallback_capture_recording_is_opt_in_for_eval_speed() {
+        {
+            let _env = EnvRestore::unset(&[
+                DISABLE_FALLBACK_CAPTURE_GIF_ENV,
+                ENABLE_FALLBACK_CAPTURE_GIF_ENV,
+            ]);
+            assert!(!fallback_capture_recording_enabled());
+        }
+        {
+            let _env = EnvRestore::set(&[(ENABLE_FALLBACK_CAPTURE_GIF_ENV, "1")]);
+            assert!(fallback_capture_recording_enabled());
+        }
+        {
+            let _env = EnvRestore::set(&[
+                (ENABLE_FALLBACK_CAPTURE_GIF_ENV, "1"),
+                (DISABLE_FALLBACK_CAPTURE_GIF_ENV, "1"),
+            ]);
+            assert!(!fallback_capture_recording_enabled());
+        }
+        {
+            let _env = EnvRestore::set(&[(DISABLE_FALLBACK_CAPTURE_GIF_ENV, "false")]);
+            assert!(fallback_capture_recording_enabled());
+        }
+    }
+
     /// Seed a real user turn into the durable log before driving.
     ///
     /// Appends straight through the store lock (the sync `Store::append_event`)
@@ -3351,6 +3509,32 @@ mod tests {
             browser_use_llm::schema::MessageRole::User,
             vec![browser_use_llm::schema::ContentPart::text(text)],
         )
+    }
+
+    fn count_tool_call_ids(messages: &[Message], call_id: &str) -> usize {
+        messages
+            .iter()
+            .flat_map(|message| message.content.iter())
+            .filter(|part| {
+                matches!(
+                    part,
+                    ContentPart::ToolCall { id, .. } if id == call_id
+                )
+            })
+            .count()
+    }
+
+    fn count_tool_result_ids(messages: &[Message], call_id: &str) -> usize {
+        messages
+            .iter()
+            .flat_map(|message| message.content.iter())
+            .filter(|part| {
+                matches!(
+                    part,
+                    ContentPart::ToolResult { tool_call_id, .. } if tool_call_id == call_id
+                )
+            })
+            .count()
     }
 
     fn seed_workspace_context(store: &SharedStore, session_id: &str, content: &str) {
@@ -3725,6 +3909,83 @@ mod tests {
         );
         assert!(!state.has_pending_input().await);
         assert!(!state.token_status().await.token_limit_reached);
+    }
+
+    #[tokio::test]
+    async fn durable_prompt_replay_ignores_duplicate_fusion_tail() {
+        let (_dir, store, session_id) = store_with_session();
+        seed_user_input(&store, &session_id, "use the browser").await;
+        {
+            let store = store.lock().expect("store mutex poisoned");
+            store
+                .append_event(
+                    &session_id,
+                    "model.tool_call",
+                    serde_json::json!({
+                        "id": "call_browser",
+                        "name": "browser_script",
+                        "arguments": { "code": "return document.title" },
+                    }),
+                )
+                .expect("seed durable tool call");
+            store
+                .append_event(
+                    &session_id,
+                    "tool.output",
+                    serde_json::json!({
+                        "tool_call_id": "call_browser",
+                        "name": "browser_script",
+                        "text": "Example Domain",
+                    }),
+                )
+                .expect("seed durable tool output");
+        }
+
+        let recorded = Arc::new(Mutex::new(vec![
+            Message::new(
+                MessageRole::Assistant,
+                vec![ContentPart::ToolCall {
+                    id: "call_browser".to_string(),
+                    name: "browser_script".to_string(),
+                    input: serde_json::json!({ "code": "return document.title" }),
+                    provider_metadata: None,
+                }],
+            ),
+            Message::new(
+                MessageRole::Tool,
+                vec![ContentPart::ToolResult {
+                    tool_call_id: "call_browser".to_string(),
+                    content: vec![ContentPart::text("Example Domain")],
+                    is_error: false,
+                }],
+            ),
+        ]));
+
+        let default_state = LiveTurnState::new(
+            Arc::clone(&store),
+            SessionId(session_id.clone()),
+            Arc::clone(&recorded),
+        );
+        let default_prompt = default_state.clone_history_for_prompt().await;
+        assert_eq!(
+            count_tool_call_ids(&default_prompt, "call_browser"),
+            2,
+            "test fixture should reproduce the old durable+recorder duplication"
+        );
+
+        let durable_state = LiveTurnState::new(Arc::clone(&store), SessionId(session_id), recorded)
+            .with_durable_prompt_replay();
+        let prompt = durable_state.clone_history_for_prompt().await;
+        assert_eq!(
+            count_tool_call_ids(&prompt, "call_browser"),
+            1,
+            "production prompt replay must not duplicate durable tool calls"
+        );
+        assert_eq!(
+            count_tool_result_ids(&prompt, "call_browser"),
+            1,
+            "production prompt replay must not duplicate durable tool outputs"
+        );
     }
 
     #[tokio::test]
@@ -5475,6 +5736,7 @@ mod tests {
                 None,
                 runtime_handle,
                 cancel,
+                None,
             ),
         )
         .await

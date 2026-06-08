@@ -1,3 +1,4 @@
+import json
 from pathlib import Path
 
 from llm_browser_worker import worker
@@ -28,6 +29,28 @@ def test_worker_run_executes_in_persistent_session_namespace(tmp_path: Path) -> 
     assert first["outputs"] == [{"text": "counter=1"}]
     assert second["ok"] is True
     assert second["data"] == 2
+
+
+def test_worker_run_applies_browser_wait_between_actions_env(
+    tmp_path: Path, monkeypatch
+) -> None:
+    sleeps = []
+    monkeypatch.setenv("BU_BROWSER_WAIT_BETWEEN_ACTIONS_MS", "125")
+    monkeypatch.setattr(worker.time, "sleep", lambda seconds: sleeps.append(seconds))
+
+    response = worker._run(
+        {
+            "id": "wait-between",
+            "session_id": "task-wait-between",
+            "cwd": str(tmp_path),
+            "artifact_dir": str(tmp_path / "artifacts"),
+            "code": "result = 'ok'",
+        }
+    )
+
+    assert response["ok"] is True
+    assert response["data"] == "ok"
+    assert sleeps == [0.125]
 
 
 def test_worker_records_artifacts_and_images(tmp_path: Path) -> None:
@@ -237,6 +260,290 @@ def test_worker_raw_cdp_capture_screenshot_attaches_image(
     assert len(response["images"]) == 1
     assert response["images"][0]["label"] == "cdp_screenshot_1"
     assert Path(response["images"][0]["path"]).exists()
+
+
+def test_worker_cdp_applies_browser_user_agent_env(monkeypatch) -> None:
+    calls = []
+    monkeypatch.setenv("BU_BROWSER_USER_AGENT", " BrowserUseRuntime/3.0 ")
+    monkeypatch.setenv("LLM_BROWSER_BROWSER_MODE", "remote-cdp")
+
+    class Helpers:
+        __all__ = ["cdp"]
+
+        def cdp(self, method, session_id=None, **params):
+            calls.append((method, session_id, params))
+            return {"method": method}
+
+    class Admin:
+        def __init__(self) -> None:
+            self.ensure_calls = 0
+
+        def ensure_daemon(self):
+            self.ensure_calls += 1
+
+    helpers = Helpers()
+    admin = Admin()
+    worker._patch_browser_harness_cdp(helpers, admin)
+
+    result = helpers.cdp("Runtime.evaluate", session_id="target-1", expression="navigator.userAgent")
+
+    assert result == {"method": "Runtime.evaluate"}
+    assert admin.ensure_calls == 1
+    assert calls == [
+        ("Network.setUserAgentOverride", "target-1", {"userAgent": "BrowserUseRuntime/3.0"}),
+        ("Runtime.evaluate", "target-1", {"expression": "navigator.userAgent"}),
+    ]
+
+    calls.clear()
+    result = helpers.cdp("Network.setUserAgentOverride", userAgent="Manual/1.0")
+
+    assert result == {"method": "Network.setUserAgentOverride"}
+    assert admin.ensure_calls == 2
+    assert calls == [("Network.setUserAgentOverride", None, {"userAgent": "Manual/1.0"})]
+
+
+def test_worker_cdp_grants_browser_permissions_env(monkeypatch) -> None:
+    calls = []
+    monkeypatch.setenv(
+        "BU_BROWSER_PERMISSIONS",
+        '["clipboardReadWrite","notifications","clipboardReadWrite",3,""]',
+    )
+    monkeypatch.setenv("LLM_BROWSER_BROWSER_MODE", "remote-cdp")
+
+    class Helpers:
+        __all__ = ["cdp"]
+
+        def cdp(self, method, session_id=None, **params):
+            calls.append((method, session_id, params))
+            return {"method": method}
+
+    class Admin:
+        def __init__(self) -> None:
+            self.ensure_calls = 0
+
+        def ensure_daemon(self):
+            self.ensure_calls += 1
+
+    helpers = Helpers()
+    admin = Admin()
+    worker._patch_browser_harness_cdp(helpers, admin)
+
+    result = helpers.cdp("Page.navigate", session_id="target-1", url="https://example.com")
+
+    assert result == {"method": "Page.navigate"}
+    assert admin.ensure_calls == 1
+    assert calls == [
+        (
+            "Browser.grantPermissions",
+            None,
+            {"permissions": ["clipboardReadWrite", "notifications"]},
+        ),
+        ("Page.navigate", "target-1", {"url": "https://example.com"}),
+    ]
+
+    calls.clear()
+    result = helpers.cdp("Browser.grantPermissions", permissions=["geolocation"])
+
+    assert result == {"method": "Browser.grantPermissions"}
+    assert admin.ensure_calls == 2
+    assert calls == [("Browser.grantPermissions", None, {"permissions": ["geolocation"]})]
+
+
+def test_worker_cdp_applies_browser_download_behavior_env(tmp_path: Path, monkeypatch) -> None:
+    calls = []
+    downloads_path = tmp_path / "downloads"
+    monkeypatch.setenv("BU_BROWSER_ACCEPT_DOWNLOADS", "true")
+    monkeypatch.setenv("BU_BROWSER_DOWNLOADS_PATH", str(downloads_path))
+    monkeypatch.setenv("LLM_BROWSER_BROWSER_MODE", "remote-cdp")
+
+    class Helpers:
+        __all__ = ["cdp"]
+
+        def cdp(self, method, session_id=None, **params):
+            calls.append((method, session_id, params))
+            return {"method": method}
+
+    class Admin:
+        def __init__(self) -> None:
+            self.ensure_calls = 0
+
+        def ensure_daemon(self):
+            self.ensure_calls += 1
+
+    helpers = Helpers()
+    admin = Admin()
+    worker._patch_browser_harness_cdp(helpers, admin)
+
+    result = helpers.cdp("Page.navigate", session_id="target-1", url="https://example.com")
+
+    assert result == {"method": "Page.navigate"}
+    assert admin.ensure_calls == 1
+    assert calls == [
+        (
+            "Browser.setDownloadBehavior",
+            None,
+            {
+                "behavior": "allow",
+                "downloadPath": str(downloads_path.resolve()),
+                "eventsEnabled": True,
+            },
+        ),
+        ("Page.navigate", "target-1", {"url": "https://example.com"}),
+    ]
+    assert downloads_path.exists()
+
+    calls.clear()
+    monkeypatch.setenv("BU_BROWSER_ACCEPT_DOWNLOADS", "false")
+    result = helpers.cdp("Runtime.evaluate", expression="1")
+
+    assert result == {"method": "Runtime.evaluate"}
+    assert admin.ensure_calls == 2
+    assert calls == [
+        ("Browser.setDownloadBehavior", None, {"behavior": "deny"}),
+        ("Runtime.evaluate", None, {"expression": "1"}),
+    ]
+
+    calls.clear()
+    result = helpers.cdp("Browser.setDownloadBehavior", behavior="allowAndName")
+
+    assert result == {"method": "Browser.setDownloadBehavior"}
+    assert admin.ensure_calls == 3
+    assert calls == [("Browser.setDownloadBehavior", None, {"behavior": "allowAndName"})]
+
+
+def test_worker_cdp_applies_browser_storage_state_env(monkeypatch) -> None:
+    calls = []
+    cookie = {"name": "sid", "value": "secret", "domain": ".example.com", "path": "/"}
+    monkeypatch.setenv(
+        "BU_BROWSER_STORAGE_STATE",
+        json.dumps(
+            {
+                "cookies": [cookie, {"name": "bad"}],
+                "origins": [
+                    {
+                        "origin": "https://example.com",
+                        "localStorage": [{"name": "theme", "value": "dark"}, {"name": 3}],
+                        "sessionStorage": [{"name": "step", "value": "one"}],
+                    }
+                ],
+            }
+        ),
+    )
+    monkeypatch.setenv("LLM_BROWSER_BROWSER_MODE", "remote-cdp")
+
+    class Helpers:
+        __all__ = ["cdp"]
+
+        def cdp(self, method, session_id=None, **params):
+            calls.append((method, session_id, params))
+            return {"method": method}
+
+    class Admin:
+        def __init__(self) -> None:
+            self.ensure_calls = 0
+
+        def ensure_daemon(self):
+            self.ensure_calls += 1
+
+    helpers = Helpers()
+    admin = Admin()
+    worker._patch_browser_harness_cdp(helpers, admin)
+
+    result = helpers.cdp("Page.navigate", session_id="target-1", url="https://example.com")
+
+    assert result == {"method": "Page.navigate"}
+    assert admin.ensure_calls == 1
+    assert calls[0] == ("Storage.setCookies", "target-1", {"cookies": [cookie]})
+    assert calls[1][0] == "Page.addScriptToEvaluateOnNewDocument"
+    assert calls[1][1] == "target-1"
+    assert calls[1][2]["runImmediately"] is True
+    script = calls[1][2]["source"]
+    assert 'window.location.origin === "https://example.com"' in script
+    assert 'window.localStorage.setItem("theme", "dark");' in script
+    assert 'window.sessionStorage.setItem("step", "one");' in script
+    assert calls[2] == ("Page.navigate", "target-1", {"url": "https://example.com"})
+
+    calls.clear()
+    result = helpers.cdp("Runtime.evaluate", session_id="target-1", expression="1")
+
+    assert result == {"method": "Runtime.evaluate"}
+    assert admin.ensure_calls == 2
+    assert calls == [("Runtime.evaluate", "target-1", {"expression": "1"})]
+
+    calls.clear()
+    result = helpers.cdp("Storage.setCookies", session_id="target-1", cookies=[])
+
+    assert result == {"method": "Storage.setCookies"}
+    assert admin.ensure_calls == 3
+    assert calls == [("Storage.setCookies", "target-1", {"cookies": []})]
+
+
+def test_worker_cdp_enforces_browser_domain_constraints_env(monkeypatch) -> None:
+    calls = []
+    monkeypatch.setenv("LLM_BROWSER_BROWSER_MODE", "remote-cdp")
+    monkeypatch.setenv("BU_BROWSER_ALLOWED_DOMAINS", '["example.com","*.browser-use.com"]')
+
+    class Helpers:
+        __all__ = ["cdp"]
+
+        def cdp(self, method, session_id=None, **params):
+            calls.append((method, session_id, params))
+            return {"method": method}
+
+    class Admin:
+        def __init__(self) -> None:
+            self.ensure_calls = 0
+
+        def ensure_daemon(self):
+            self.ensure_calls += 1
+
+    def expect_blocked(url: str, method: str = "Page.navigate") -> None:
+        try:
+            helpers.cdp(method, session_id="target-1", url=url)
+        except RuntimeError as exc:
+            assert "BrowserProfile domain constraints blocked navigation" in str(exc)
+            assert url in str(exc)
+        else:
+            raise AssertionError(f"navigation should be blocked: {url}")
+
+    helpers = Helpers()
+    admin = Admin()
+    worker._patch_browser_harness_cdp(helpers, admin)
+
+    result = helpers.cdp("Page.navigate", session_id="target-1", url="https://www.example.com/path")
+
+    assert result == {"method": "Page.navigate"}
+    assert calls == [("Page.navigate", "target-1", {"url": "https://www.example.com/path"})]
+
+    expect_blocked("https://iana.org/")
+    expect_blocked("https://example.com.evil.org/")
+
+    assert len(calls) == 1
+
+    monkeypatch.setenv("BU_BROWSER_PROHIBITED_DOMAINS", '["www.example.com"]')
+    expect_blocked("https://www.example.com/path")
+
+    assert len(calls) == 1
+
+    monkeypatch.delenv("BU_BROWSER_ALLOWED_DOMAINS", raising=False)
+    monkeypatch.setenv("BU_BROWSER_PROHIBITED_DOMAINS", '["*.tracking.example"]')
+
+    expect_blocked("https://ads.tracking.example/")
+
+    assert len(calls) == 1
+
+    helpers.cdp("Target.createTarget", url="https://safe.example/")
+    assert calls[-1] == ("Target.createTarget", None, {"url": "https://safe.example/"})
+
+    expect_blocked("https://ads.tracking.example/", method="Target.createTarget")
+
+    monkeypatch.delenv("BU_BROWSER_PROHIBITED_DOMAINS", raising=False)
+    monkeypatch.setenv("BU_BROWSER_BLOCK_IP_ADDRESSES", "true")
+
+    expect_blocked("http://127.0.0.1/")
+
+    assert len(calls) == 2
+    assert admin.ensure_calls == 8
 
 
 def test_worker_page_info_fallback_reads_target_url_and_title(
@@ -534,6 +841,96 @@ def test_visible_managed_browser_prefers_google_chrome(monkeypatch) -> None:
         worker._pick_managed_chrome_path(visible=True)
         == "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
     )
+
+
+def test_managed_browser_profile_env_controls_worker_launch(
+    tmp_path: Path, monkeypatch
+) -> None:
+    monkeypatch.delenv("BU_CDP_URL", raising=False)
+    monkeypatch.delenv("BU_CDP_WS", raising=False)
+    monkeypatch.delenv("BU_BROWSER_ID", raising=False)
+    monkeypatch.setenv("LLM_BROWSER_BROWSER_MODE", "managed_headed")
+    monkeypatch.setenv(
+        "BU_MANAGED_BROWSER_ARGS",
+        '["--proxy-server=http://proxy.example:8080","--user-agent=BrowserUseTest/1.0",3,""]',
+    )
+
+    assert worker._should_start_managed_chrome() is True
+    assert worker._managed_chrome_is_visible() is True
+
+    headed = worker._managed_chrome_args("/chrome", 9335, tmp_path / "profile", True)
+    assert "--new-window" in headed
+    assert "--proxy-server=http://proxy.example:8080" in headed
+    assert "--user-agent=BrowserUseTest/1.0" in headed
+    assert headed.index("--proxy-server=http://proxy.example:8080") < headed.index("about:blank")
+    assert "3" not in headed
+    assert "" not in headed
+
+    monkeypatch.setenv("LLM_BROWSER_BROWSER_MODE", "managed-headless")
+
+    assert worker._should_start_managed_chrome() is True
+    assert worker._managed_chrome_is_visible() is False
+
+    headless = worker._managed_chrome_args("/chrome", 9336, tmp_path / "profile", False)
+    assert "--headless=new" in headless
+    assert "--new-window" not in headless
+    assert "--proxy-server=http://proxy.example:8080" in headless
+
+
+def test_managed_browser_profile_env_uses_configured_user_data_dir(
+    tmp_path: Path, monkeypatch
+) -> None:
+    configured_profile = tmp_path / "configured-profile"
+    monkeypatch.setenv("BU_MANAGED_BROWSER_PROFILE", str(configured_profile))
+
+    profile, is_temporary = worker._managed_chrome_profile_dir()
+
+    assert profile == configured_profile
+    assert is_temporary is False
+    assert configured_profile.exists()
+
+    args = worker._managed_chrome_args("/chrome", 9337, profile, False)
+    assert f"--user-data-dir={configured_profile}" in args
+
+    monkeypatch.setattr(worker, "_managed_chrome", None)
+    monkeypatch.setattr(worker, "_managed_chrome_profile", configured_profile)
+    monkeypatch.setattr(worker, "_managed_chrome_profile_is_temporary", False)
+
+    worker._cleanup_managed_chrome()
+
+    assert configured_profile.exists()
+    assert worker._managed_chrome_profile is None
+    assert worker._managed_chrome_profile_is_temporary is False
+
+
+def test_managed_browser_viewport_env_controls_worker_launch(
+    tmp_path: Path, monkeypatch
+) -> None:
+    monkeypatch.setenv(
+        "BU_BROWSER_VIEWPORT",
+        '{"width":1024,"height":768,"deviceScaleFactor":2,"screenWidth":1440,"screenHeight":900}',
+    )
+    monkeypatch.setenv("BU_BROWSER_NO_VIEWPORT", "false")
+
+    headless = worker._managed_chrome_args("/chrome", 9338, tmp_path / "profile", False)
+
+    assert "--headless=new" in headless
+    assert "--window-size=1024,768" in headless
+    assert "--force-device-scale-factor=2" in headless
+
+    headed = worker._managed_chrome_args("/chrome", 9339, tmp_path / "profile", True)
+
+    assert "--new-window" in headed
+    assert "--window-size=1024,768" in headed
+    assert "--window-size=1512,900" not in headed
+
+    monkeypatch.setenv("BU_BROWSER_NO_VIEWPORT", "true")
+
+    no_viewport = worker._managed_chrome_args("/chrome", 9340, tmp_path / "profile", True)
+
+    assert "--window-size=1024,768" not in no_viewport
+    assert "--force-device-scale-factor=2" not in no_viewport
+    assert "--window-size=1512,900" in no_viewport
 
 
 def test_managed_chrome_args_visible_vs_headless(tmp_path: Path) -> None:

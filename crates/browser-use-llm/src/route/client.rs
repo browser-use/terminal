@@ -563,6 +563,8 @@ struct StreamState {
     ready: VecDeque<Result<LlmEvent, LlmError>>,
     /// Lifecycle phase.
     phase: Phase,
+    /// Optional max idle gap between provider stream chunks.
+    idle_timeout: Option<Duration>,
 }
 
 impl StreamState {
@@ -582,6 +584,34 @@ impl StreamState {
     }
 }
 
+async fn next_byte_chunk(
+    byte_stream: &mut ByteStream,
+    idle_timeout: Option<Duration>,
+) -> Option<Result<bytes::Bytes, LlmError>> {
+    let next = match idle_timeout {
+        Some(timeout) => match tokio::time::timeout(timeout, byte_stream.next()).await {
+            Ok(next) => next,
+            Err(_) => return Some(Err(stream_idle_timeout_error(timeout))),
+        },
+        None => byte_stream.next().await,
+    };
+    next.map(|chunk| chunk.map_err(|e| LlmError::transport(scrub(&e.to_string()))))
+}
+
+fn stream_idle_timeout_error(timeout: Duration) -> LlmError {
+    LlmError::transport(format!(
+        "model stream idle timeout after {}ms",
+        timeout.as_millis()
+    ))
+}
+
+fn model_request_timeout_error(timeout: Duration) -> LlmError {
+    LlmError::transport(format!(
+        "model request timeout after {}ms",
+        timeout.as_millis()
+    ))
+}
+
 // Compile-time guard: the streaming state must stay `Send` so the event stream
 // can cross task/thread boundaries (the public `stream` future is `Send`).
 const _: fn() = || {
@@ -599,12 +629,18 @@ pub struct ModelClient {
     http: reqwest::Client,
     /// Retry/backoff configuration.
     retry: RetryPolicy,
+    /// Optional timeout for opening the provider response stream.
+    request_timeout: Option<Duration>,
+    /// Optional max idle gap between streamed HTTP byte chunks.
+    stream_idle_timeout: Option<Duration>,
 }
 
 impl fmt::Debug for ModelClient {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("ModelClient")
             .field("retry", &self.retry)
+            .field("request_timeout", &self.request_timeout)
+            .field("stream_idle_timeout", &self.stream_idle_timeout)
             .finish_non_exhaustive()
     }
 }
@@ -621,6 +657,8 @@ impl ModelClient {
         Self {
             http: reqwest::Client::new(),
             retry: RetryPolicy::default(),
+            request_timeout: None,
+            stream_idle_timeout: None,
         }
     }
 
@@ -629,17 +667,58 @@ impl ModelClient {
         Self {
             http: reqwest::Client::new(),
             retry,
+            request_timeout: None,
+            stream_idle_timeout: None,
         }
     }
 
     /// Construct a client from an existing `reqwest::Client` and retry policy.
     pub fn from_parts(http: reqwest::Client, retry: RetryPolicy) -> Self {
-        Self { http, retry }
+        Self {
+            http,
+            retry,
+            request_timeout: None,
+            stream_idle_timeout: None,
+        }
     }
 
     /// The retry policy in effect.
     pub fn retry_policy(&self) -> &RetryPolicy {
         &self.retry
+    }
+
+    /// Bound how long a request may wait for the provider response stream to open.
+    pub fn with_request_timeout(mut self, timeout: Duration) -> Self {
+        self.request_timeout = Some(timeout);
+        self
+    }
+
+    /// Disable provider response-open timeout enforcement.
+    pub fn without_request_timeout(mut self) -> Self {
+        self.request_timeout = None;
+        self
+    }
+
+    /// The provider response-open timeout in effect.
+    pub fn request_timeout(&self) -> Option<Duration> {
+        self.request_timeout
+    }
+
+    /// Bound the idle gap between streamed response byte chunks.
+    pub fn with_stream_idle_timeout(mut self, timeout: Duration) -> Self {
+        self.stream_idle_timeout = Some(timeout);
+        self
+    }
+
+    /// Disable stream idle timeout enforcement.
+    pub fn without_stream_idle_timeout(mut self) -> Self {
+        self.stream_idle_timeout = None;
+        self
+    }
+
+    /// The stream idle timeout in effect.
+    pub fn stream_idle_timeout(&self) -> Option<Duration> {
+        self.stream_idle_timeout
     }
 
     /// Build the prepared request body and header list for a route + request.
@@ -704,7 +783,15 @@ impl ModelClient {
         let max = self.retry.max_attempts.max(1);
         let mut last_err: Option<LlmError> = None;
         for attempt in 0..max {
-            match self.send_once(url, headers, body).await {
+            let send_once = self.send_once(url, headers, body);
+            let attempt_result = match self.request_timeout {
+                Some(timeout) => match tokio::time::timeout(timeout, send_once).await {
+                    Ok(result) => result,
+                    Err(_) => Err((model_request_timeout_error(timeout), None)),
+                },
+                None => send_once.await,
+            };
+            match attempt_result {
                 Ok(resp) => return Ok(resp),
                 Err((err, retry_after_ms)) => {
                     let last_attempt = attempt + 1 >= max;
@@ -734,9 +821,8 @@ impl ModelClient {
         req: &LlmRequest,
     ) -> Result<Pin<Box<dyn Stream<Item = Result<LlmEvent, LlmError>> + Send>>, LlmError> {
         let (body, headers) = self.prepare(route, req)?;
-        let resp = self
-            .send_with_retry(&route.endpoint.url(), &headers, &body)
-            .await?;
+        let url = route.endpoint.url();
+        let resp = self.send_with_retry(&url, &headers, &body).await?;
 
         let state = StreamState {
             byte_stream: Box::pin(resp.bytes_stream()),
@@ -744,6 +830,7 @@ impl ModelClient {
             protocol_stream: route.protocol.decoder(),
             ready: VecDeque::new(),
             phase: Phase::Streaming,
+            idle_timeout: self.stream_idle_timeout,
         };
 
         // Drive the byte stream through the same SSE → protocol pipeline as
@@ -754,17 +841,19 @@ impl ModelClient {
                     return Some((ev, st));
                 }
                 match st.phase {
-                    Phase::Streaming => match st.byte_stream.next().await {
-                        Some(Ok(chunk)) => {
-                            let frames = st.sse.push(chunk.as_ref());
-                            st.decode_frames(frames);
+                    Phase::Streaming => {
+                        match next_byte_chunk(&mut st.byte_stream, st.idle_timeout).await {
+                            Some(Ok(chunk)) => {
+                                let frames = st.sse.push(chunk.as_ref());
+                                st.decode_frames(frames);
+                            }
+                            Some(Err(e)) => {
+                                st.phase = Phase::Done;
+                                return Some((Err(e), st));
+                            }
+                            None => st.phase = Phase::Flushing,
                         }
-                        Some(Err(e)) => {
-                            st.phase = Phase::Done;
-                            return Some((Err(LlmError::transport(scrub(&e.to_string()))), st));
-                        }
-                        None => st.phase = Phase::Flushing,
-                    },
+                    }
                     Phase::Flushing => {
                         st.phase = Phase::Done;
                         match st.protocol_stream.finish() {
@@ -810,6 +899,9 @@ fn header_map(headers: &reqwest::header::HeaderMap) -> BTreeMap<String, String> 
 mod tests {
     use super::*;
     use crate::protocols::OpenAiResponsesProtocol;
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+    use std::thread;
 
     // --- decode_chunks: end-to-end OpenAI Responses SSE -----------------
 
@@ -848,6 +940,7 @@ mod tests {
         let usage = Usage {
             input_tokens: 11,
             cached_input_tokens: 0,
+            cache_creation_input_tokens: 0,
             output_tokens: 7,
             reasoning_output_tokens: 0,
             total_tokens: 18,
@@ -1259,6 +1352,173 @@ mod tests {
     }
 
     // --- async path smoke test (no live provider call) ------------------
+
+    fn spawn_idle_sse_server() -> (String, thread::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind local server");
+        let addr = listener.local_addr().expect("local addr");
+        let handle = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept request");
+            let mut request = Vec::new();
+            let mut buf = [0_u8; 1024];
+            loop {
+                let read = stream.read(&mut buf).expect("read request");
+                if read == 0 {
+                    break;
+                }
+                request.extend_from_slice(&buf[..read]);
+                if request.windows(4).any(|window| window == b"\r\n\r\n") {
+                    break;
+                }
+            }
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n\r\n")
+                .expect("write headers");
+            thread::sleep(Duration::from_millis(200));
+        });
+        (format!("http://{addr}/v1"), handle)
+    }
+
+    fn spawn_no_response_server() -> (String, thread::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind local server");
+        let addr = listener.local_addr().expect("local addr");
+        let handle = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept request");
+            let mut request = Vec::new();
+            let mut buf = [0_u8; 1024];
+            loop {
+                let read = stream.read(&mut buf).expect("read request");
+                if read == 0 {
+                    break;
+                }
+                request.extend_from_slice(&buf[..read]);
+                if request.windows(4).any(|window| window == b"\r\n\r\n") {
+                    break;
+                }
+            }
+            thread::sleep(Duration::from_millis(200));
+        });
+        (format!("http://{addr}/v1"), handle)
+    }
+
+    fn spawn_timeout_then_sse_server() -> (String, thread::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind local server");
+        let addr = listener.local_addr().expect("local addr");
+        let handle = thread::spawn(move || {
+            for attempt in 0..2 {
+                let (mut stream, _) = listener.accept().expect("accept request");
+                let mut request = Vec::new();
+                let mut buf = [0_u8; 1024];
+                loop {
+                    let read = stream.read(&mut buf).expect("read request");
+                    if read == 0 {
+                        break;
+                    }
+                    request.extend_from_slice(&buf[..read]);
+                    if request.windows(4).any(|window| window == b"\r\n\r\n") {
+                        break;
+                    }
+                }
+                if attempt == 0 {
+                    thread::spawn(move || {
+                        let _keep_open = stream;
+                        thread::sleep(Duration::from_millis(100));
+                    });
+                } else {
+                    stream
+                        .write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n\r\n")
+                        .expect("write headers");
+                }
+            }
+        });
+        (format!("http://{addr}/v1"), handle)
+    }
+
+    #[tokio::test]
+    async fn stream_open_timeout_yields_retryable_transport_error() {
+        let (base_url, handle) = spawn_no_response_server();
+        let client = ModelClient::with_retry(RetryPolicy {
+            max_attempts: 1,
+            ..RetryPolicy::default()
+        })
+        .with_request_timeout(Duration::from_millis(20));
+        let route = Route::new(
+            Box::new(OpenAiResponsesProtocol::new()),
+            Endpoint::new(base_url, "/responses"),
+            Auth::bearer("sk-not-used"),
+        );
+        let mut req = LlmRequest::new("gpt-5.1-codex", "openai");
+        req.messages.push(crate::schema::Message::user_text("hi"));
+
+        let err = match client.stream(&route, &req).await {
+            Ok(_) => panic!("request-open timeout should fail before stream opens"),
+            Err(err) => err,
+        };
+        handle.join().expect("idle server thread");
+
+        assert_eq!(err.reason, LlmErrorReason::Transport);
+        assert!(err.retryable);
+        assert!(
+            err.message.contains("model request timeout after 20ms"),
+            "{err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn stream_open_timeout_is_per_attempt_not_whole_retry_loop() {
+        let (base_url, handle) = spawn_timeout_then_sse_server();
+        let client = ModelClient::with_retry(RetryPolicy {
+            max_attempts: 2,
+            base_delay: Duration::ZERO,
+            max_delay: Duration::ZERO,
+            jitter_seed: None,
+        })
+        .with_request_timeout(Duration::from_millis(20));
+        let route = Route::new(
+            Box::new(OpenAiResponsesProtocol::new()),
+            Endpoint::new(base_url, "/responses"),
+            Auth::bearer("sk-not-used"),
+        );
+        let mut req = LlmRequest::new("gpt-5.1-codex", "openai");
+        req.messages.push(crate::schema::Message::user_text("hi"));
+
+        let _stream = client
+            .stream(&route, &req)
+            .await
+            .expect("second request-open attempt should succeed");
+        handle.join().expect("server thread");
+    }
+
+    #[tokio::test]
+    async fn stream_idle_timeout_yields_retryable_transport_error() {
+        let (base_url, handle) = spawn_idle_sse_server();
+        let client = ModelClient::with_retry(RetryPolicy {
+            max_attempts: 1,
+            ..RetryPolicy::default()
+        })
+        .with_stream_idle_timeout(Duration::from_millis(20));
+        let route = Route::new(
+            Box::new(OpenAiResponsesProtocol::new()),
+            Endpoint::new(base_url, "/responses"),
+            Auth::bearer("sk-not-used"),
+        );
+        let mut req = LlmRequest::new("gpt-5.1-codex", "openai");
+        req.messages.push(crate::schema::Message::user_text("hi"));
+
+        let mut stream = client.stream(&route, &req).await.expect("open stream");
+        let err = stream
+            .next()
+            .await
+            .expect("idle stream should yield an error")
+            .expect_err("idle stream should fail");
+        handle.join().expect("idle server thread");
+
+        assert_eq!(err.reason, LlmErrorReason::Transport);
+        assert!(err.retryable);
+        assert!(
+            err.message.contains("model stream idle timeout after 20ms"),
+            "{err}"
+        );
+    }
 
     /// Exercises the real async stack — the tokio runtime, `generate`, the
     /// `send_with_retry` → `send_once` path, and transport-error mapping —

@@ -79,7 +79,11 @@ use super::{CompactionMode, SamplingDriver, TurnObserver, TurnState};
 use crate::decision::{self, LoopStep};
 use crate::events::TurnCtx;
 use crate::task::{TurnAbortReason, TurnLifecycleEvent};
+use browser_use_llm::schema::{ContentPart, Message, MessageRole};
 use tokio_util::sync::CancellationToken;
+
+const FINAL_MAX_TURNS_NUDGE: &str = "This is the final allowed step for this run. Stop exploring and call the done tool with the best complete answer you can provide now. Include unknown or unavailable items explicitly instead of continuing to search.";
+const PROGRESS_MAX_TURNS_NUDGE: &str = "Progress checkpoint: If you have enough evidence, a saved artifact, or a complete-enough answer, stop further exploration and call the done tool now. Continue only for clearly missing required information that is likely to change the final answer.";
 
 /// The async, unbounded turn-loop driver. Generic over the three frozen turn
 /// traits so production wires real impls (`ContextManager`+`Session`,
@@ -119,6 +123,33 @@ impl<St: TurnState, Sd: SamplingDriver, Ob: TurnObserver> TurnLoop<St, Sd, Ob> {
         turn_has_fresh_input: bool,
         cancel: CancellationToken,
     ) -> Result<Option<String>, crate::AgentError> {
+        self.run_inner(ctx, turn_has_fresh_input, cancel, None)
+            .await
+    }
+
+    /// Run the driver with an optional sampling-round limit.
+    ///
+    /// Browser Use's Python API exposes this as `Agent.run(max_steps=...)`.
+    /// The default [`run`](Self::run) remains unbounded for Codex parity, while
+    /// terminal/browser-use bridge callers can opt into the cap.
+    pub async fn run_with_max_turns(
+        &self,
+        ctx: TurnCtx,
+        turn_has_fresh_input: bool,
+        cancel: CancellationToken,
+        max_turns: usize,
+    ) -> Result<Option<String>, crate::AgentError> {
+        self.run_inner(ctx, turn_has_fresh_input, cancel, Some(max_turns.max(1)))
+            .await
+    }
+
+    async fn run_inner(
+        &self,
+        ctx: TurnCtx,
+        turn_has_fresh_input: bool,
+        cancel: CancellationToken,
+        max_turns: Option<usize>,
+    ) -> Result<Option<String>, crate::AgentError> {
         let turn_id = ctx.session_id.clone();
         self.observer.on_lifecycle(TurnLifecycleEvent::TurnStarted {
             turn_id: turn_id.clone(),
@@ -128,6 +159,7 @@ impl<St: TurnState, Sd: SamplingDriver, Ob: TurnObserver> TurnLoop<St, Sd, Ob> {
         // drained; with no fresh input we may drain immediately.
         let mut can_drain = decision::initial_can_drain(turn_has_fresh_input);
         let mut last_agent_message: Option<String> = None;
+        let mut turns_run = 0usize;
 
         // Unbounded (`turn.rs:214`): NO max-turns counter. The only exits are
         // Complete, cancellation, or a hard error.
@@ -147,6 +179,18 @@ impl<St: TurnState, Sd: SamplingDriver, Ob: TurnObserver> TurnLoop<St, Sd, Ob> {
             // `ContextManager` history; the loop simply threads it through.
             let mut request = self.state.clone_history_for_prompt().await;
             request.extend(input);
+            let next_turn = turns_run + 1;
+            if max_turns.is_some_and(|limit| next_turn == limit) {
+                request.push(Message::new(
+                    MessageRole::Developer,
+                    vec![ContentPart::text(FINAL_MAX_TURNS_NUDGE)],
+                ));
+            } else if max_turns.is_some_and(|limit| should_emit_progress_nudge(limit, next_turn)) {
+                request.push(Message::new(
+                    MessageRole::Developer,
+                    vec![ContentPart::text(PROGRESS_MAX_TURNS_NUDGE)],
+                ));
+            }
 
             // ---- 2. run one sampling round-trip ----
             let outcome = match self
@@ -166,6 +210,7 @@ impl<St: TurnState, Sd: SamplingDriver, Ob: TurnObserver> TurnLoop<St, Sd, Ob> {
                 }
                 Err(other) => return Err(other),
             };
+            turns_run += 1;
 
             // Carry the latest assistant text forward (codex keeps the last
             // non-empty agent message as the turn result; `turn.rs:340`).
@@ -183,6 +228,23 @@ impl<St: TurnState, Sd: SamplingDriver, Ob: TurnObserver> TurnLoop<St, Sd, Ob> {
 
             // ---- 4. act on the step (codex `turn.rs:250-355`) ----
             match step {
+                LoopStep::Complete => {
+                    // Terminal: no follow-up needed and no compaction. Record the
+                    // final agent message and break (`turn.rs:340-355`).
+                    self.observer
+                        .on_lifecycle(TurnLifecycleEvent::TurnComplete {
+                            turn_id,
+                            last_agent_message: last_agent_message.clone(),
+                        });
+                    return Ok(last_agent_message);
+                }
+                _ if max_turns.is_some_and(|limit| turns_run >= limit) => {
+                    self.observer.on_lifecycle(TurnLifecycleEvent::TurnAborted {
+                        turn_id,
+                        reason: TurnAbortReason::MaxTurns,
+                    });
+                    return Ok(last_agent_message);
+                }
                 LoopStep::CompactThenContinue { can_drain_next } => {
                     // Compact, then continue. The compaction BODY is a stub hook
                     // (real model-based compaction WP pending); the CONTROL FLOW
@@ -197,17 +259,14 @@ impl<St: TurnState, Sd: SamplingDriver, Ob: TurnObserver> TurnLoop<St, Sd, Ob> {
                     // gate is always open (`turn.rs:250-255`).
                     can_drain = true;
                 }
-                LoopStep::Complete => {
-                    // Terminal: no follow-up needed and no compaction. Record the
-                    // final agent message and break (`turn.rs:340-355`).
-                    self.observer
-                        .on_lifecycle(TurnLifecycleEvent::TurnComplete {
-                            turn_id,
-                            last_agent_message: last_agent_message.clone(),
-                        });
-                    return Ok(last_agent_message);
-                }
             }
         }
     }
+}
+
+fn should_emit_progress_nudge(max_turns: usize, next_turn: usize) -> bool {
+    if max_turns < 40 || next_turn >= max_turns {
+        return false;
+    }
+    next_turn >= max_turns / 2 && next_turn % 10 == 0
 }

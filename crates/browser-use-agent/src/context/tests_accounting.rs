@@ -79,6 +79,7 @@ fn from_llm_usage_uses_server_total_when_present() {
     let u = Usage {
         input_tokens: 100,
         cached_input_tokens: 40,
+        cache_creation_input_tokens: 0,
         output_tokens: 30,
         reasoning_output_tokens: 10,
         total_tokens: 123,
@@ -96,6 +97,7 @@ fn from_llm_usage_total_fallback_excludes_cached() {
     let u = Usage {
         input_tokens: 100,
         cached_input_tokens: 40,
+        cache_creation_input_tokens: 0,
         output_tokens: 30,
         reasoning_output_tokens: 10,
         total_tokens: 0,

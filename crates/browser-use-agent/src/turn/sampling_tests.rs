@@ -12,7 +12,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use browser_use_llm::schema::{
-    ContentPart, FinishReason, LlmError, LlmErrorReason, LlmEvent, LlmRequest, Message,
+    CacheHint, ContentPart, FinishReason, LlmError, LlmErrorReason, LlmEvent, LlmRequest, Message,
     MessageRole, TextPhase, Usage,
 };
 use browser_use_protocol::EventRecord;
@@ -219,6 +219,15 @@ fn tool_call(name: &str) -> Result<LlmEvent, LlmError> {
     })
 }
 
+fn tool_call_with_input(name: &str, input: serde_json::Value) -> Result<LlmEvent, LlmError> {
+    Ok(LlmEvent::ToolCall {
+        id: "call-1".to_string(),
+        name: name.to_string(),
+        namespace: None,
+        input,
+    })
+}
+
 fn finish(reason: FinishReason) -> Result<LlmEvent, LlmError> {
     Ok(LlmEvent::Finish {
         usage: Usage {
@@ -320,6 +329,40 @@ async fn finish_accounts_usage_only_when_goal_is_active() {
 }
 
 #[tokio::test]
+async fn repeated_sampling_requests_emit_monotonic_turn_indices() {
+    let (transport, _opens) = ScriptedTransport::new(vec![
+        OpenScript::Stream(vec![finish(FinishReason::Stop)]),
+        OpenScript::Stream(vec![finish(FinishReason::Stop)]),
+    ]);
+    let sink = Arc::new(RecordingSink::default());
+    let d = driver(transport, sink.clone(), 5);
+
+    let _ = d
+        .run_sampling_request(user_input(), CancellationToken::new())
+        .await
+        .expect("first sampling request should succeed");
+    let _ = d
+        .run_sampling_request(user_input(), CancellationToken::new())
+        .await
+        .expect("second sampling request should succeed");
+
+    let events = sink.drain();
+    let turn_request_indices: Vec<i64> = events
+        .iter()
+        .filter(|event| event.event_type == names::MODEL_TURN_REQUEST)
+        .map(|event| event.payload["turn_idx"].as_i64().expect("turn_idx"))
+        .collect();
+    let token_count_indices: Vec<i64> = events
+        .iter()
+        .filter(|event| event.event_type == names::TOKEN_COUNT)
+        .map(|event| event.payload["turn_idx"].as_i64().expect("turn_idx"))
+        .collect();
+
+    assert_eq!(turn_request_indices, vec![0, 1]);
+    assert_eq!(token_count_indices, vec![0, 1]);
+}
+
+#[tokio::test]
 async fn active_goal_context_is_injected_with_codex_envelope() {
     let (transport, seen) =
         RecordingTransport::new(vec![text_delta("ok"), finish(FinishReason::Stop)]);
@@ -343,7 +386,9 @@ async fn active_goal_context_is_injected_with_codex_envelope() {
     assert!(text.starts_with("<goal_context>\n"));
     assert!(text.ends_with("\n</goal_context>"));
     assert!(text.contains("<objective>\nfinish the active goal\n</objective>"));
-    assert_eq!(req.messages[1], user_input()[0]);
+    let mut expected_user = user_input()[0].clone();
+    expected_user.cache = Some(CacheHint::Ephemeral);
+    assert_eq!(req.messages[1], expected_user);
 }
 
 // ---- (2) text-only stream -> no follow_up ---------------------------------
@@ -585,9 +630,11 @@ async fn driver_passes_populated_per_call_request_to_open_stream() {
     );
     // And it must be EXACTLY the input the driver was asked to sample, with the
     // turn's model/provider identity from `ctx()`.
+    let mut expected_messages = input.clone();
+    expected_messages.last_mut().unwrap().cache = Some(CacheHint::Ephemeral);
     assert_eq!(
-        req.messages, input,
-        "open_stream must receive the driver's per-call input messages verbatim"
+        req.messages, expected_messages,
+        "open_stream must receive the driver's per-call input messages with the current-state cache hint"
     );
     // `req.model`/`req.provider` are the `ModelId`/`ProviderId` newtypes; compare
     // against the same `.into()` conversion `LlmRequest::new` applies to `ctx()`.
@@ -601,6 +648,251 @@ async fn driver_passes_populated_per_call_request_to_open_stream() {
         ctx().provider.into(),
         "request carries the turn's provider"
     );
+    assert_eq!(
+        req.system.first().and_then(|part| part.cache),
+        Some(CacheHint::Ephemeral),
+        "stable base system prompt should be cacheable for providers that support prompt caching"
+    );
+    assert_eq!(
+        req.messages.last().and_then(|message| message.cache),
+        Some(CacheHint::Ephemeral),
+        "latest browser-state message should be cacheable like the Python Anthropic serializer"
+    );
+}
+
+#[tokio::test]
+async fn open_stream_marks_an_earlier_cache_breakpoint_for_long_histories() {
+    let (transport, seen) =
+        RecordingTransport::new(vec![text_delta("ok"), finish(FinishReason::Stop)]);
+    let sink: Arc<dyn EventSink> = Arc::new(RecordingSink::default());
+    let d = ModelSamplingDriver::new(transport, sink, ctx(), 5).without_jitter();
+
+    let input: Vec<Message> = (0..25)
+        .map(|index| {
+            Message::new(
+                MessageRole::User,
+                vec![ContentPart::text(format!("browser state {index}"))],
+            )
+        })
+        .collect();
+    let _ = d
+        .run_sampling_request(input, CancellationToken::new())
+        .await
+        .expect("sampling should succeed");
+
+    let captured = seen.lock().unwrap();
+    let req = &captured[0];
+    let cache_indices: Vec<usize> = req
+        .messages
+        .iter()
+        .enumerate()
+        .filter_map(|(index, message)| {
+            (message.cache == Some(CacheHint::Ephemeral)).then_some(index)
+        })
+        .collect();
+
+    assert_eq!(
+        cache_indices,
+        vec![8, 24],
+        "long browser histories should keep the latest message cacheable and add one earlier breakpoint inside Anthropic's lookback window"
+    );
+}
+
+#[tokio::test]
+async fn open_stream_cache_breakpoints_account_for_browser_mode_system_message() {
+    let (transport, seen) =
+        RecordingTransport::new(vec![text_delta("ok"), finish(FinishReason::Stop)]);
+    let sink: Arc<dyn EventSink> = Arc::new(RecordingSink::default());
+    let mut turn_ctx = ctx();
+    turn_ctx.browser_mode_instruction = Some("Browser mode: cloud".to_string());
+    let d = ModelSamplingDriver::new(transport, sink, turn_ctx, 5).without_jitter();
+
+    let input: Vec<Message> = (0..25)
+        .map(|index| {
+            Message::new(
+                MessageRole::User,
+                vec![ContentPart::text(format!("browser state {index}"))],
+            )
+        })
+        .collect();
+    let _ = d
+        .run_sampling_request(input, CancellationToken::new())
+        .await
+        .expect("sampling should succeed");
+
+    let captured = seen.lock().unwrap();
+    let req = &captured[0];
+    assert_eq!(req.messages[0].role, MessageRole::System);
+    let cache_indices: Vec<usize> = req
+        .messages
+        .iter()
+        .enumerate()
+        .filter_map(|(index, message)| {
+            (message.cache == Some(CacheHint::Ephemeral)).then_some(index)
+        })
+        .collect();
+
+    assert_eq!(
+        cache_indices,
+        vec![9, 25],
+        "cache hints should be computed after browser-mode system insertion, not shifted onto stale indices"
+    );
+}
+
+#[tokio::test]
+async fn turn_request_event_omits_full_llm_input_by_default() {
+    let (transport, _opens) =
+        ScriptedTransport::new(vec![OpenScript::Stream(vec![finish(FinishReason::Stop)])]);
+    let sink = Arc::new(RecordingSink::default());
+    let d = driver(transport, sink.clone(), 5);
+
+    let _ = d
+        .run_sampling_request(
+            vec![Message::new(
+                MessageRole::User,
+                vec![
+                    ContentPart::text("Find the account page."),
+                    ContentPart::Media {
+                        mime_type: "image/png".to_string(),
+                        data: Some("iVBORw0KGgoAAAANSUhEUgAAAAEAAAAB".to_string()),
+                        url: None,
+                        detail: Some("low".to_string()),
+                    },
+                ],
+            )],
+            CancellationToken::new(),
+        )
+        .await
+        .expect("sampling should succeed");
+
+    let events = sink.drain();
+    let request = events
+        .iter()
+        .find(|event| event.event_type == names::MODEL_TURN_REQUEST)
+        .expect("turn request event emitted");
+    let llm_input = &request.payload["llm_input"];
+    assert_eq!(llm_input["message_count"], serde_json::json!(1));
+    assert_eq!(llm_input["omitted_earlier_messages"], serde_json::json!(1));
+    assert_eq!(llm_input["full_input_omitted"], serde_json::json!(true));
+    assert_eq!(llm_input["truncated"], serde_json::json!(true));
+    assert!(llm_input.get("messages").is_none());
+    assert!(llm_input.get("system").is_none());
+    assert!(llm_input.get("tools").is_none());
+    let serialized = serde_json::to_string(llm_input).expect("llm_input serializes");
+    assert!(!serialized.contains("iVBORw0KGgoAAAANSUhEUgAAAAEAAAAB"));
+}
+
+#[tokio::test]
+async fn turn_request_event_carries_full_llm_input_messages() {
+    let (transport, _opens) =
+        ScriptedTransport::new(vec![OpenScript::Stream(vec![finish(FinishReason::Stop)])]);
+    let sink = Arc::new(RecordingSink::default());
+    let d = driver(transport, sink.clone(), 5).with_full_llm_input_events(true);
+
+    let input = vec![
+        Message::new(
+            MessageRole::User,
+            vec![
+                ContentPart::text("Find the account page."),
+                ContentPart::Media {
+                    mime_type: "image/png".to_string(),
+                    data: Some("iVBORw0KGgoAAAANSUhEUgAAAAEAAAAB".to_string()),
+                    url: None,
+                    detail: Some("low".to_string()),
+                },
+            ],
+        ),
+        Message::new(
+            MessageRole::Assistant,
+            vec![ContentPart::ToolCall {
+                id: "call-1".to_string(),
+                name: "browser_script".to_string(),
+                input: serde_json::json!({
+                    "code": "goto_url('https://example.com')",
+                    "api_key": "secret-value",
+                }),
+                provider_metadata: None,
+            }],
+        ),
+    ];
+
+    let _ = d
+        .run_sampling_request(input, CancellationToken::new())
+        .await
+        .expect("sampling should succeed");
+
+    let events = sink.drain();
+    let request = events
+        .iter()
+        .find(|event| event.event_type == names::MODEL_TURN_REQUEST)
+        .expect("turn request event emitted");
+    let llm_input = &request.payload["llm_input"];
+    assert_eq!(llm_input["message_count"], serde_json::json!(2));
+    assert_eq!(llm_input["omitted_earlier_messages"], serde_json::json!(0));
+    assert_eq!(
+        llm_input["messages"][0]["content"][0]["text"],
+        serde_json::json!("Find the account page.")
+    );
+    assert_eq!(
+        llm_input["messages"][0]["content"][1]["data"],
+        serde_json::json!("iVBORw0KGgoAAAANSUhEUgAAAAEAAAAB")
+    );
+    assert_eq!(
+        llm_input["messages"][1]["content"][0]["input"]["api_key"],
+        serde_json::json!("[redacted]")
+    );
+    assert_eq!(llm_input["truncated"], serde_json::json!(false));
+    assert!(!llm_input["system"][0]["text"]
+        .as_str()
+        .unwrap_or_default()
+        .is_empty());
+}
+
+#[tokio::test]
+async fn turn_request_event_carries_all_observability_messages_without_text_budget() {
+    let (transport, _opens) =
+        ScriptedTransport::new(vec![OpenScript::Stream(vec![finish(FinishReason::Stop)])]);
+    let sink = Arc::new(RecordingSink::default());
+    let d = driver(transport, sink.clone(), 5).with_full_llm_input_events(true);
+
+    let long_text = "observe-this-text".repeat(6_000);
+    let mut input: Vec<Message> = (0..85)
+        .map(|index| {
+            Message::new(
+                MessageRole::User,
+                vec![ContentPart::text(format!("msg-{index}"))],
+            )
+        })
+        .collect();
+    input.push(Message::new(
+        MessageRole::User,
+        vec![ContentPart::text(long_text.clone())],
+    ));
+
+    let _ = d
+        .run_sampling_request(input, CancellationToken::new())
+        .await
+        .expect("sampling should succeed");
+
+    let events = sink.drain();
+    let request = events
+        .iter()
+        .find(|event| event.event_type == names::MODEL_TURN_REQUEST)
+        .expect("turn request event emitted");
+    let llm_input = &request.payload["llm_input"];
+    let messages = llm_input["messages"].as_array().expect("messages array");
+    assert_eq!(llm_input["message_count"], serde_json::json!(86));
+    assert_eq!(llm_input["omitted_earlier_messages"], serde_json::json!(0));
+    assert_eq!(messages.len(), 86);
+    assert_eq!(
+        messages[85]["content"][0]["text"],
+        serde_json::json!(long_text)
+    );
+    assert_eq!(llm_input["truncated"], serde_json::json!(false));
+
+    let serialized = serde_json::to_string(llm_input).expect("llm_input serializes");
+    assert!(!serialized.contains("request observability text budget exhausted"));
+    assert!(!serialized.contains("...[truncated]"));
 }
 
 #[tokio::test]
@@ -630,7 +922,9 @@ async fn driver_prepends_selected_browser_mode_instruction_to_messages() {
         "mode instruction message was not prepended: {:?}",
         req.messages[0]
     );
-    assert_eq!(&req.messages[1..], input.as_slice());
+    let mut expected_input = input.clone();
+    expected_input.last_mut().unwrap().cache = Some(CacheHint::Ephemeral);
+    assert_eq!(&req.messages[1..], expected_input.as_slice());
 }
 
 // ---- (6) each turn installs its OWN request (the cell is per-call) ----------
@@ -658,9 +952,11 @@ async fn each_open_sees_its_own_per_call_request() {
             !req.messages.is_empty(),
             "open #{i} received an EMPTY request"
         );
+        let mut expected_input = input.clone();
+        expected_input.last_mut().unwrap().cache = Some(CacheHint::Ephemeral);
         assert_eq!(
-            req.messages, input,
-            "open #{i} must carry the per-call input verbatim"
+            req.messages, expected_input,
+            "open #{i} must carry the per-call input plus provider cache hint"
         );
     }
 }
@@ -751,7 +1047,7 @@ impl crate::turn::sampling::FusionRecorder for NoopRecorder {
 fn tool_def(name: &str) -> browser_use_llm::schema::ToolDefinition {
     browser_use_llm::schema::ToolDefinition {
         name: name.to_string(),
-        description: String::new(),
+        description: format!("{name} model-visible tool description"),
         input_schema: serde_json::json!({"type": "object"}),
         output_schema: None,
         namespace: None,
@@ -789,11 +1085,13 @@ async fn fused_driver_advertises_dispatcher_tool_specs_on_request() {
     // about the request the driver built.
     let (transport, seen) =
         RecordingTransport::new(vec![text_delta("ok"), finish(FinishReason::Stop)]);
-    let sink: Arc<dyn EventSink> = Arc::new(RecordingSink::default());
+    let sink = Arc::new(RecordingSink::default());
+    let sink_for_driver: Arc<dyn EventSink> = sink.clone();
     let recorder: Arc<dyn FusionRecorder> = Arc::new(NoopRecorder);
-    let d = ModelSamplingDriver::new(transport, sink, ctx(), 5)
+    let d = ModelSamplingDriver::new(transport, sink_for_driver, ctx(), 5)
         .without_jitter()
-        .with_fusion(dispatcher, recorder);
+        .with_fusion(dispatcher, recorder)
+        .with_full_llm_input_events(true);
 
     let _ = d
         .run_sampling_request(user_input(), CancellationToken::new())
@@ -813,11 +1111,115 @@ async fn fused_driver_advertises_dispatcher_tool_specs_on_request() {
         !req.tools.is_empty(),
         "fused driver must advertise the dispatcher's tool specs — req.tools is EMPTY"
     );
-    let names: Vec<&str> = req.tools.iter().map(|t| t.name.as_str()).collect();
+    let tool_names: Vec<&str> = req.tools.iter().map(|t| t.name.as_str()).collect();
     assert_eq!(
-        names,
+        tool_names,
         vec!["browser", "python", "shell"],
         "req.tools must carry the registered tool names, in the registry's order"
+    );
+
+    let events = sink.drain();
+    let request = events
+        .iter()
+        .find(|event| event.event_type == names::MODEL_TURN_REQUEST)
+        .expect("turn request event emitted");
+    let llm_tools = request.payload["llm_input"]["tools"]
+        .as_array()
+        .expect("llm_input tools array");
+    assert_eq!(
+        request.payload["llm_input"]["tools_count"],
+        serde_json::json!(3)
+    );
+    assert_eq!(llm_tools[0]["name"], serde_json::json!("browser"));
+    assert_eq!(
+        llm_tools[0]["description"],
+        serde_json::json!("browser model-visible tool description")
+    );
+    assert_eq!(
+        llm_tools[0]["input_schema"],
+        serde_json::json!({"type": "object"})
+    );
+}
+
+#[tokio::test]
+async fn fused_browser_script_dispatch_emits_runtime_tool_output_event() {
+    use crate::turn::dispatch::ToolDispatcher;
+    use crate::turn::sampling::FusionRecorder;
+
+    let dispatcher = Arc::new(ToolDispatcher::with_runner_and_specs(
+        NoopRunner,
+        /* model_supports */ true,
+        vec![tool_def("browser_script")],
+    ));
+    let (transport, _seen) = RecordingTransport::new(vec![
+        tool_call("browser_script"),
+        finish(FinishReason::Stop),
+    ]);
+    let sink = Arc::new(RecordingSink::default());
+    let sink_for_driver: Arc<dyn EventSink> = sink.clone();
+    let recorder: Arc<dyn FusionRecorder> = Arc::new(NoopRecorder);
+    let driver = ModelSamplingDriver::new(transport, sink_for_driver, ctx(), 5)
+        .without_jitter()
+        .with_fusion(dispatcher, recorder);
+
+    let outcome = driver
+        .run_sampling_request(user_input(), CancellationToken::new())
+        .await
+        .expect("sampling should succeed");
+
+    assert!(outcome.model_needs_follow_up);
+    let events = sink.drain();
+    let output = events
+        .iter()
+        .find(|event| event.event_type == names::TOOL_OUTPUT)
+        .expect("browser_script dispatch must emit a runtime tool.output event");
+    assert_eq!(output.payload["name"], "browser_script");
+    assert_eq!(output.payload["tool_call_id"], "call-1");
+    assert_eq!(output.payload["text"], "noop");
+}
+
+#[tokio::test]
+async fn fused_done_result_becomes_final_message_without_follow_up() {
+    use crate::turn::dispatch::ToolDispatcher;
+    use crate::turn::sampling::FusionRecorder;
+
+    let specs = vec![tool_def("done")];
+    let dispatcher = Arc::new(ToolDispatcher::with_runner_and_specs(
+        NoopRunner, /* model_supports */ true, specs,
+    ));
+    let (transport, _opens) = ScriptedTransport::new(vec![OpenScript::Stream(vec![
+        tool_call_with_input(
+            "done",
+            serde_json::json!({
+                "result": "full table answer",
+                "text": "legacy summary"
+            }),
+        ),
+        finish(FinishReason::ToolUse),
+    ])]);
+    let sink: Arc<dyn EventSink> = Arc::new(RecordingSink::default());
+    let recorder: Arc<dyn FusionRecorder> = Arc::new(NoopRecorder);
+    let d = ModelSamplingDriver::new(transport, sink, ctx(), 5)
+        .without_jitter()
+        .with_fusion(dispatcher, recorder);
+
+    let out = d
+        .run_sampling_request(user_input(), CancellationToken::new())
+        .await
+        .expect("sampling should succeed");
+
+    assert!(
+        !out.model_needs_follow_up,
+        "done must terminate the fused turn instead of requesting another sample"
+    );
+    assert_eq!(
+        out.last_agent_message.as_deref(),
+        Some("full table answer"),
+        "canonical done.result must be surfaced over the legacy text alias"
+    );
+    assert!(
+        out.defers_mailbox_delivery_to_next_turn,
+        "terminal done output is the final-answer boundary"
     );
 }
 

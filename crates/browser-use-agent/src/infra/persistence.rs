@@ -267,6 +267,9 @@ pub fn record_browser_command_response_events(
 /// Mirrors `browser-use-core::persistence::browser_script_transcript_text`
 /// (`crates/browser-use-core/src/persistence.rs:118`).
 fn browser_script_transcript_text(response: &BrowserScriptOutput) -> String {
+    if response.status.as_deref() == Some("running") {
+        return browser_script_running_transcript_text(response);
+    }
     if response.text.trim().is_empty() {
         return String::new();
     }
@@ -278,6 +281,37 @@ fn browser_script_transcript_text(response: &BrowserScriptOutput) -> String {
         .filter(|line| !is_browser_script_transport_line(line))
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+fn browser_script_running_transcript_text(response: &BrowserScriptOutput) -> String {
+    let mut lines = response
+        .text
+        .lines()
+        .map(str::trim_end)
+        .filter(|line| !line.trim().is_empty())
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+    if lines.is_empty() {
+        lines.push("browser_script is still running.".to_string());
+    }
+    if let Some(run_id) = response.run_id.as_deref() {
+        if !lines
+            .iter()
+            .any(|line| line.trim_start().starts_with("run_id:"))
+        {
+            lines.push(format!("run_id: {run_id}"));
+        }
+        if !lines.iter().any(|line| {
+            let line = line.trim_start();
+            line.starts_with("Next:") || line.starts_with("Next step:")
+        }) {
+            lines.push(format!(
+				"Next step: call browser_script with action=\"observe\", run_id=\"{run_id}\", and observe_timeout_ms={}.",
+				response.next_observe_ms.unwrap_or(30_000)
+			));
+        }
+    }
+    lines.join("\n")
 }
 
 /// Whether a transcript line is a transport/progress marker to be dropped.
@@ -685,6 +719,23 @@ mod tests {
                 .to_string();
         let cleaned = browser_script_transcript_text(&response);
         assert_eq!(cleaned, "real line");
+    }
+
+    #[test]
+    fn running_browser_script_preserves_observe_instruction() {
+        let mut response = BrowserScriptOutput::default();
+        response.ok = true;
+        response.status = Some("running".to_string());
+        response.run_id = Some("bs-123".to_string());
+        response.next_observe_ms = Some(7_000);
+        response.text = "browser_script is still running.".to_string();
+
+        let text = browser_script_transcript_text(&response);
+
+        assert!(text.contains("browser_script is still running."));
+        assert!(text.contains("run_id: bs-123"));
+        assert!(text.contains("action=\"observe\""));
+        assert!(text.contains("observe_timeout_ms=7000"));
     }
 
     #[test]

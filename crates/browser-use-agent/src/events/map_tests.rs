@@ -108,6 +108,7 @@ fn finish_maps_to_token_count_from_usage() {
     let usage = Usage {
         input_tokens: 100,
         cached_input_tokens: 10,
+        cache_creation_input_tokens: 0,
         output_tokens: 20,
         reasoning_output_tokens: 5,
         total_tokens: 125,
@@ -206,6 +207,7 @@ fn usage_total_zero_falls_back_to_computed_total() {
     let u = Usage {
         input_tokens: 100,
         cached_input_tokens: 40,
+        cache_creation_input_tokens: 0,
         output_tokens: 20,
         reasoning_output_tokens: 5,
         total_tokens: 0, // provider didn't report an inclusive total
@@ -230,6 +232,7 @@ fn usage_total_nonzero_is_preserved() {
     let u = Usage {
         input_tokens: 100,
         cached_input_tokens: 40,
+        cache_creation_input_tokens: 12,
         output_tokens: 20,
         reasoning_output_tokens: 5,
         total_tokens: 250, // explicit total wins over computed_total
@@ -240,8 +243,8 @@ fn usage_total_nonzero_is_preserved() {
     assert_eq!(mu.input_cached_tokens, Some(40));
     assert_eq!(mu.output_tokens, Some(20));
     assert_eq!(mu.reasoning_output_tokens, Some(5));
-    // Cost / cache-creation fields are unknown at this layer.
-    assert_eq!(mu.input_cache_creation_tokens, None);
+    assert_eq!(mu.input_cache_creation_tokens, Some(12));
+    // Cost fields are unknown at this layer.
     assert_eq!(mu.cost_usd, None);
     assert_eq!(mu.cost_source, None);
 }

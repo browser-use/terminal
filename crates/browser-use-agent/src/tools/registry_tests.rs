@@ -603,7 +603,6 @@ fn parallel_safe_flags_match_registration() {
     assert_eq!(reg.parallel_safe("tool_search"), Some(true));
     assert_eq!(reg.parallel_safe("web_search"), Some(true));
     assert_eq!(reg.parallel_safe("search"), Some(SEARCH_PARALLEL_SAFE));
-    assert!(!SEARCH_PARALLEL_SAFE);
     // Everything else is serial.
     for name in [
         "shell",
@@ -1046,6 +1045,16 @@ fn definitions_carry_required_fields_and_names() {
 }
 
 #[test]
+fn done_definition_preserves_timebox_partial_result_guidance() {
+    let done = definitions::done();
+    assert!(done.description.contains("best verified partial result"));
+    assert!(done.description.contains("external cancellation"));
+    assert!(done
+        .description
+        .contains("unknown, unavailable, or incomplete fields"));
+}
+
+#[test]
 fn subagent_v2_definitions_match_codex_output_schema_surface() {
     let spawn = definitions::spawn_agent();
     assert_eq!(
@@ -1175,7 +1184,7 @@ async fn done_dispatches_through_the_registry() {
     let out = reg
         .dispatch(
             "done",
-            &serde_json::json!({ "text": "task finished" }),
+            &serde_json::json!({ "result": "task finished" }),
             &ctx("done"),
             &env(),
             AskForApproval::Never,
@@ -1193,4 +1202,14 @@ async fn done_dispatches_through_the_registry() {
     );
     // done is serial (terminal).
     assert_eq!(reg.parallel_safe("done"), Some(false));
+
+    let done_def = reg
+        .model_visible_definitions()
+        .into_iter()
+        .find(|definition| definition.name == "done")
+        .expect("done definition");
+    let properties = &done_def.input_schema["properties"];
+    assert!(properties.get("result").is_some());
+    assert!(properties.get("text").is_some());
+    assert!(properties.get("result_file").is_some());
 }

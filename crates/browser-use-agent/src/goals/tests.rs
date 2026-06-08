@@ -56,6 +56,7 @@ fn usage(input: u64, cached: u64, output: u64) -> Usage {
     Usage {
         input_tokens: input,
         cached_input_tokens: cached,
+        cache_creation_input_tokens: 0,
         output_tokens: output,
         reasoning_output_tokens: 0,
         total_tokens: 0,

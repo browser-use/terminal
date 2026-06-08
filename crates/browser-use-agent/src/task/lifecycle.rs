@@ -18,6 +18,8 @@ pub enum TurnAbortReason {
     Interrupted,
     /// A new task replaced the active one (`spawn_task`); no history marker.
     Replaced,
+    /// The active turn stopped because an internal max-turn budget was exhausted.
+    MaxTurns,
     /// The active turn was torn down because of an error.
     Error,
 }

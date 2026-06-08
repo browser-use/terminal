@@ -447,6 +447,34 @@ pub struct BrowserConfig {
     pub headless: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub profile_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub profile: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub proxy_country_code: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cdp_url: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cdp_headers: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub user_agent: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub viewport: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub storage_state: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub downloads_path: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub allowed_domains: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub blocked_domains: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub window_size: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub state_dir: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub no_viewport: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub accept_downloads: Option<bool>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -6586,6 +6614,7 @@ mod tests {
             keep_alive: true,
             headless: Some(true),
             profile_id: Some("default".to_string()),
+            ..BrowserConfig::default()
         });
         let agent_a = AgentId::from_string("agent-a")?;
         let agent_b = AgentId::from_string("agent-b")?;
@@ -6740,6 +6769,7 @@ mod tests {
             keep_alive: true,
             headless: Some(true),
             profile_id: Some("sdk".to_string()),
+            ..BrowserConfig::default()
         });
 
         let lease = handle.claim_browser(&browser_id, root.agent_id().clone())?;
@@ -9075,6 +9105,7 @@ mod tests {
             keep_alive: true,
             headless: Some(true),
             profile_id: Some("test-profile".to_string()),
+            ..BrowserConfig::default()
         });
         let created = subscription.recv().await?;
         let created_snapshot = created.snapshot.as_ref().expect("created snapshot");

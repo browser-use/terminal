@@ -107,6 +107,7 @@ mod tests {
                 usage: Usage {
                     input_tokens: 10,
                     cached_input_tokens: 4,
+                    cache_creation_input_tokens: 0,
                     output_tokens: 6,
                     reasoning_output_tokens: 2,
                     total_tokens: 18,
@@ -125,6 +126,7 @@ mod tests {
         let u = Usage {
             input_tokens: 100,
             cached_input_tokens: 40,
+            cache_creation_input_tokens: 0,
             output_tokens: 20,
             reasoning_output_tokens: 5,
             total_tokens: 0,

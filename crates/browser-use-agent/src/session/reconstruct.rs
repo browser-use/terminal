@@ -613,9 +613,11 @@ pub fn provider_messages_from_event_slice(
                     &mut assistant_tool_calls,
                 );
                 if let Some(call_id) = event.payload.get("tool_call_id").and_then(Value::as_str) {
-                    messages.push(tool_message_from_output_event(&event.payload, call_id));
-                    emitted_tool_messages.insert(call_id.to_string());
-                    turn_open = true;
+                    if !emitted_tool_messages.contains(call_id) {
+                        messages.push(tool_message_from_output_event(&event.payload, call_id));
+                        emitted_tool_messages.insert(call_id.to_string());
+                        turn_open = true;
+                    }
                 }
             }
             "tool.failed" => {
@@ -1154,15 +1156,22 @@ fn response_input_item_output_content(item: &Value) -> Value {
 fn value_to_tool_output_text(value: &Value) -> String {
     match value {
         Value::String(text) => text.clone(),
-        Value::Array(parts) => parts
-            .iter()
-            .filter_map(|part| {
-                part.get("text")
-                    .and_then(Value::as_str)
-                    .map(ToOwned::to_owned)
-            })
-            .collect::<Vec<_>>()
-            .join(""),
+        Value::Array(parts) => {
+            let text = parts
+                .iter()
+                .filter_map(|part| {
+                    part.get("text")
+                        .and_then(Value::as_str)
+                        .map(ToOwned::to_owned)
+                })
+                .collect::<Vec<_>>()
+                .join("");
+            if text.trim().is_empty() {
+                value.to_string()
+            } else {
+                text
+            }
+        }
         Value::Null => String::new(),
         other => other.to_string(),
     }
@@ -1473,15 +1482,58 @@ fn tool_output_event_content(payload: &Value) -> Value {
 
 fn tool_output_event_text(payload: &Value) -> String {
     if let Some(text) = payload.get("text").and_then(Value::as_str) {
-        return text.to_string();
+        if !text.trim().is_empty() {
+            return text.to_string();
+        }
     }
     if let Some(output) = payload.get("output") {
-        return value_to_tool_output_text(output);
+        let text = value_to_tool_output_text(output);
+        if !text.trim().is_empty() {
+            return text;
+        }
     }
     if let Some(content) = payload.get("content") {
-        return value_to_tool_output_text(content);
+        let text = value_to_tool_output_text(content);
+        if !text.trim().is_empty() {
+            return text;
+        }
     }
-    String::new()
+    if let Some(text) = browser_script_running_tool_text(payload) {
+        return text;
+    }
+    let mut parts = Vec::new();
+    for key in ["summary", "data", "outputs"] {
+        let Some(value) = payload.get(key) else {
+            continue;
+        };
+        if value.is_null() || value == &serde_json::json!({}) || value == &serde_json::json!([]) {
+            continue;
+        }
+        parts.push(format!("{key}: {}", value_to_tool_output_text(value)));
+    }
+    parts.join("\n")
+}
+
+fn browser_script_running_tool_text(payload: &Value) -> Option<String> {
+    let name = payload.get("name").and_then(Value::as_str)?;
+    if name != "browser_script" {
+        return None;
+    }
+    if payload.get("status").and_then(Value::as_str) != Some("running") {
+        return None;
+    }
+    let mut parts = vec!["browser_script is still running.".to_string()];
+    if let Some(run_id) = payload.get("run_id").and_then(Value::as_str) {
+        parts.push(format!("run_id: {run_id}"));
+        let observe_ms = payload
+            .get("next_observe_ms")
+            .and_then(Value::as_u64)
+            .unwrap_or(1_000);
+        parts.push(format!(
+            "Next step: call browser_script with action=\"observe\", run_id=\"{run_id}\", and observe_timeout_ms={observe_ms}."
+        ));
+    }
+    Some(parts.join("\n"))
 }
 
 fn synthetic_tool_result_text(name: &str) -> String {

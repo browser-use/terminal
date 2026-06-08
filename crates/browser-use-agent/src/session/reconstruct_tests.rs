@@ -141,6 +141,153 @@ fn turn_with_tool_call_and_output() {
 }
 
 #[test]
+fn tool_output_event_uses_structured_browser_script_fallback_text() {
+    let events = vec![
+        event(1, "session.input", json!({ "text": "open page" })),
+        event(
+            2,
+            "model.tool_call",
+            json!({
+                "id": "call_browser",
+                "name": "browser_script",
+                "arguments": { "code": "emit_output(page_info(), label='page_info')" }
+            }),
+        ),
+        event(
+            3,
+            "tool.output",
+            json!({
+                "tool_call_id": "call_browser",
+                "name": "browser_script",
+                "text": "",
+                "summary": [{
+                    "kind": "page",
+                    "output_label": "page_info",
+                    "title": "Example Domain",
+                    "url": "https://example.com"
+                }],
+                "outputs": [{
+                    "label": "page_info",
+                    "value": {
+                        "title": "Example Domain",
+                        "url": "https://example.com"
+                    }
+                }]
+            }),
+        ),
+        event(4, "session.done", json!({})),
+    ];
+
+    let messages = provider_messages_from_events(&events);
+    assert_eq!(messages.len(), 3, "messages: {messages:#?}");
+    let tool = &messages[2];
+    assert_eq!(tool.get("role").and_then(Value::as_str), Some("tool"));
+    let content = tool
+        .get("content")
+        .and_then(Value::as_str)
+        .expect("structured fallback content");
+    assert!(content.contains("summary:"));
+    assert!(content.contains("outputs:"));
+    assert!(content.contains("Example Domain"));
+    assert!(!content.trim().is_empty());
+}
+
+#[test]
+fn duplicate_tool_output_keeps_first_browser_script_result() {
+    let events = vec![
+        event(1, "session.input", json!({ "text": "open page" })),
+        event(
+            2,
+            "model.tool_call",
+            json!({
+                "id": "call_browser",
+                "name": "browser_script",
+                "arguments": { "code": "emit_output(page_info(), label='page_info')" }
+            }),
+        ),
+        event(
+            3,
+            "tool.output",
+            json!({
+                "tool_call_id": "call_browser",
+                "name": "browser_script",
+                "text": "",
+                "summary": [{
+                    "kind": "page",
+                    "output_label": "page_info",
+                    "title": "Example Domain",
+                    "url": "https://example.com"
+                }]
+            }),
+        ),
+        event(
+            4,
+            "tool.output",
+            json!({
+                "tool_call_id": "call_browser",
+                "name": "browser_script",
+                "text": "browser_script completed"
+            }),
+        ),
+        event(5, "session.done", json!({})),
+    ];
+
+    let messages = provider_messages_from_events(&events);
+    assert_eq!(messages.len(), 3, "messages: {messages:#?}");
+    let tool_messages: Vec<_> = messages
+        .iter()
+        .filter(|message| message.get("role").and_then(Value::as_str) == Some("tool"))
+        .collect();
+    assert_eq!(tool_messages.len(), 1, "messages: {messages:#?}");
+    let content = tool_messages[0]
+        .get("content")
+        .and_then(Value::as_str)
+        .expect("tool content");
+    assert!(content.contains("Example Domain"));
+    assert!(!content.contains("aborted"), "content: {content}");
+}
+
+#[test]
+fn running_browser_script_output_uses_run_id_fallback_text() {
+    let events = vec![
+        event(1, "session.input", json!({ "text": "open page" })),
+        event(
+            2,
+            "model.tool_call",
+            json!({
+                "id": "call_browser",
+                "name": "browser_script",
+                "arguments": { "code": "wait_for_load(30)" }
+            }),
+        ),
+        event(
+            3,
+            "tool.output",
+            json!({
+                "tool_call_id": "call_browser",
+                "name": "browser_script",
+                "status": "running",
+                "run_id": "bs-123",
+                "next_observe_ms": 7000,
+                "text": ""
+            }),
+        ),
+        event(4, "session.done", json!({})),
+    ];
+
+    let messages = provider_messages_from_events(&events);
+    assert_eq!(messages.len(), 3, "messages: {messages:#?}");
+    let content = messages[2]
+        .get("content")
+        .and_then(Value::as_str)
+        .expect("running browser_script content");
+    assert!(content.contains("browser_script is still running."));
+    assert!(content.contains("run_id: bs-123"));
+    assert!(content.contains("action=\"observe\""));
+    assert!(content.contains("observe_timeout_ms=7000"));
+}
+
+#[test]
 fn tool_output_event_preserves_image_content() {
     let events = vec![
         event(1, "session.input", json!({ "text": "load image" })),

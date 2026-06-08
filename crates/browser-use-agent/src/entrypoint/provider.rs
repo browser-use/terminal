@@ -45,6 +45,7 @@ use std::future::Future;
 use std::hash::{Hash, Hasher};
 use std::pin::Pin;
 use std::sync::{Arc, Mutex, OnceLock};
+use std::time::Duration;
 
 use browser_use_llm::auth::{load_codex_auth, CodexAuth};
 use browser_use_llm::route::ModelClient;
@@ -165,13 +166,33 @@ impl RuntimeBrowserBackend {
             return Ok(());
         };
         let runtime_session_id = RuntimeSessionId::from_string(session_id.to_string())?;
+        let text = if response.text.trim().is_empty()
+            && response.ok
+            && response.status.as_deref() != Some("running")
+            && response.outputs.is_empty()
+            && response.summary.is_empty()
+            && response.data.is_null()
+            && response.images.is_empty()
+            && response.artifacts.is_empty()
+        {
+            "browser_script completed".to_string()
+        } else {
+            response.text.clone()
+        };
         let base_payload = serde_json::json!({
+            "name": "browser_script",
             "run_id": run_id,
             "ok": response.ok,
             "status": response.status.clone(),
             "next_observe_ms": response.next_observe_ms,
-            "text": response.text.clone(),
+            "text": text,
             "error": response.error.clone(),
+            "data": response.data.clone(),
+            "outputs": response.outputs.clone(),
+            "summary": response.summary.clone(),
+            "images": response.images.clone(),
+            "artifacts": response.artifacts.clone(),
+            "diagnosis": response.diagnosis.clone(),
         });
 
         if synthesize_start {
@@ -448,6 +469,7 @@ fn browser_backend_for_runtime_or_config(
                             keep_alive: true,
                             headless: None,
                             profile_id: Some(session_id.as_str().to_string()),
+                            ..RuntimeBrowserConfig::default()
                         },
                     )?;
                     let browser_registries = handle.browser_physical_registries(&browser_id)?;
@@ -1051,7 +1073,12 @@ fn resolve_provider_with_python(
     //     message vec — the turn loop threads the real prompt through
     //     `run_sampling_request`, which rebuilds the request per attempt from
     //     `ctx` + the loop's input (the shape `build_transport` documents).
-    let client = Arc::new(ModelClient::default());
+    let mut client = ModelClient::default();
+    if let Some(timeout_ms) = config.options.model_stream_idle_timeout_ms {
+        let timeout = Duration::from_millis(timeout_ms.max(1));
+        client = client.with_stream_idle_timeout(timeout);
+    }
+    let client = Arc::new(client);
     let transport = build_transport(client, route, &ctx, Vec::new());
 
     // (3a) Resolve the Python backend for the run's `python` tool. Real path:
@@ -1074,7 +1101,8 @@ fn resolve_provider_with_python(
     let goal_store = build_goal_store(&user_input);
     let goals_enabled = goal_runtime_enabled(config, &user_input);
     let preemption_probe = mailbox_preemption_probe(&user_input, runtime_handle.as_ref());
-    let mut driver = build_sampling_driver(transport, Arc::clone(&sink), ctx, max_retries);
+    let mut driver = build_sampling_driver(transport, Arc::clone(&sink), ctx, max_retries)
+        .with_full_llm_input_events(config.options.full_llm_input_events);
     if goals_enabled {
         driver = driver.with_goal_store(goal_store.clone());
     }
@@ -1311,6 +1339,8 @@ fn build_tool_dispatcher_with_cwd_and_goal_store(
     )?;
     let browser_tool = BrowserTool::with_backend(browser_backend)
         .with_selected_browser_mode(config.options.browser_mode.clone())
+        .with_selected_browser_profile_id(config.options.browser_profile_id.clone())
+        .with_selected_local_browser(config.options.browser_local_browser.clone())
         .with_default_script_timeout_secs(config.options.python_tool_timeout_seconds);
     let browser_tool = match &user_input {
         Some((store, session_id)) => {
@@ -1368,9 +1398,10 @@ fn build_tool_dispatcher_with_cwd_and_goal_store(
     reg.register::<_, DoneRequest>("done", definitions::done(), false, DoneTool::new());
 
     // Codex-style collaboration exposure: v2 is gated by
-    // `features.multi_agent_v2`, while legacy v1 tools are exposed only when
-    // the legacy collaboration feature is enabled.
-    if config.options.multi_agent_v2.enabled {
+    // `features.multi_agent_v2`, but only advertise the subagent tools when this
+    // run actually has a child runner. Otherwise the model can burn turns on an
+    // unsupported tool that can never succeed.
+    if subagent_tools_enabled_for_run(config) {
         register_subagent_tools(
             &mut reg,
             config,
@@ -1378,7 +1409,7 @@ fn build_tool_dispatcher_with_cwd_and_goal_store(
             &tool_cwd,
             runtime_handle.clone(),
         );
-    } else if config.options.collab_enabled {
+    } else if legacy_subagent_tools_enabled_for_run(config) {
         register_legacy_subagent_tools(
             &mut reg,
             config,
@@ -1500,6 +1531,16 @@ fn build_tool_dispatcher_with_cwd_and_goal_store(
     Ok(Arc::new(ToolDispatcher::with_runner_and_specs(
         runner, /* supports_parallel_tool_calls */ true, specs,
     )))
+}
+
+fn subagent_tools_enabled_for_run(config: &ProviderRunConfig) -> bool {
+    config.options.multi_agent_v2.enabled && config.options.child_agent_runner.is_some()
+}
+
+fn legacy_subagent_tools_enabled_for_run(config: &ProviderRunConfig) -> bool {
+    !config.options.multi_agent_v2.enabled
+        && config.options.collab_enabled
+        && config.options.child_agent_runner.is_some()
 }
 
 fn apply_role_tool_policy<S, A>(
@@ -2969,7 +3010,10 @@ mod tests {
                 ok: true,
                 status: Some("finished".to_string()),
                 run_id: Some("script-1".to_string()),
-                text: "done".to_string(),
+                outputs: vec![serde_json::json!({
+                    "label": "page_info",
+                    "value": { "url": "https://example.com", "title": "Example" }
+                })],
                 ..Default::default()
             })
         }
@@ -3130,15 +3174,29 @@ mod tests {
             .events_for_session(root.session_id())?
             .into_iter()
             .filter(|event| event.event_type.starts_with("browser_script."))
-            .map(|event| event.event_type)
+            .collect::<Vec<_>>();
+        let script_event_types = script_events
+            .iter()
+            .map(|event| event.event_type.clone())
             .collect::<Vec<_>>();
         assert_eq!(
-            script_events,
+            script_event_types,
             vec![
                 "browser_script.started".to_string(),
                 "browser_script.output_delta".to_string(),
                 "browser_script.completed".to_string(),
             ]
+        );
+        let completed = script_events
+            .iter()
+            .find(|event| event.event_type == "browser_script.completed")
+            .expect("completed browser_script event");
+        assert_eq!(completed.payload["name"], "browser_script");
+        assert_eq!(completed.payload["text"], "");
+        assert_eq!(completed.payload["outputs"][0]["label"], "page_info");
+        assert_eq!(
+            completed.payload["outputs"][0]["value"]["url"],
+            "https://example.com"
         );
         Ok(())
     }
@@ -3178,6 +3236,34 @@ mod tests {
             build_tool_dispatcher(Arc::new(MarkerPythonBackend), &config, None);
     }
 
+    #[test]
+    fn browser_use_api_tool_allowlist_hides_workspace_tools() {
+        let options = crate::config_overrides::AgentRunOptions {
+            config_overrides: vec![(
+                "tool_allowlist".to_string(),
+                toml::Value::Array(vec![
+                    toml::Value::String("browser".to_string()),
+                    toml::Value::String("browser_script".to_string()),
+                    toml::Value::String("done".to_string()),
+                ]),
+            )],
+            ..crate::config_overrides::AgentRunOptions::default()
+        };
+        let config =
+            ProviderRunConfig::new(ProviderBackend::Fake, "fake-model").with_options(options);
+        let dispatcher = build_tool_dispatcher(Arc::new(MarkerPythonBackend), &config, None);
+        let names: Vec<&str> = dispatcher
+            .tool_specs()
+            .iter()
+            .map(|s| s.name.as_str())
+            .collect();
+
+        assert_eq!(names, vec!["browser", "browser_script", "done"]);
+        assert!(!names.contains(&"exec_command"));
+        assert!(!names.contains(&"python"));
+        assert!(!names.contains(&"tool_search"));
+    }
+
     /// An empty `mcp_servers` map registers NO `mcp` tool (prior behavior).
     #[test]
     fn empty_mcp_servers_registers_no_mcp_tool() {
@@ -3201,11 +3287,11 @@ mod tests {
         assert!(names.contains(&"done"));
         assert!(names.contains(&"update_plan"));
         // Both web searches are wired into the production dispatcher: the hosted
-        // `web_search` and the locally-executed DuckDuckGo `search`.
+        // `web_search` and the browser-use search API `search`.
         assert!(names.contains(&"web_search"));
         assert!(
             names.contains(&"search"),
-            "the locally-executed `search` tool must be reachable by the live model"
+            "the `search` tool must be reachable by the live model"
         );
     }
 
@@ -3250,11 +3336,14 @@ mod tests {
         );
     }
 
-    /// The production dispatcher advertises the Codex MultiAgentV2 orchestration
-    /// tools while the feature is enabled; a spawn still fails honestly when no
-    /// child runner is wired.
+    fn test_child_agent_runner() -> crate::config_overrides::ChildAgentRunner {
+        crate::config_overrides::ChildAgentRunner::new(|_req| Ok(()))
+    }
+
+    /// The production dispatcher does not advertise subagent tools when there is
+    /// no child runner wired for the run.
     #[test]
-    fn subagent_tools_are_registered_by_default_in_the_dispatcher() {
+    fn subagent_tools_are_hidden_without_child_runner() {
         let options = crate::config_overrides::AgentRunOptions::default();
         let config =
             ProviderRunConfig::new(ProviderBackend::Fake, "fake-model").with_options(options);
@@ -3273,19 +3362,16 @@ mod tests {
             "close_agent",
         ] {
             assert!(
-                names.contains(&tool),
-                "{tool} must be registered by default in the production dispatcher; got {names:?}"
+                !names.contains(&tool),
+                "{tool} must be hidden without a configured child runner; got {names:?}"
             );
         }
-        assert!(
-            !names.contains(&"send_input"),
-            "send_input is a v1 tool and must not be exposed in the default Codex-v2 flat tool surface"
-        );
     }
 
     #[test]
     fn subagent_tools_are_registered_in_the_dispatcher() {
         let options = crate::config_overrides::AgentRunOptions {
+            child_agent_runner: Some(test_child_agent_runner()),
             multi_agent_v2: crate::config_overrides::MultiAgentV2Options {
                 enabled: true,
                 ..Default::default()
@@ -3321,8 +3407,12 @@ mod tests {
 
     #[test]
     fn spawn_agent_agent_type_guidance_discourages_default_override() {
-        let config = ProviderRunConfig::new(ProviderBackend::Fake, "fake-model")
-            .with_options(crate::config_overrides::AgentRunOptions::default());
+        let config = ProviderRunConfig::new(ProviderBackend::Fake, "fake-model").with_options(
+            crate::config_overrides::AgentRunOptions {
+                child_agent_runner: Some(test_child_agent_runner()),
+                ..crate::config_overrides::AgentRunOptions::default()
+            },
+        );
         let dispatcher = build_tool_dispatcher(Arc::new(MarkerPythonBackend), &config, None);
         let spawn = dispatcher
             .tool_specs()
@@ -3377,6 +3467,7 @@ mod tests {
     #[test]
     fn legacy_subagent_tools_are_exposed_when_collab_enabled() {
         let options = crate::config_overrides::AgentRunOptions {
+            child_agent_runner: Some(test_child_agent_runner()),
             multi_agent_v2: crate::config_overrides::MultiAgentV2Options {
                 enabled: false,
                 ..Default::default()
@@ -3409,6 +3500,7 @@ mod tests {
     #[test]
     fn subagent_tools_apply_multi_agent_v2_definition_options() {
         let options = crate::config_overrides::AgentRunOptions {
+            child_agent_runner: Some(test_child_agent_runner()),
             multi_agent_v2: crate::config_overrides::MultiAgentV2Options {
                 enabled: true,
                 tool_namespace: Some("agents".to_string()),
@@ -3454,6 +3546,7 @@ mod tests {
     #[test]
     fn subagent_namespace_is_only_applied_for_responses_backends() {
         let options = crate::config_overrides::AgentRunOptions {
+            child_agent_runner: Some(test_child_agent_runner()),
             multi_agent_v2: crate::config_overrides::MultiAgentV2Options {
                 enabled: true,
                 tool_namespace: Some("agents".to_string()),

@@ -3,7 +3,9 @@ from __future__ import annotations
 import contextlib
 import atexit
 import base64
+import fnmatch
 import hashlib
+import ipaddress
 import importlib
 import importlib.util
 import io
@@ -19,6 +21,7 @@ import mimetypes
 import re
 import tempfile
 import time
+import urllib.parse
 import urllib.request
 from pathlib import Path
 from typing import Any, Dict
@@ -27,6 +30,7 @@ from typing import Any, Dict
 _namespaces: Dict[str, Dict[str, Any]] = {}
 _managed_chrome: subprocess.Popen[Any] | None = None
 _managed_chrome_profile: Path | None = None
+_managed_chrome_profile_is_temporary = False
 _explicit_agent_workspace = os.environ.get("BH_AGENT_WORKSPACE")
 
 
@@ -230,6 +234,298 @@ def _browser_mode() -> str:
     return os.environ.get("LLM_BROWSER_BROWSER_MODE", "").lower().replace("_", "-").replace(" ", "-")
 
 
+def _browser_user_agent() -> str | None:
+    value = os.environ.get("BU_BROWSER_USER_AGENT")
+    if value is None:
+        return None
+    value = value.strip()
+    return value or None
+
+
+def _apply_browser_user_agent_override(cdp: Any, session_id: Any = None) -> None:
+    user_agent = _browser_user_agent()
+    if not user_agent:
+        return
+    with contextlib.suppress(Exception):
+        cdp("Network.setUserAgentOverride", session_id=session_id, userAgent=user_agent)
+
+
+def _browser_permissions() -> list[str]:
+    raw = os.environ.get("BU_BROWSER_PERMISSIONS")
+    if not raw:
+        return []
+    try:
+        parsed = json.loads(raw)
+    except json.JSONDecodeError:
+        return []
+    if not isinstance(parsed, list):
+        return []
+    permissions: list[str] = []
+    seen: set[str] = set()
+    for permission in parsed:
+        if not isinstance(permission, str):
+            continue
+        permission = permission.strip()
+        if not permission or permission in seen:
+            continue
+        permissions.append(permission)
+        seen.add(permission)
+    return permissions
+
+
+def _apply_browser_permissions(cdp: Any) -> None:
+    permissions = _browser_permissions()
+    if not permissions:
+        return
+    with contextlib.suppress(Exception):
+        cdp("Browser.grantPermissions", permissions=permissions)
+
+
+def _browser_download_behavior() -> dict[str, Any] | None:
+    accept_downloads = _env_bool("BU_BROWSER_ACCEPT_DOWNLOADS")
+    if accept_downloads is False:
+        return {"behavior": "deny"}
+
+    raw_path = os.environ.get("BU_BROWSER_DOWNLOADS_PATH")
+    if not raw_path or not raw_path.strip():
+        return None
+    download_path = Path(raw_path.strip()).expanduser().resolve()
+    with contextlib.suppress(OSError):
+        download_path.mkdir(parents=True, exist_ok=True)
+    return {"behavior": "allow", "downloadPath": str(download_path), "eventsEnabled": True}
+
+
+def _apply_browser_download_behavior(cdp: Any) -> None:
+    behavior = _browser_download_behavior()
+    if not behavior:
+        return
+    with contextlib.suppress(Exception):
+        cdp("Browser.setDownloadBehavior", **behavior)
+
+
+def _browser_storage_state_raw() -> str | None:
+    raw = os.environ.get("BU_BROWSER_STORAGE_STATE")
+    if not raw or not raw.strip():
+        return None
+    return raw
+
+
+def _browser_storage_state() -> dict[str, Any] | None:
+    raw = _browser_storage_state_raw()
+    if raw is None:
+        return None
+    try:
+        parsed = json.loads(raw)
+    except json.JSONDecodeError:
+        return None
+    return parsed if isinstance(parsed, dict) else None
+
+
+def _browser_storage_cookies(storage_state: dict[str, Any]) -> list[dict[str, Any]]:
+    raw_cookies = storage_state.get("cookies")
+    if not isinstance(raw_cookies, list):
+        return []
+    cookies: list[dict[str, Any]] = []
+    for cookie in raw_cookies:
+        if not isinstance(cookie, dict):
+            continue
+        if not isinstance(cookie.get("name"), str) or not isinstance(cookie.get("value"), str):
+            continue
+        cookies.append(cookie)
+    return cookies
+
+
+def _browser_storage_init_scripts(storage_state: dict[str, Any]) -> list[str]:
+    origins = storage_state.get("origins")
+    if not isinstance(origins, list):
+        return []
+    scripts: list[str] = []
+    for origin_state in origins:
+        if not isinstance(origin_state, dict):
+            continue
+        origin = origin_state.get("origin")
+        statements: list[str] = []
+        for storage_name in ("localStorage", "sessionStorage"):
+            items = origin_state.get(storage_name)
+            if not isinstance(items, list):
+                continue
+            for item in items:
+                if not isinstance(item, dict):
+                    continue
+                name = item.get("name")
+                value = item.get("value")
+                if not isinstance(name, str) or not isinstance(value, str):
+                    continue
+                statements.append(
+                    f"window.{storage_name}.setItem({json.dumps(name)}, {json.dumps(value)});"
+                )
+        if not statements:
+            continue
+        body = "\n".join(statements)
+        if isinstance(origin, str) and origin:
+            scripts.append(
+                "try {\n"
+                f"  if (window.location.origin === {json.dumps(origin)}) {{\n"
+                f"    {body}\n"
+                "  }\n"
+                "} catch (error) {}"
+            )
+        else:
+            scripts.append(f"try {{\n  {body}\n}} catch (error) {{}}")
+    return scripts
+
+
+def _apply_browser_storage_state(
+    cdp: Any,
+    session_id: Any = None,
+    applied: set[tuple[Any, ...]] | None = None,
+) -> None:
+    raw = _browser_storage_state_raw()
+    if raw is None:
+        return
+    storage_state = _browser_storage_state()
+    if not storage_state:
+        return
+
+    signature = hashlib.sha256(raw.encode("utf-8")).hexdigest()
+    cookies = _browser_storage_cookies(storage_state)
+    cookie_key = ("storage_cookies", signature)
+    if cookies and (applied is None or cookie_key not in applied):
+        try:
+            cdp("Storage.setCookies", session_id=session_id, cookies=cookies)
+        except Exception:
+            pass
+        else:
+            if applied is not None:
+                applied.add(cookie_key)
+
+    if session_id is None:
+        return
+    for index, script in enumerate(_browser_storage_init_scripts(storage_state)):
+        script_key = ("storage_script", str(session_id), signature, index)
+        if applied is not None and script_key in applied:
+            continue
+        try:
+            cdp(
+                "Page.addScriptToEvaluateOnNewDocument",
+                session_id=session_id,
+                source=script,
+                runImmediately=True,
+            )
+        except Exception:
+            pass
+        else:
+            if applied is not None:
+                applied.add(script_key)
+
+
+def _env_json_string_list(name: str) -> list[str]:
+    raw = os.environ.get(name)
+    if not raw:
+        return []
+    try:
+        parsed = json.loads(raw)
+    except json.JSONDecodeError:
+        return []
+    if not isinstance(parsed, list):
+        return []
+    return [value.strip() for value in parsed if isinstance(value, str) and value.strip()]
+
+
+def _is_root_domain(domain: str) -> bool:
+    if "*" in domain or "://" in domain:
+        return False
+    return domain.count(".") == 1
+
+
+def _is_ip_address(host: str) -> bool:
+    with contextlib.suppress(ValueError):
+        ipaddress.ip_address(host)
+        return True
+    return False
+
+
+def _domain_pattern_matches(url: str, host: str, scheme: str, pattern: str) -> bool:
+    parsed_url = urllib.parse.urlparse(url)
+    full_url_pattern = f"{scheme}://{host}"
+    pattern = pattern.strip()
+    if not pattern:
+        return False
+    if "*" in pattern:
+        if pattern.startswith("*."):
+            domain_part = pattern[2:].lower()
+            host_lower = host.lower()
+            return scheme in {"http", "https"} and (
+                host_lower == domain_part or host_lower.endswith(f".{domain_part}")
+            )
+        if pattern.endswith("/*"):
+            prefix = pattern[:-1]
+            if "://" in prefix:
+                parsed_pattern = urllib.parse.urlparse(prefix)
+                pattern_host = parsed_pattern.hostname
+                if not pattern_host:
+                    return False
+                return (
+                    parsed_pattern.scheme.lower() == scheme.lower()
+                    and pattern_host.lower() == host.lower()
+                    and parsed_url.path.startswith(parsed_pattern.path or "/")
+                )
+            return url.startswith(pattern[:-1])
+        return fnmatch.fnmatch(full_url_pattern if "://" in pattern else host, pattern)
+    if "://" in pattern:
+        parsed_pattern = urllib.parse.urlparse(pattern)
+        pattern_host = parsed_pattern.hostname
+        if not pattern_host:
+            return False
+        if parsed_pattern.scheme.lower() != scheme.lower() or pattern_host.lower() != host.lower():
+            return False
+        pattern_path = parsed_pattern.path or ""
+        if pattern_path and pattern_path != "/" and not parsed_url.path.startswith(pattern_path):
+            return False
+        return True
+    host_lower = host.lower()
+    pattern_lower = pattern.lower()
+    if host_lower == pattern_lower:
+        return True
+    return _is_root_domain(pattern_lower) and host_lower == f"www.{pattern_lower}"
+
+
+def _browser_profile_url_allowed(url: str) -> bool:
+    if url in {"about:blank", "chrome://new-tab-page/", "chrome://new-tab-page", "chrome://newtab/"}:
+        return True
+    try:
+        parsed = urllib.parse.urlparse(url)
+    except Exception:
+        return False
+    if parsed.scheme in {"data", "blob"}:
+        return True
+    host = parsed.hostname
+    if not host:
+        return False
+    if _env_bool("BU_BROWSER_BLOCK_IP_ADDRESSES") is True and _is_ip_address(host):
+        return False
+
+    allowed_domains = _env_json_string_list("BU_BROWSER_ALLOWED_DOMAINS")
+    prohibited_domains = _env_json_string_list("BU_BROWSER_PROHIBITED_DOMAINS")
+    if prohibited_domains and any(
+        _domain_pattern_matches(url, host, parsed.scheme, pattern) for pattern in prohibited_domains
+    ):
+        return False
+    if allowed_domains:
+        return any(_domain_pattern_matches(url, host, parsed.scheme, pattern) for pattern in allowed_domains)
+    return True
+
+
+def _enforce_browser_domain_constraints(method: str, params: dict[str, Any]) -> None:
+    url = params.get("url")
+    if not isinstance(url, str) or not url:
+        return
+    if method not in {"Page.navigate", "Target.createTarget"} and "." in method:
+        return
+    if not _browser_profile_url_allowed(url):
+        raise RuntimeError(f"BrowserProfile domain constraints blocked navigation to {url}")
+
+
 def _annotate_error(msg: str) -> str:
     for pattern, hint in _HINT_PATTERNS:
         if pattern.search(msg):
@@ -333,6 +629,11 @@ def _free_port() -> int:
 
 
 def _managed_chrome_is_visible() -> bool:
+    mode = _browser_mode()
+    if mode in {"managed-headed", "headed", "headful"}:
+        return True
+    if mode in {"managed-headless", "headless", "headless-chromium"}:
+        return False
     return os.environ.get("LLM_BROWSER_MANAGED_CHROME_VISIBLE") == "1"
 
 
@@ -340,7 +641,8 @@ def _should_start_managed_chrome() -> bool:
     if os.environ.get("BU_CDP_URL") or os.environ.get("BU_CDP_WS") or os.environ.get("BU_BROWSER_ID"):
         return False
     return (
-        _browser_mode() in {"headless", "headless-chromium"}
+        _browser_mode()
+        in {"managed-headless", "managed-headed", "headless", "headless-chromium", "headed", "headful"}
         or os.environ.get("LLM_BROWSER_AUTO_CHROME") == "1"
     )
 
@@ -356,7 +658,84 @@ def _pick_managed_chrome_path(visible: bool) -> str:
     return _pick_chromium_path()
 
 
+def _managed_chrome_extra_args() -> list[str]:
+    raw = os.environ.get("BU_MANAGED_BROWSER_ARGS")
+    if not raw:
+        return []
+    try:
+        parsed = json.loads(raw)
+    except json.JSONDecodeError:
+        return []
+    if not isinstance(parsed, list):
+        return []
+    return [arg for arg in parsed if isinstance(arg, str) and arg]
+
+
+def _managed_chrome_profile_dir() -> tuple[Path, bool]:
+    configured = os.environ.get("BU_MANAGED_BROWSER_PROFILE")
+    if configured and configured.strip():
+        profile = Path(configured).expanduser()
+        profile.mkdir(parents=True, exist_ok=True)
+        return profile, False
+    return Path(tempfile.mkdtemp(prefix="but-managed-chrome.")), True
+
+
+def _env_bool(name: str) -> bool | None:
+    raw = os.environ.get(name)
+    if raw is None:
+        return None
+    value = raw.strip().lower()
+    if value in {"1", "true", "yes", "on"}:
+        return True
+    if value in {"0", "false", "no", "off"}:
+        return False
+    return None
+
+
+def _env_milliseconds_to_seconds(name: str) -> float:
+    raw = os.environ.get(name)
+    if raw is None:
+        return 0.0
+    try:
+        milliseconds = float(raw.strip())
+    except ValueError:
+        return 0.0
+    if milliseconds <= 0:
+        return 0.0
+    return milliseconds / 1000.0
+
+
+def _apply_browser_wait_between_actions() -> None:
+    wait_seconds = _env_milliseconds_to_seconds("BU_BROWSER_WAIT_BETWEEN_ACTIONS_MS")
+    if wait_seconds > 0:
+        time.sleep(wait_seconds)
+
+
+def _managed_chrome_viewport_args() -> list[str]:
+    if _env_bool("BU_BROWSER_NO_VIEWPORT") is True:
+        return []
+    raw = os.environ.get("BU_BROWSER_VIEWPORT")
+    if not raw:
+        return []
+    try:
+        parsed = json.loads(raw)
+    except json.JSONDecodeError:
+        return []
+    if not isinstance(parsed, dict):
+        return []
+    width = parsed.get("width")
+    height = parsed.get("height")
+    if type(width) is not int or type(height) is not int or width <= 0 or height <= 0:
+        return []
+    args = [f"--window-size={width},{height}"]
+    device_scale_factor = parsed.get("deviceScaleFactor")
+    if isinstance(device_scale_factor, (int, float)) and device_scale_factor > 0:
+        args.append(f"--force-device-scale-factor={device_scale_factor:g}")
+    return args
+
+
 def _managed_chrome_args(chrome: str, port: int, profile: Path, visible: bool) -> list[str]:
+    viewport_args = _managed_chrome_viewport_args()
     args = [
         chrome,
         "--remote-debugging-address=127.0.0.1",
@@ -366,9 +745,13 @@ def _managed_chrome_args(chrome: str, port: int, profile: Path, visible: bool) -
         "--no-default-browser-check",
     ]
     if visible:
-        args.extend(["--new-window", "--window-size=1512,900"])
+        args.append("--new-window")
+        if not viewport_args:
+            args.append("--window-size=1512,900")
     else:
         args.append("--headless=new")
+    args.extend(viewport_args)
+    args.extend(_managed_chrome_extra_args())
     args.append("about:blank")
     return args
 
@@ -383,7 +766,7 @@ def _daemon_has_browser_connection(admin: Any) -> bool:
 
 
 def _cleanup_managed_chrome() -> None:
-    global _managed_chrome, _managed_chrome_profile
+    global _managed_chrome, _managed_chrome_profile, _managed_chrome_profile_is_temporary
     proc = _managed_chrome
     _managed_chrome = None
     if proc is not None and proc.poll() is None:
@@ -393,13 +776,14 @@ def _cleanup_managed_chrome() -> None:
         except subprocess.TimeoutExpired:
             proc.kill()
             proc.wait(timeout=5)
-    if _managed_chrome_profile is not None:
+    if _managed_chrome_profile is not None and _managed_chrome_profile_is_temporary:
         shutil.rmtree(_managed_chrome_profile, ignore_errors=True)
-        _managed_chrome_profile = None
+    _managed_chrome_profile = None
+    _managed_chrome_profile_is_temporary = False
 
 
 def _ensure_managed_chrome(admin: Any | None = None) -> None:
-    global _managed_chrome, _managed_chrome_profile
+    global _managed_chrome, _managed_chrome_profile, _managed_chrome_profile_is_temporary
     if not _should_start_managed_chrome():
         return
     if admin is not None and _daemon_has_browser_connection(admin):
@@ -408,7 +792,7 @@ def _ensure_managed_chrome(admin: Any | None = None) -> None:
         return
 
     port = _free_port()
-    profile = Path(tempfile.mkdtemp(prefix="but-managed-chrome."))
+    profile, profile_is_temporary = _managed_chrome_profile_dir()
     visible = _managed_chrome_is_visible()
     chrome = _pick_managed_chrome_path(visible)
     proc = subprocess.Popen(
@@ -430,11 +814,13 @@ def _ensure_managed_chrome(admin: Any | None = None) -> None:
             time.sleep(0.25)
     else:
         proc.terminate()
-        shutil.rmtree(profile, ignore_errors=True)
+        if profile_is_temporary:
+            shutil.rmtree(profile, ignore_errors=True)
         raise RuntimeError(f"managed Chrome DevTools did not become available: {last_error}")
 
     _managed_chrome = proc
     _managed_chrome_profile = profile
+    _managed_chrome_profile_is_temporary = profile_is_temporary
     os.environ["BU_CDP_URL"] = f"http://127.0.0.1:{port}"
     if not visible:
         atexit.register(_cleanup_managed_chrome)
@@ -553,12 +939,26 @@ def _patch_browser_harness_cdp(helpers: Any, admin: Any) -> None:
     if getattr(helpers, "__llm_browser_cdp_patched__", False):
         return
     original_cdp = helpers.cdp
+    applied_browser_profile_state: set[tuple[Any, ...]] = set()
 
     def cdp_with_daemon(method: str, session_id: Any = None, **params: Any) -> Any:
         if _browser_mode() == "cloud":
             _ensure_cloud_browser(admin)
         else:
             admin.ensure_daemon()
+        _enforce_browser_domain_constraints(method, params)
+        if method != "Browser.grantPermissions":
+            _apply_browser_permissions(original_cdp)
+        if method != "Browser.setDownloadBehavior":
+            _apply_browser_download_behavior(original_cdp)
+        if method not in {"Storage.setCookies", "Page.addScriptToEvaluateOnNewDocument"}:
+            _apply_browser_storage_state(
+                original_cdp,
+                session_id=session_id,
+                applied=applied_browser_profile_state,
+            )
+        if method != "Network.setUserAgentOverride":
+            _apply_browser_user_agent_override(original_cdp, session_id=session_id)
         return original_cdp(method, session_id=session_id, **params)
 
     helpers.__llm_browser_original_cdp__ = original_cdp
@@ -1653,6 +2053,7 @@ def _run(request: Dict[str, Any]) -> Dict[str, Any]:
         assert ns is not None
         with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stdout):
             exec(compile(code, "<browser-use-python-worker>", "exec"), ns)
+        _apply_browser_wait_between_actions()
         _auto_emit_browser_state(ns, request_id)
         _emit_browser_identity_events(ns, request_id)
         return {

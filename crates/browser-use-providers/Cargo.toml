@@ -10,6 +10,7 @@ base64.workspace = true
 browser-use-protocol = { path = "../browser-use-protocol" }
 bytes = "1"
 chrono.workspace = true
+image.workspace = true
 rand = "0.9.4"
 reqwest.workspace = true
 serde = { workspace = true, features = ["derive"] }

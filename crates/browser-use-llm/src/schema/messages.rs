@@ -86,16 +86,28 @@ pub enum CacheHint {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Message {
     pub role: MessageRole,
+    /// Optional prompt-cache hint; only honored by protocols that support
+    /// inline cache markers (Anthropic / Bedrock).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache: Option<CacheHint>,
     #[serde(default)]
     pub content: Vec<ContentPart>,
 }
 
 impl Message {
     pub fn new(role: MessageRole, content: Vec<ContentPart>) -> Self {
-        Self { role, content }
+        Self {
+            role,
+            cache: None,
+            content,
+        }
     }
     pub fn user_text(s: impl Into<String>) -> Self {
         Self::new(MessageRole::User, vec![ContentPart::text(s)])
+    }
+    pub fn with_cache(mut self, cache: CacheHint) -> Self {
+        self.cache = Some(cache);
+        self
     }
 }
 

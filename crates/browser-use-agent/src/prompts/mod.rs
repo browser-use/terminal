@@ -205,8 +205,17 @@ pub fn browser_mode_instruction(mode: &str) -> String {
         )
         .to_string(),
         "cloud" | "browser-use-cloud" => concat!(
-            "Selected browser mode: Browser Use cloud. Use `browser remote start` before page work. ",
+            "Selected browser mode: Browser Use cloud. Use `browser connect` before page work. ",
+            "Plain `browser connect` uses the remembered cloud profile when one is set. ",
             "Remote start means start and connect; use `browser remote live-url` to retrieve the watch URL."
+        )
+        .to_string(),
+        "remote-cdp" | "cdp" => concat!(
+            "Selected browser mode: Remote CDP. The evaluation harness already provides the browser endpoint. ",
+            "Do not call `browser connect managed`, `browser connect local`, or `browser remote start`. ",
+            "If the task says the browser session is already open at the start URL, first inspect the current page with `browser_script` using `page_info()` and extraction/screenshot as needed; do not navigate to that same URL again unless the current page URL is wrong. ",
+            "Otherwise start page work directly with `browser_script` using `new_tab(url)` for first navigation, or `goto_url(url)` only when the current tab should be reused; trust its `navigation_ready` page_info result when the URL is correct, then inspect/extract instead of repeating the same navigation. ",
+            "Use `browser status --json` only if you need to inspect the current connection."
         )
         .to_string(),
         other => format!(

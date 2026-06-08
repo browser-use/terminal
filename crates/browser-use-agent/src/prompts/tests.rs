@@ -92,6 +92,75 @@ fn browser_mode_instruction_matches_main_local_connection_guidance() {
     assert!(prompt.contains("/profile"));
 }
 
+#[test]
+fn browser_mode_instruction_guides_remote_cdp_to_direct_page_work() {
+    let prompt = browser_mode_instruction("remote-cdp");
+    assert!(prompt.contains("Selected browser mode: Remote CDP"));
+    assert!(prompt.contains("already provides the browser endpoint"));
+    assert!(prompt.contains("already open at the start URL"));
+    assert!(prompt.contains("first inspect the current page"));
+    assert!(prompt.contains("trust its `navigation_ready` page_info result"));
+    assert!(prompt.contains("Do not call `browser connect managed`"));
+}
+
+#[test]
+fn system_prompt_bounds_multi_item_collection_loops() {
+    assert!(BASE_SYSTEM_PROMPT.contains("Multi-item collection rule"));
+    assert!(BASE_SYSTEM_PROMPT.contains("maintain a checklist"));
+    assert!(BASE_SYSTEM_PROMPT.contains("Do not keep varying one search term"));
+    assert!(BASE_SYSTEM_PROMPT.contains("audit the checklist"));
+}
+
+#[test]
+fn system_prompt_commits_single_site_collection_to_one_domain() {
+    assert!(BASE_SYSTEM_PROMPT.contains("Single-site collection rule"));
+    assert!(BASE_SYSTEM_PROMPT.contains("choose one viable domain early"));
+    assert!(BASE_SYSTEM_PROMPT.contains("do not keep searching for a perfect domain"));
+    assert!(BASE_SYSTEM_PROMPT.contains("Do not stitch rows from multiple domains"));
+    assert!(BASE_SYSTEM_PROMPT.contains("mark it unavailable for that domain"));
+}
+
+#[test]
+fn prompts_avoid_screenshots_for_text_heavy_extraction() {
+    assert!(BASE_SYSTEM_PROMPT.contains(
+        "For text-heavy research, document reading, search, pricing, tables, and list extraction"
+    ));
+    assert!(BASE_SYSTEM_PROMPT.contains("screenshots add latency"));
+    assert!(BASE_SYSTEM_PROMPT.contains("If you have three or more independent URLs"));
+
+    let script = browser_script_tool_description();
+    assert!(script.contains(
+        "For text-heavy research, document reading, search, pricing, tables, and list extraction"
+    ));
+    assert!(script.contains("screenshots add latency"));
+    assert!(script.contains("navigation_ready"));
+    assert!(script.contains("trust it and inspect/extract from the current page"));
+}
+
+#[test]
+fn browser_script_prompt_guides_model_controlled_email_and_stable_selectors() {
+    let script = browser_script_tool_description();
+
+    assert!(script.contains("fill_input(selector, text, clear=True, timeout=3)"));
+    assert!(script.contains("current_datetime()"));
+    assert!(script.contains("email_inbox(limit=20, sent_after=None)"));
+    assert!(script.contains("email_inbox(sent_after=...)"));
+    assert!(script.contains("avoid brittle positional selectors"));
+    assert!(script.contains("input:nth-of-type(2)"));
+    assert!(script.contains("compare `timestamp`/`message_id` yourself"));
+    assert!(script.contains("verify the message `timestamp`"));
+}
+
+#[test]
+fn dataset_prompt_enforces_timeboxed_finalization() {
+    let prompt = include_str!("../../../../prompts/dataset-case-user.md");
+
+    assert!(prompt.contains("Timebox contract"));
+    assert!(prompt.contains("soft deadline"));
+    assert!(prompt.contains("hard deadline"));
+    assert!(prompt.contains("Never keep running until the external runner timeout"));
+}
+
 /// Plan mode was removed. The compatibility enum value now renders the Default
 /// asset so stale configs do not re-enable planning behavior.
 #[test]
@@ -141,13 +210,26 @@ fn browser_tool_descriptions_preserve_interaction_skills() {
         script.contains("js(function_source, *args)"),
         "browser_script description lost js argument helper guidance"
     );
+    assert!(
+        script.contains("http_get_many(urls, **kwargs)")
+            && script.contains("browser_fetch_many(requests, **kwargs)"),
+        "browser_script description lost batch/direct fetch helper guidance"
+    );
+    assert!(
+        script.contains("Batch recipe after discovering stable links or endpoints")
+            && script.contains("responses = http_get_many(urls, timeout=12, max_workers=8)")
+            && script.contains("Fetched ${$.ok_count}/${$.total} independent URLs"),
+        "browser_script description lost its concrete batch-fetch adoption recipe"
+    );
 
     // The base system prompt enumerates the page-interaction helpers, including
     // the screenshot/image helpers used for visual inspection.
     assert!(
         BASE_SYSTEM_PROMPT.contains("capture_screenshot")
             && BASE_SYSTEM_PROMPT.contains("emit_image")
-            && BASE_SYSTEM_PROMPT.contains("js(function_source, *args)"),
+            && BASE_SYSTEM_PROMPT.contains("js(function_source, *args)")
+            && BASE_SYSTEM_PROMPT.contains("http_get_many")
+            && BASE_SYSTEM_PROMPT.contains("browser_fetch_many"),
         "base system prompt lost its screenshot/image interaction helpers"
     );
 }

@@ -2,6 +2,77 @@
 
 _Last updated: 2026-05-30. Single source of truth for what is DONE vs NOT._
 
+## 2026-06-05 browser-use Rust SDK eval integration
+
+- [x] Runtime prompt replay now receives `browser_script` tool results through the
+  normal `tool.output` event path. This fixes eval traces where the first
+  `browser_script` page probe or navigation was replayed to the model as
+  `aborted`, causing repeated navigate/status/recover loops before the agent
+  could interact with the browser.
+- [x] Provider-message reconstruction now de-duplicates multiple
+  `tool.output` events with the same `tool_call_id`, preserving the first rich
+  browser result when both the browser handler and generic dispatcher emit an
+  output for the same call.
+- [x] `browser_script` now waits up to 15s before detaching into
+  observe/run-id mode. This keeps normal navigation/screenshot/page-info scripts
+  attached long enough to return direct page state, reducing traces where the
+  model immediately observes, repeats navigation, or burns steps checking browser
+  status after a slow page load.
+- [x] `goto_url(...)` now emits a compact structured `navigation` observation
+  even when the model calls it as a bare statement and discards the Python return
+  value. This gives the next turn explicit evidence that navigation was sent,
+  without adding an implicit load wait or screenshots.
+- [x] Navigation observations now include bounded target-level page state
+  (`page_state.target.url/title` when CDP target metadata reflects the requested
+  URL), and mutable `browser status --json` paths enrich `page` with URL/title
+  when probing is available. This gives repeated status/recovery loops concrete
+  page evidence without forcing a full load wait.
+- [x] Navigation helpers now perform a bounded readiness wait and return
+  `navigation_ready` with `page_info` in the same `browser_script` result when
+  the target page is inspectable. This addresses traces where the model sent
+  `navigate`, saw only a "navigation sent" placeholder on the next turn, and
+  repeated navigation/status calls instead of inspecting the page.
+- [x] Provider image normalization now downsamples oversized data-URL screenshots
+  before they are sent to Anthropic. This keeps visual context attached while
+  avoiding Claude's many-image request limit where any image dimension above
+  2000px causes an HTTP 400 and collapses the eval result to `None`.
+- [x] The direct `browser-use-llm` Anthropic Messages serializer now also
+  downsamples oversized inline `ContentPart::Media` base64 images before
+  request construction. This covers the live Rust model-transport path that
+  bypasses provider JSON normalization and previously still hit
+  `messages.*.content.*.image.source.base64.data` 2000px rejections.
+- [x] The Python `browser_use.rust.Agent` wrapper now pre-navigates CDP-backed
+  browser sessions by default before starting the Rust SDK run, while retaining
+  `BROWSER_USE_RUST_DIRECT_INITIAL_NAVIGATION=0` as an opt-out. This means
+  Browser Use Cloud CDP evals start Rust on the already-loaded task URL and pass
+  a "continue from current page" task context instead of making the model spend
+  its first turns repeatedly calling `navigate`/browser-status recovery.
+- [x] Remote-CDP browser prompts and `browser_script` tool documentation now
+  match the loaded-page contract: preloaded task URLs should be inspected first,
+  and `navigation_ready` + `page_info` results from `goto_url(...)`/`new_tab(...)`
+  should be trusted instead of repeating the same navigation. The Python wrapper
+  task context also tells the Rust agent to inspect current page state before
+  any repeat navigation.
+- [x] `browser_script` result-envelope state now lives in function locals, so
+  model-written Python globals like `ok`, `error`, `stdout`, or `stderr` cannot
+  corrupt the final `__BROWSER_SCRIPT_RESULT__` marker. This fixes eval failures
+  where Rust rejected a completed script result with `invalid type: sequence,
+  expected a boolean`.
+- Proof:
+  - `cargo test -p browser-use-browser browser_script_user_globals_cannot_corrupt_result_envelope -- --nocapture`
+  - `uv run pytest tests/ci/test_rust_agent.py -q -k 'direct_initial_navigation or initial_actions_can_pre_navigate_existing_cdp_session or run_pre_navigates_cdp_session_before_sdk_by_default'`
+  - `cargo test -p browser-use-agent prompts::tests`
+  - `cargo fmt --all --check`
+  - `cargo test -p browser-use-providers anthropic_messages_downsamples_oversized_tool_images -- --nocapture`
+  - `cargo test -p browser-use-providers anthropic_messages -- --nocapture`
+  - `cargo test -p browser-use-llm build_body_downsamples_oversized_inline_media_for_anthropic -- --nocapture`
+  - `cargo test -p browser-use-llm anthropic_messages -- --nocapture`
+  - `cargo test -p browser-use-agent duplicate_tool_output_keeps_first_browser_script_result -- --nocapture`
+  - `cargo test -p browser-use-agent fused_browser_script_dispatch_emits_runtime_tool_output_event -- --nocapture`
+  - `cargo test -p browser-use-browser browser_script_initial_wait_defaults_to_fifteen_seconds_and_clamps_env -- --nocapture`
+  - `cargo test -p browser-use-browser browser_script_navigation_helpers_wait_for_page_state -- --nocapture`
+  - `cargo test -p browser-use-browser browser_script_start_observe_finishes_slow_scripts -- --test-threads=1 --nocapture`
+
 ## Trust rule
 Only commits **made and test-verified in the working session** are trusted. A separate
 agent ran on similarly-named branches (`sanfrancisco-*`) and the branch namespace got
@@ -303,3 +374,95 @@ Switch `browser-use-tui` + `browser-use-cli` from `browser-use-core` → `browse
 
 ## FINAL CUTOVER = [BLOCKED-NEEDS-HUMAN]
 After all 4 safety WPs: switch browser-use-tui + browser-use-cli from browser-use-core → browser-use-agent, retire browser-use-core. ONLY human-gated step — do NOT do autonomously.
+
+---
+
+## Browser-Use Rust SDK Integration Proof Ledger
+
+- [x] SDK browser-use API tool surface — the Python `browser_use.rust.Agent` now
+  sends `config_overrides.tool_allowlist=["browser","browser_script","done"]`
+  with SDK runs, and the terminal SDK server converts JSON-RPC config overrides
+  into `AgentRunOptions.config_overrides` before building the production tool
+  registry. This keeps browser-use API/eval runs on the browser interaction
+  surface and prevents model-visible drift into `exec_command`, `python`,
+  `apply_patch`, planning, image, or hosted-search workspace tools unless a
+  caller uses another terminal entrypoint/config.
+  - Proof: `uv run pytest tests/ci/test_rust_agent.py -q -k 'translates_browser_use_args_to_terminal or run_pre_navigates_cdp_session_before_sdk_by_default'`
+  - Proof: `cargo test -q -p browser-use-cli sdk_provider_run_config_accepts_browser_use_tool_allowlist`
+  - Proof: `cargo test -q -p browser-use-agent browser_use_api_tool_allowlist_hides_workspace_tools`
+  - Proof: `cargo fmt --all --check`
+
+- [x] Busy browser-script status recovery — `browser status --json` now returns
+  live busy guidance when a long `browser_script` has checked out the browser
+  session, including the active script `run_id`, an observe next step, and a
+  page-probed checkout snapshot. This prevents the browser-use API agent from
+  treating a still-running navigation/script as a broken browser and wasting
+  steps on repeated navigation/status/recovery loops.
+  - Proof: `cargo test -q -p browser-use-browser browser_status`
+  - Proof: `cargo test -q -p browser-use-browser browser_recovery_while_checked_out_returns_busy_guidance`
+  - Proof: `cargo fmt --all --check && git diff --check`
+
+- [x] Idempotent browser-script observe — completed `browser_script` results are
+  cached briefly by `run_id`, so a repeated `observe` after completion returns
+  the final payload instead of an `unknown browser_script run_id` infrastructure
+  error. This keeps navigation/script results visible to the agent when it asks
+  for the same pending browser action one extra time.
+  - Proof: `cargo test -q -p browser-use-browser browser_script_observe_is_idempotent_after_completion`
+  - Proof: `cargo test -q -p browser-use-browser browser_script_start_observe_finishes_slow_scripts`
+  - Proof: `cargo test -q -p browser-use-browser browser_status`
+  - Proof: `cargo test -q -p browser-use-browser browser_recovery_while_checked_out_returns_busy_guidance`
+  - Proof: `cargo fmt --all --check && git diff --check`
+
+- [x] Browser-script start single-flight guard — starting a second
+  `browser_script` while a previous run is active now returns model-visible
+  observe/cancel guidance for the existing `run_id` instead of spawning another
+  CDP script against the same browser session. Navigation helper summaries also
+  promote `navigation_ready`, URL, title, readyState, and next step into the
+  compact summary that appears before large/truncated structured outputs. This
+  targets repeated navigate/status/recovery loops where the agent did not attach
+  the first navigation result to the next step.
+  - Proof: `cargo test -q -p browser-use-browser browser_script_start_defers_when_session_has_active_run`
+  - Proof: `cargo test -q -p browser-use-browser browser_script_navigation_helpers_wait_for_page_state`
+  - Proof: `cargo test -q -p browser-use-agent prompts::tests::prompts_avoid_screenshots_for_text_heavy_extraction`
+  - Proof: `cargo fmt --all --check && git diff --check`
+
+- [x] Browser-script JS lexical isolation — `js(...)` now wraps snippets with
+  top-level `let`/`const`/`class`/function declarations in an IIFE before CDP
+  `Runtime.evaluate`. This keeps repeated extraction snippets from failing with
+  `Identifier ... has already been declared` while preserving direct expression
+  behavior for simple reads like `document.title`.
+  - Proof: `cargo test -p browser-use-browser browser_script_js_wraps_top_level_lexical_declarations -- --nocapture`
+  - Proof: `cargo fmt --check`
+
+- [x] Browser fetch JSON body compatibility — `browser_fetch(...)` now accepts
+  the common Python-style `json=` keyword as an alias for `json_body=`, and
+  `browser_fetch_many(...)` accepts per-request `{"json": ...}` bodies. This
+  prevents model-authored browser API fetches from failing on a wrapper
+  signature mismatch while preserving the existing JSON serialization and
+  `Content-Type: application/json` behavior.
+  - Proof: `cargo test -p browser-use-browser browser_script_browser_fetch_single_returns_structured_errors_by_default -- --nocapture`
+
+- [x] Browser-script result envelope isolation — the helper now builds the
+  final `__BROWSER_SCRIPT_RESULT__` payload inside its own function scope, so
+  user-authored scripts cannot corrupt wrapper-owned `ok`, `error`, `stdout`,
+  or `stderr` variables by assigning those names in their extraction code.
+  This preserves a structured browser_script result even when model-authored
+  code shadows common variable names.
+  - Proof: `cargo test -p browser-use-browser browser_script_user_globals_cannot_corrupt_result_envelope -- --nocapture`
+
+- [x] Browser-script fresh-process `NameError` guidance — Python `NameError`
+  tracebacks from `browser_script` are now classified separately and return
+  model-visible recovery guidance that every variable must be defined in the
+  same call or loaded from checkpoint files because Python variables from
+  previous `browser_script` calls do not persist. This targets repeated
+  low-score action churn where the browser/page was still usable but the model
+  retried with stale script-local names.
+  - Proof: `cargo test -p browser-use-browser browser_script_tracebacks_are_not_treated_as_dropped_websockets -- --nocapture`
+
+- [x] Done tool timebox partial-result guidance — the `done` tool description
+  now explicitly tells the model to submit the best verified partial result
+  with unknown/incomplete fields marked when wall-clock or step budget is nearly
+  exhausted, instead of continuing until external cancellation. This targets
+  repeated evaluated-but-low rows where the agent had evidence but hit the
+  30-minute budget without an intentional finalization step.
+  - Proof: `cargo test -p browser-use-agent done_definition_preserves_timebox_partial_result_guidance -- --nocapture`

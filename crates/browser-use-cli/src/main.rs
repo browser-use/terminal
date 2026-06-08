@@ -1,6 +1,6 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs;
-use std::io::{self, BufRead, Read, Write};
+use std::io::{self, BufRead, IsTerminal, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::sync::{
@@ -16,11 +16,12 @@ use browser_use_agent::config_model::{
     model_catalog_for_cwd_with_options,
 };
 use browser_use_agent::config_overrides::{
-    apply_child_request_runtime_config, load_mcp_servers_for_profile, parse_config_overrides,
-    resolve_agent_roles_for_profile, resolve_approval_policy_for_profile,
-    resolve_collab_for_profile, resolve_guardian_for_profile, resolve_multi_agent_v2_for_profile,
-    AgentRunOptions, ChildAgentRunCompletion, ChildAgentRunRequest, ChildAgentRunner,
-    ConfigOverrides, ProviderBackend, ProviderRunConfig, RunConfigValueSource,
+    apply_child_request_runtime_config, apply_runtime_config_overrides,
+    load_mcp_servers_for_profile, parse_config_overrides, resolve_agent_roles_for_profile,
+    resolve_approval_policy_for_profile, resolve_collab_for_profile, resolve_guardian_for_profile,
+    resolve_multi_agent_v2_for_profile, AgentRunOptions, ChildAgentRunCompletion,
+    ChildAgentRunRequest, ChildAgentRunner, ConfigOverrides, ProviderBackend, ProviderRunConfig,
+    RunConfigValueSource,
 };
 use browser_use_agent::context::{
     append_user_shell_command_context_event, typed_user_input_payload_from_items_for_cwd,
@@ -60,11 +61,14 @@ use browser_use_protocol::{
     session_result_from_events, task_from_events,
 };
 use browser_use_providers::{
-    claude_code_oauth_authorize_url, claude_code_oauth_pkce,
-    exchange_claude_code_authorization_code, load_codex_auth, load_codex_auth_file,
-    load_codex_managed_auth, load_codex_managed_auth_file, parse_claude_code_authorization_input,
+    claude_code_oauth_authorize_url, claude_code_oauth_pkce, codex_callback_page,
+    codex_callback_status, codex_oauth_authorize_url, codex_oauth_pkce, codex_oauth_state,
+    exchange_claude_code_authorization_code, exchange_codex_authorization_code, load_codex_auth,
+    load_codex_auth_file, load_codex_managed_auth, load_codex_managed_auth_file,
+    parse_claude_code_authorization_input, parse_codex_authorization_input,
     ClaudeCodeOAuthCredential, CodexAuth, CodexManagedAuth, CLAUDE_CODE_CALLBACK_HOST,
-    CLAUDE_CODE_CALLBACK_PATH, CLAUDE_CODE_CALLBACK_PORT,
+    CLAUDE_CODE_CALLBACK_PATH, CLAUDE_CODE_CALLBACK_PORT, CODEX_CALLBACK_HOST, CODEX_CALLBACK_PATH,
+    CODEX_CALLBACK_PORT,
 };
 use browser_use_python_worker::PythonWorker;
 use browser_use_runtime::{
@@ -72,19 +76,58 @@ use browser_use_runtime::{
     CompleteAgentRequest, CreateRootAgentRequest, Durability as RuntimeDurability,
     FailAgentRequest, LiveThreadPersistence, LocalRuntimeRequest, LocalRuntimeWaitTarget,
     MailboxDeliveryPhase as RuntimeMailboxDeliveryPhase, MailboxItemKind as RuntimeMailboxItemKind,
-    MemoryJournal, RunAgentRequest, RunId as RuntimeRunId, RuntimeHandle, RuntimeProjectionState,
-    SessionId, SpawnChildRequest, SqliteJournal, StateIndex, SubmitInputRequest,
+    RunAgentRequest, RunId as RuntimeRunId, RuntimeHandle, RuntimeProjectionState, SessionId,
+    SpawnChildRequest, SqliteJournal, StateIndex, SubmitInputRequest,
 };
 #[cfg(test)]
 use browser_use_runtime::{AttachChildAgentRequest, AttachRootAgentRequest};
 use browser_use_store::{now_ms, resolve_state_dir, Store};
 use clap::{Parser, Subcommand, ValueEnum};
+use reqwest::Url;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 const MESSAGE_KIND_FOLLOWUP: &str = "followup";
+const SDK_PROTOCOL_VERSION: u64 = 1;
 const APPROX_CHARS_PER_TOKEN: usize = 4;
 const DATASET_BROWSER_CLEANUP_TIMEOUT: Duration = Duration::from_secs(15);
+const SDK_EVENT_STRING_LIMIT_BYTES: usize = 1_000_000;
+const SDK_JSON_RPC_FRAME_LIMIT_BYTES: usize = 8 * 1024 * 1024;
+const SDK_HISTORY_EVENTS_HEAD_COUNT: usize = 20;
+const SDK_HISTORY_EVENTS_INITIAL_TAIL_COUNT: usize = 400;
+
+fn should_color_stdout() -> bool {
+    io::stdout().is_terminal() && std::env::var_os("NO_COLOR").is_none()
+}
+
+fn ansi(text: impl AsRef<str>, code: &str) -> String {
+    let text = text.as_ref();
+    if should_color_stdout() {
+        format!("\x1b[{code}m{text}\x1b[0m")
+    } else {
+        text.to_string()
+    }
+}
+
+fn cli_heading(text: impl AsRef<str>) -> String {
+    ansi(text, "1;38;5;208")
+}
+
+fn cli_code(text: impl AsRef<str>) -> String {
+    ansi(text, "1;38;5;208")
+}
+
+fn cli_link(text: impl AsRef<str>) -> String {
+    ansi(text, "4;38;5;39")
+}
+
+fn cli_muted(text: impl AsRef<str>) -> String {
+    ansi(text, "2")
+}
+
+fn cli_success(text: impl AsRef<str>) -> String {
+    ansi(text, "1;32")
+}
 
 #[derive(Debug, Parser)]
 #[command(name = "browser-use-terminal", bin_name = "browser-use-terminal")]
@@ -192,13 +235,18 @@ enum Command {
         #[arg(long, default_value = "deepseek-v4-pro")]
         model: String,
     },
-    /// Run a task against the codex (chatgpt.com) backend via the Codex CLI login.
+    /// Run a task against the Codex (chatgpt.com) backend via Codex OAuth.
     ///
-    /// Credentials resolve env-first (`CODEX_ACCESS_TOKEN` + `CODEX_ACCOUNT_ID`),
-    /// then the credential store (`auth login codex` / `auth import-codex`), then
-    /// `~/.codex/auth.json`.
+    /// Credentials resolve env-first (`LLM_BROWSER_CODEX_ACCESS_TOKEN` +
+    /// `LLM_BROWSER_CODEX_ACCOUNT_ID`), then the credential store
+    /// (`auth login codex` / `auth import-codex`).
     RunCodex {
         text: String,
+        #[arg(long, default_value = "gpt-5.1-codex")]
+        model: String,
+    },
+    RunCodexSession {
+        task_id: String,
         #[arg(long, default_value = "gpt-5.1-codex")]
         model: String,
     },
@@ -306,6 +354,19 @@ enum Command {
     Auth {
         #[command(subcommand)]
         command: AuthCommand,
+    },
+    /// Manage domain-scoped secrets (passwords + TOTP 2FA) for browser logins.
+    ///
+    /// Values are stored in the OS keychain; only metadata (domain, name, kind)
+    /// is kept in the app database. The agent only ever sees placeholder names.
+    Secrets {
+        #[command(subcommand)]
+        command: SecretsCommand,
+    },
+    /// Manage the navigation allow/deny policy enforced during browser tasks.
+    Domains {
+        #[command(subcommand)]
+        command: DomainsCommand,
     },
     Diagnostics,
     SdkServer {
@@ -549,6 +610,8 @@ enum AuthCommand {
         #[arg(long)]
         code: Option<String>,
         #[arg(long)]
+        device_code: bool,
+        #[arg(long)]
         no_browser: bool,
     },
     ImportCodex {
@@ -557,7 +620,75 @@ enum AuthCommand {
     },
     Logout {
         account: AuthAccount,
+        #[arg(long)]
+        local_only: bool,
     },
+}
+
+#[derive(Debug, Subcommand)]
+enum SecretsCommand {
+    /// Store a secret. Prompts for the value with no echo (or reads --stdin).
+    Set {
+        #[arg(long)]
+        domain: String,
+        #[arg(long)]
+        name: String,
+        /// Treat the value as a base32 TOTP seed (2FA), generating codes at fill time.
+        #[arg(long)]
+        totp: bool,
+        /// Extra domains this secret may also be used on (comma-separated).
+        #[arg(long, value_delimiter = ',')]
+        allow: Vec<String>,
+        /// Read the value from stdin instead of prompting (for scripted use).
+        #[arg(long)]
+        stdin: bool,
+    },
+    /// List configured secrets (metadata only — never values).
+    List,
+    /// Remove a secret.
+    Remove {
+        #[arg(long)]
+        domain: String,
+        #[arg(long)]
+        name: String,
+    },
+    /// Import saved logins (passwords + 2FA) live from 1Password.
+    ///
+    /// Reads Login items via the `op` CLI, which must be installed and signed in
+    /// (`op signin`). Each login becomes username/password/otp secrets.
+    Import,
+    /// Configure email one-time-code (2FA / verification) via AgentMail.
+    Email {
+        #[command(subcommand)]
+        action: EmailCommand,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum EmailCommand {
+    /// Store your AgentMail API token (prompts with no echo, or reads --stdin).
+    SetToken {
+        #[arg(long)]
+        stdin: bool,
+    },
+    /// Show whether email-2FA is configured and the inbox address.
+    Status,
+    /// Provision (if needed) and print the agent's inbox email address.
+    Address,
+    /// Remove the AgentMail token and cached inbox.
+    Clear,
+}
+
+#[derive(Debug, Subcommand)]
+enum DomainsCommand {
+    /// Allow navigation to a domain (and its subdomains). Supports `*.example.com`.
+    Allow { domain: String },
+    /// Block navigation to a domain (checked before the allow-list).
+    Deny { domain: String },
+    /// Show the current allow/deny lists.
+    List,
+    /// Clear both allow and deny lists.
+    Clear,
 }
 
 #[derive(Debug, Subcommand)]
@@ -750,6 +881,15 @@ fn main() -> Result<()> {
             collaboration_mode,
             &runtime_options,
         ),
+        Command::RunCodexSession { task_id, model } => run_codex_session(
+            &store,
+            &task_id,
+            model,
+            config_profile.as_deref(),
+            &config_overrides,
+            collaboration_mode,
+            &runtime_options,
+        ),
         Command::RunOpenaiSession { task_id, model } => run_openai_session(
             &store,
             &task_id,
@@ -836,6 +976,8 @@ fn main() -> Result<()> {
             &config_overrides,
         ),
         Command::Auth { command } => auth(&store, command),
+        Command::Secrets { command } => secrets(&store, command),
+        Command::Domains { command } => domains(&store, command),
         Command::Diagnostics => diagnostics(&store),
         Command::SdkServer { .. } => unreachable!("sdk-server is handled before Store bootstrap"),
         Command::Trace { task_id, output } => trace(&store, &task_id, output),
@@ -1066,6 +1208,7 @@ fn command_name(command: &Command) -> &'static str {
         Command::RunOpenrouter { .. } => "run_openrouter",
         Command::RunDeepseek { .. } => "run_deepseek",
         Command::RunCodex { .. } => "run_codex",
+        Command::RunCodexSession { .. } => "run_codex_session",
         Command::RunOpenaiSession { .. } => "run_openai_session",
         Command::RunAnthropicSession { .. } => "run_anthropic_session",
         Command::RunOpenrouterSession { .. } => "run_openrouter_session",
@@ -1087,6 +1230,8 @@ fn command_name(command: &Command) -> &'static str {
         Command::Import { .. } => "import",
         Command::Config { .. } => "config",
         Command::Auth { .. } => "auth",
+        Command::Secrets { .. } => "secrets",
+        Command::Domains { .. } => "domains",
         Command::Diagnostics => "diagnostics",
         Command::SdkServer { .. } => "sdk_server",
         Command::Trace { .. } => "trace",
@@ -1960,6 +2105,7 @@ fn cli_agent_options(
         options = options.with_mcp_servers(mcp_servers);
     }
     if !config_overrides.is_empty() {
+        apply_runtime_config_overrides(&mut options, &config_overrides)?;
         options = options.with_config_overrides(config_overrides);
     }
     Ok(options)
@@ -2169,6 +2315,28 @@ fn run_codex(
             runtime_options,
         )?);
     run_new_session_from_config(store, text, config)
+}
+
+fn run_codex_session(
+    store: &Store,
+    task_id: &str,
+    model: String,
+    config_profile: Option<&str>,
+    raw_config_overrides: &[String],
+    collaboration_mode: CollaborationModeKind,
+    runtime_options: &CliRuntimeOptions,
+) -> Result<()> {
+    ensure_task_exists(store, task_id)?;
+    let config =
+        ProviderRunConfig::new(ProviderBackend::Codex, model).with_options(cli_agent_options(
+            config_profile,
+            raw_config_overrides,
+            collaboration_mode,
+            runtime_options,
+        )?);
+    let session_id = run_existing_session_from_config_and_notify(store, task_id, config, None)?;
+    println!("{session_id}");
+    Ok(())
 }
 
 fn run_openai_session(
@@ -2803,15 +2971,12 @@ fn python(store: &Store, task_id: &str, code: String) -> Result<()> {
 fn browser_script(store: &Store, task_id: &str, code: String) -> Result<()> {
     let task = ensure_task_exists(store, task_id)?;
     let tool_call_id = format!("browser_script-cli-{task_id}");
-    if let Some(cdp_url) = std::env::var("BU_CDP_URL")
-        .ok()
-        .filter(|url| !url.trim().is_empty())
-    {
+    if let Some(connect_command) = remote_cdp_connect_command_from_env() {
         let connect = browser_use_browser::run_browser_command(
             task_id,
             &task.cwd,
             &task.artifact_root,
-            &format!("browser connect remote-cdp --url {}", cdp_url.trim()),
+            &connect_command,
         )?;
         if connect.content.get("status").and_then(Value::as_str) != Some("connected") {
             bail!("browser connect remote-cdp failed: {}", connect.content);
@@ -2860,6 +3025,30 @@ fn browser_script(store: &Store, task_id: &str, code: String) -> Result<()> {
     )
 }
 
+fn remote_cdp_connect_command_from_env() -> Option<String> {
+    std::env::var("BU_CDP_WS")
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .or_else(|| {
+            std::env::var("BU_CDP_URL")
+                .ok()
+                .map(|value| value.trim().to_string())
+                .filter(|value| !value.is_empty())
+        })
+        .map(|endpoint| {
+            let flag = if endpoint.starts_with("ws://") || endpoint.starts_with("wss://") {
+                "--ws"
+            } else {
+                "--url"
+            };
+            format!(
+                "browser connect remote-cdp {flag} {}",
+                shell_quote_arg(&endpoint)
+            )
+        })
+}
+
 #[derive(Clone, Debug)]
 struct SyncCookiesArgs {
     profile: Option<String>,
@@ -2878,6 +3067,7 @@ fn run_cookie_sync_browser_command(store: &Store, args: &[String]) -> Result<Val
     let artifact_root = cli_browser_artifact_root(store)?;
     let options = browser_use_browser::BrowserCommandOptions {
         browser_use_api_key,
+        browser_use_api_url: Some(browser_use_cloud_api_base_url()),
     };
     Ok(browser_use_browser::run_browser_command_with_options(
         "cli-browser",
@@ -3170,7 +3360,194 @@ fn is_secret_setting(key: &str) -> bool {
 }
 
 const BROWSER_USE_CLOUD_API_KEY_SETTING: &str = "auth.browser_use_cloud.api_key";
+const BROWSER_USE_CLOUD_API_KEY_ID_SETTING: &str = "auth.browser_use_cloud.api_key_id";
+const BROWSER_USE_CLOUD_API_KEY_SOURCE_SETTING: &str = "auth.browser_use_cloud.api_key_source";
+const BROWSER_USE_CLOUD_API_KEY_PROJECT_SETTING: &str = "auth.browser_use_cloud.project_id";
+const BROWSER_USE_CLOUD_API_KEY_EXPIRES_SETTING: &str = "auth.browser_use_cloud.expires_at";
+const BROWSER_USE_CLOUD_API_KEY_SCOPES_SETTING: &str = "auth.browser_use_cloud.scopes";
 const BROWSER_USE_CLOUD_API_KEY_ENV: &str = "BROWSER_USE_API_KEY";
+const BROWSER_USE_CLOUD_API_URL_ENV: &str = "BROWSER_USE_CLOUD_API_URL";
+const BROWSER_USE_CLOUD_DEFAULT_API_URL: &str = "https://api.browser-use.com";
+const BROWSER_USE_CLOUD_LOCAL_API_URL: &str = "http://localhost:8000";
+const BROWSER_USE_CLOUD_LOCAL_APP_URL: &str = "http://localhost:3000";
+const BROWSER_USE_CLOUD_DEVICE_GRANT_TYPE: &str = "urn:ietf:params:oauth:grant-type:device_code";
+const BROWSER_USE_CLOUD_AUTHORIZATION_CODE_GRANT_TYPE: &str = "authorization_code";
+const BROWSER_USE_CLOUD_CLIENT_ID: &str = "browser-use-terminal";
+const BROWSER_USE_CLOUD_CALLBACK_PATH: &str = "/browser-use-cloud/callback";
+
+fn secrets(store: &Store, command: SecretsCommand) -> Result<()> {
+    use browser_use_agent::tools::handlers::secrets_admin as sa;
+    match command {
+        SecretsCommand::Set {
+            domain,
+            name,
+            totp,
+            allow,
+            stdin,
+        } => {
+            let kind = if totp {
+                sa::Kind::Totp
+            } else {
+                sa::Kind::Password
+            };
+            let value = if stdin {
+                let mut buf = String::new();
+                std::io::Read::read_to_string(&mut std::io::stdin(), &mut buf)?;
+                buf.trim_end_matches(['\n', '\r']).to_string()
+            } else {
+                let prompt = if totp {
+                    format!("Base32 TOTP seed for {name} @ {domain} (hidden): ")
+                } else {
+                    format!("Value for {name} @ {domain} (hidden): ")
+                };
+                rpassword::prompt_password(prompt)?
+            };
+            let meta = sa::set_secret_active(store, &domain, &name, kind, allow, &value)?;
+            println!(
+                "Stored {} secret {:?} for {} (encrypted file).",
+                meta.kind.as_str(),
+                meta.placeholder,
+                meta.domain
+            );
+            Ok(())
+        }
+        SecretsCommand::List => {
+            let metas = sa::list_secrets(store)?;
+            if metas.is_empty() {
+                println!(
+                    "No secrets configured. Add one with `secrets set --domain <d> --name <n>`."
+                );
+                return Ok(());
+            }
+            println!("{:<28} {:<18} {}", "DOMAIN", "NAME", "KIND");
+            for meta in metas {
+                let extra = if meta.allowed_domains.is_empty() {
+                    String::new()
+                } else {
+                    format!("  (+{})", meta.allowed_domains.join(", "))
+                };
+                println!(
+                    "{:<28} {:<18} {}{}",
+                    meta.domain,
+                    meta.placeholder,
+                    meta.kind.as_str(),
+                    extra
+                );
+            }
+            Ok(())
+        }
+        SecretsCommand::Remove { domain, name } => {
+            if sa::remove_secret_active(store, &domain, &name)? {
+                println!("Removed secret {name:?} for {domain}.");
+            } else {
+                println!("No secret {name:?} found for {domain}.");
+            }
+            Ok(())
+        }
+        SecretsCommand::Import => {
+            use browser_use_agent::tools::handlers::secrets_import as si;
+            let stats = si::import_1password(store)?;
+            if stats.changed_logins() == 0 {
+                println!(
+                    "Already up to date — {} login(s) from 1Password, nothing new.",
+                    stats.unchanged_logins
+                );
+            } else {
+                println!(
+                    "Synced 1Password: {} new, {} updated ({} unchanged).",
+                    stats.new_logins, stats.updated_logins, stats.unchanged_logins
+                );
+            }
+            Ok(())
+        }
+        SecretsCommand::Email { action } => secrets_email(store, action),
+    }
+}
+
+fn secrets_email(store: &Store, command: EmailCommand) -> Result<()> {
+    use browser_use_agent::tools::handlers::secrets_admin as sa;
+    match command {
+        EmailCommand::SetToken { stdin } => {
+            let token = if stdin {
+                let mut buf = String::new();
+                std::io::Read::read_to_string(&mut std::io::stdin(), &mut buf)?;
+                buf.trim().to_string()
+            } else {
+                rpassword::prompt_password("AgentMail API token (hidden): ")?
+            };
+            sa::set_agentmail_token(store, &token)?;
+            println!("Saved AgentMail token. Run `secrets email address` to provision the inbox.");
+            Ok(())
+        }
+        EmailCommand::Status => {
+            if sa::email_2fa_configured(store) {
+                match store.get_setting(sa::AGENTMAIL_INBOX_KEY)? {
+                    Some(inbox) if !inbox.is_empty() => {
+                        println!("Email 2FA: configured (AgentMail). Inbox: {inbox}")
+                    }
+                    _ => println!(
+                        "Email 2FA: configured (AgentMail). Inbox not provisioned yet — run `secrets email address`."
+                    ),
+                }
+            } else {
+                println!("Email 2FA: not configured. Set a token with `secrets email set-token`.");
+            }
+            Ok(())
+        }
+        EmailCommand::Address => {
+            let inbox = sa::agentmail_inbox_address(store)?;
+            println!("{inbox}");
+            Ok(())
+        }
+        EmailCommand::Clear => {
+            sa::clear_agentmail_token(store)?;
+            println!("Removed AgentMail token and cached inbox.");
+            Ok(())
+        }
+    }
+}
+
+fn domains(store: &Store, command: DomainsCommand) -> Result<()> {
+    use browser_use_agent::tools::handlers::secrets_admin as sa;
+    match command {
+        DomainsCommand::Allow { domain } => {
+            let list = sa::add_domain(store, &domain, true)?;
+            println!("Allowed domains: {}", list.join(", "));
+            Ok(())
+        }
+        DomainsCommand::Deny { domain } => {
+            let list = sa::add_domain(store, &domain, false)?;
+            println!("Denied domains: {}", list.join(", "));
+            Ok(())
+        }
+        DomainsCommand::List => {
+            let (allow, deny) = sa::list_domains(store)?;
+            println!(
+                "Allowed: {}",
+                if allow.is_empty() {
+                    "(none — navigation is unrestricted until you allow or deny a domain)"
+                        .to_string()
+                } else {
+                    allow.join(", ")
+                }
+            );
+            println!(
+                "Denied:  {}",
+                if deny.is_empty() {
+                    "(none)".to_string()
+                } else {
+                    deny.join(", ")
+                }
+            );
+            Ok(())
+        }
+        DomainsCommand::Clear => {
+            sa::clear_domains(store)?;
+            println!("Cleared the navigation allow/deny lists.");
+            Ok(())
+        }
+    }
+}
 
 fn auth(store: &Store, command: AuthCommand) -> Result<()> {
     match command {
@@ -3215,6 +3592,7 @@ fn auth(store: &Store, command: AuthCommand) -> Result<()> {
             access_token,
             account_id,
             code,
+            device_code,
             no_browser,
         } => auth_login(
             store,
@@ -3223,6 +3601,7 @@ fn auth(store: &Store, command: AuthCommand) -> Result<()> {
             access_token,
             account_id,
             code,
+            device_code,
             no_browser,
         ),
         AuthCommand::ImportCodex { input } => {
@@ -3249,8 +3628,11 @@ fn auth(store: &Store, command: AuthCommand) -> Result<()> {
             println!("Codex login: imported account {}", auth.account_id);
             Ok(())
         }
-        AuthCommand::Logout { account } => {
-            auth_logout(store, account)?;
+        AuthCommand::Logout {
+            account,
+            local_only,
+        } => {
+            auth_logout(store, account, local_only)?;
             println!("{}: logged out", auth_account_label(account));
             Ok(())
         }
@@ -3272,6 +3654,68 @@ fn print_auth_line(label: &str, connected: bool) {
     println!("{label}: {status}");
 }
 
+#[derive(Debug, Deserialize)]
+struct BrowserUseCloudDeviceStartResponse {
+    device_code: String,
+    user_code: String,
+    verification_uri: String,
+    expires_in: u64,
+    interval: u64,
+}
+
+#[derive(Debug, Serialize)]
+struct BrowserUseCloudDeviceStartRequest {
+    device_name: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct BrowserUseCloudDeviceTokenRequest<'a> {
+    grant_type: &'a str,
+    device_code: &'a str,
+}
+
+#[derive(Debug, Serialize)]
+struct BrowserUseCloudBrowserStartRequest<'a> {
+    client_id: &'a str,
+    response_type: &'a str,
+    redirect_uri: &'a str,
+    code_challenge: &'a str,
+    code_challenge_method: &'a str,
+    state: &'a str,
+    device_name: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct BrowserUseCloudBrowserStartResponse {
+    authorization_uri: String,
+    expires_in: u64,
+}
+
+#[derive(Debug, Serialize)]
+struct BrowserUseCloudAuthorizationCodeTokenRequest<'a> {
+    grant_type: &'a str,
+    code: &'a str,
+    redirect_uri: &'a str,
+    code_verifier: &'a str,
+    client_id: &'a str,
+}
+
+#[derive(Debug, Deserialize)]
+struct BrowserUseCloudTokenResponse {
+    api_key: String,
+    api_key_id: String,
+    project_id: String,
+    expires_at: Option<String>,
+    scopes: Vec<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct BrowserUseCloudTokenError {
+    error: String,
+    error_description: Option<String>,
+    interval: Option<u64>,
+}
+
 fn auth_login(
     store: &Store,
     account: AuthAccount,
@@ -3279,16 +3723,43 @@ fn auth_login(
     access_token: Option<String>,
     account_id: Option<String>,
     code: Option<String>,
+    device_code: bool,
     no_browser: bool,
 ) -> Result<()> {
     match account {
         AuthAccount::BrowserUseCloud => {
-            let api_key =
-                read_required_secret(api_key, &format!("{} API key", auth_account_label(account)))?;
-            let key = api_key_setting(account).context("account does not use an API key")?;
-            store.set_setting(key, api_key.trim())?;
+            if let Some(api_key) = api_key {
+                let api_key = read_required_secret(
+                    Some(api_key),
+                    &format!("{} API key", auth_account_label(account)),
+                )?;
+                store_browser_use_cloud_api_key(store, api_key.trim(), None)?;
+                println!(
+                    "{}: connected (stored API key)",
+                    auth_account_label(account)
+                );
+                return Ok(());
+            }
+            if code.is_some() {
+                bail!(
+                    "auth login browser-use-cloud uses --device-code for manual sign-in; --code is for Claude Code OAuth"
+                );
+            }
+            let credential = if device_code {
+                browser_use_cloud_device_login(!no_browser)?
+            } else {
+                browser_use_cloud_browser_login(!no_browser)?
+            };
+            store_browser_use_cloud_api_key(store, &credential.api_key, Some(&credential))?;
             store.set_setting("browser", "Browser Use Cloud")?;
-            println!("{}: connected (stored)", auth_account_label(account));
+            println!(
+                "{} {}",
+                cli_success(format!(
+                    "{}: connected to project",
+                    auth_account_label(account)
+                )),
+                credential.project_id
+            );
             Ok(())
         }
         AuthAccount::Openai
@@ -3305,27 +3776,23 @@ fn auth_login(
         }
         AuthAccount::Codex => {
             let auth = if access_token.is_some() || account_id.is_some() {
-                CodexAuth {
-                    access_token: access_token
+                CodexManagedAuth::from_stored_parts(
+                    access_token
                         .context("auth login codex requires --access-token with --account-id")?,
-                    account_id: account_id
+                    account_id
                         .context("auth login codex requires --account-id with --access-token")?,
-                }
+                    None,
+                    None,
+                    None,
+                    None,
+                )
             } else {
-                match load_codex_managed_auth() {
-                    Ok(managed_auth) => {
-                        let auth = managed_auth.current_auth()?;
-                        store_codex_managed_auth(store, &managed_auth)?;
-                        store.set_setting("account", "Codex login")?;
-                        println!("Codex login: connected account {}", auth.account_id);
-                        return Ok(());
-                    }
-                    Err(_) => load_codex_auth().context("load external Codex auth for login")?,
-                }
+                codex_login(code, !no_browser)?
             };
-            store_codex_auth(store, &auth)?;
+            let current = auth.current_auth()?;
+            store_codex_managed_auth(store, &auth)?;
             store.set_setting("account", "Codex login")?;
-            println!("Codex login: connected account {}", auth.account_id);
+            println!("Codex login: connected account {}", current.account_id);
             Ok(())
         }
         AuthAccount::ClaudeCode => {
@@ -3338,7 +3805,338 @@ fn auth_login(
     }
 }
 
-fn auth_logout(store: &Store, account: AuthAccount) -> Result<()> {
+fn browser_use_cloud_api_base_url() -> String {
+    if let Some(url) = std::env::var(BROWSER_USE_CLOUD_API_URL_ENV)
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+    {
+        return normalize_browser_use_cloud_url(&url);
+    }
+
+    if browser_use_cloud_local_dev_available() {
+        return BROWSER_USE_CLOUD_LOCAL_API_URL.to_string();
+    }
+
+    BROWSER_USE_CLOUD_DEFAULT_API_URL.to_string()
+}
+
+fn normalize_browser_use_cloud_url(url: &str) -> String {
+    url.trim().trim_end_matches('/').to_string()
+}
+
+fn browser_use_cloud_local_dev_available() -> bool {
+    let Ok(client) = reqwest::blocking::Client::builder()
+        .timeout(Duration::from_millis(700))
+        .build()
+    else {
+        return false;
+    };
+
+    browser_use_cloud_local_backend_available(&client)
+        && browser_use_cloud_local_frontend_available(&client)
+}
+
+fn browser_use_cloud_local_backend_available(client: &reqwest::blocking::Client) -> bool {
+    let version_ok = client
+        .get(format!(
+            "{BROWSER_USE_CLOUD_LOCAL_API_URL}/browser-use-version"
+        ))
+        .send()
+        .is_ok_and(|response| response.status().is_success());
+    if !version_ok {
+        return false;
+    }
+
+    client
+        .get(format!(
+            "{BROWSER_USE_CLOUD_LOCAL_API_URL}/cloud/cli-auth/device/0000-0000"
+        ))
+        .send()
+        .is_ok_and(|response| response.status() == reqwest::StatusCode::UNAUTHORIZED)
+}
+
+fn browser_use_cloud_local_frontend_available(client: &reqwest::blocking::Client) -> bool {
+    client
+        .head(format!("{BROWSER_USE_CLOUD_LOCAL_APP_URL}/device"))
+        .send()
+        .is_ok_and(|response| response.status().is_success())
+}
+
+fn browser_use_cloud_device_name() -> Option<String> {
+    std::env::var("HOSTNAME")
+        .or_else(|_| std::env::var("COMPUTERNAME"))
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
+fn browser_use_cloud_browser_login(open_browser: bool) -> Result<BrowserUseCloudTokenResponse> {
+    let base_url = browser_use_cloud_api_base_url();
+    let client = reqwest::blocking::Client::builder()
+        .timeout(Duration::from_secs(15))
+        .build()
+        .context("build Browser Use Cloud auth client")?;
+    let (code_verifier, code_challenge) = claude_code_oauth_pkce();
+    let (state, _) = claude_code_oauth_pkce();
+    let (tx, rx) = mpsc::channel();
+    let (_callback, redirect_uri) = start_browser_use_cloud_callback_server(state.clone(), tx)?;
+
+    let start = client
+        .post(format!("{base_url}/cloud/cli-auth/browser"))
+        .json(&BrowserUseCloudBrowserStartRequest {
+            client_id: BROWSER_USE_CLOUD_CLIENT_ID,
+            response_type: "code",
+            redirect_uri: &redirect_uri,
+            code_challenge: &code_challenge,
+            code_challenge_method: "S256",
+            state: &state,
+            device_name: browser_use_cloud_device_name(),
+        })
+        .send()
+        .context("start Browser Use Cloud browser authorization")?
+        .error_for_status()
+        .context("start Browser Use Cloud browser authorization")?
+        .json::<BrowserUseCloudBrowserStartResponse>()
+        .context("parse Browser Use Cloud browser authorization")?;
+
+    println!("{}", cli_heading("Browser Use Cloud sign-in"));
+    println!();
+    println!(
+        "{} {}",
+        cli_muted("Open:"),
+        cli_link(&start.authorization_uri)
+    );
+    println!(
+        "{}",
+        cli_muted(format!(
+            "Waiting for browser approval on {redirect_uri} ..."
+        ))
+    );
+    println!();
+    println!(
+        "{}",
+        cli_muted("If the browser does not open, open the URL above.")
+    );
+    if open_browser {
+        if let Err(error) = open::that(&start.authorization_uri) {
+            eprintln!("Could not open browser automatically: {error}");
+        }
+    }
+
+    let authorization = rx
+        .recv_timeout(Duration::from_secs(start.expires_in.max(1)))
+        .context("timed out waiting for Browser Use Cloud browser approval")??;
+    if authorization.state.as_deref() != Some(&state) {
+        bail!("Browser Use Cloud OAuth state mismatch");
+    }
+    if let Some(error) = authorization.error {
+        let description = authorization
+            .error_description
+            .unwrap_or_else(|| "Browser Use Cloud sign-in was denied".to_string());
+        bail!("{description} ({error})");
+    }
+    let code = authorization
+        .code
+        .context("Browser Use Cloud authorization code was missing")?;
+
+    let response = client
+        .post(format!("{base_url}/cloud/cli-auth/token"))
+        .json(&BrowserUseCloudAuthorizationCodeTokenRequest {
+            grant_type: BROWSER_USE_CLOUD_AUTHORIZATION_CODE_GRANT_TYPE,
+            code: &code,
+            redirect_uri: &redirect_uri,
+            code_verifier: &code_verifier,
+            client_id: BROWSER_USE_CLOUD_CLIENT_ID,
+        })
+        .send()
+        .context("exchange Browser Use Cloud authorization code")?;
+    if response.status().is_success() {
+        return response
+            .json::<BrowserUseCloudTokenResponse>()
+            .context("parse Browser Use Cloud browser token");
+    }
+    let status = response.status();
+    let text = response.text().unwrap_or_default();
+    let error = serde_json::from_str::<BrowserUseCloudTokenError>(&text).unwrap_or(
+        BrowserUseCloudTokenError {
+            error: "server_error".to_string(),
+            error_description: Some(format!(
+                "Browser Use Cloud returned {status} during authorization code exchange"
+            )),
+            interval: None,
+        },
+    );
+    bail!(
+        "{}",
+        error
+            .error_description
+            .unwrap_or_else(|| format!("Browser Use Cloud sign-in failed: {}", error.error))
+    )
+}
+
+fn browser_use_cloud_device_login(open_browser: bool) -> Result<BrowserUseCloudTokenResponse> {
+    let base_url = browser_use_cloud_api_base_url();
+    let client = reqwest::blocking::Client::builder()
+        .timeout(Duration::from_secs(15))
+        .build()
+        .context("build Browser Use Cloud auth client")?;
+    let start = client
+        .post(format!("{base_url}/cloud/cli-auth/device"))
+        .json(&BrowserUseCloudDeviceStartRequest {
+            device_name: browser_use_cloud_device_name(),
+        })
+        .send()
+        .context("start Browser Use Cloud device authorization")?
+        .error_for_status()
+        .context("start Browser Use Cloud device authorization")?
+        .json::<BrowserUseCloudDeviceStartResponse>()
+        .context("parse Browser Use Cloud device authorization")?;
+
+    println!("{}", cli_heading("Browser Use Cloud sign-in"));
+    println!();
+    println!(
+        "{} {}",
+        cli_muted("Open:"),
+        cli_link(&start.verification_uri)
+    );
+    println!("{} {}", cli_muted("Code:"), cli_code(&start.user_code));
+    println!();
+    println!(
+        "{}",
+        cli_muted(format!(
+            "If the browser does not open, go to {} and enter the code.",
+            start.verification_uri
+        ))
+    );
+    if open_browser {
+        if let Err(error) = open::that(&start.verification_uri) {
+            eprintln!("Could not open browser automatically: {error}");
+        }
+    }
+
+    let deadline = Instant::now() + Duration::from_secs(start.expires_in);
+    let mut interval = Duration::from_secs(start.interval.max(1));
+    while Instant::now() < deadline {
+        thread::sleep(interval);
+        let response = match client
+            .post(format!("{base_url}/cloud/cli-auth/token"))
+            .json(&BrowserUseCloudDeviceTokenRequest {
+                grant_type: BROWSER_USE_CLOUD_DEVICE_GRANT_TYPE,
+                device_code: &start.device_code,
+            })
+            .send()
+        {
+            Ok(response) => response,
+            Err(_) => continue,
+        };
+        if response.status().is_success() {
+            return response
+                .json::<BrowserUseCloudTokenResponse>()
+                .context("parse Browser Use Cloud device token");
+        }
+
+        let status = response.status();
+        let text = response.text().unwrap_or_default();
+        let error = serde_json::from_str::<BrowserUseCloudTokenError>(&text).unwrap_or(
+            BrowserUseCloudTokenError {
+                error: "server_error".to_string(),
+                error_description: Some(format!(
+                    "Browser Use Cloud returned {status} during device authorization"
+                )),
+                interval: None,
+            },
+        );
+        match error.error.as_str() {
+            "authorization_pending" => {}
+            "slow_down" => {
+                interval = Duration::from_secs(error.interval.unwrap_or(10).max(1));
+            }
+            "access_denied" => bail!(
+                "{}",
+                error
+                    .error_description
+                    .unwrap_or_else(|| "Browser Use Cloud sign-in was denied".to_string())
+            ),
+            "expired_token" => bail!(
+                "{}",
+                error
+                    .error_description
+                    .unwrap_or_else(|| "Browser Use Cloud sign-in expired".to_string())
+            ),
+            _ => bail!(
+                "{}",
+                error.error_description.unwrap_or_else(|| format!(
+                    "Browser Use Cloud sign-in failed: {}",
+                    error.error
+                ))
+            ),
+        }
+    }
+    bail!("Browser Use Cloud sign-in expired")
+}
+
+fn store_browser_use_cloud_api_key(
+    store: &Store,
+    api_key: &str,
+    credential: Option<&BrowserUseCloudTokenResponse>,
+) -> Result<()> {
+    store.set_setting(BROWSER_USE_CLOUD_API_KEY_SETTING, api_key.trim())?;
+    store.set_setting("browser", "Browser Use Cloud")?;
+    if let Some(credential) = credential {
+        store.set_setting(BROWSER_USE_CLOUD_API_KEY_SOURCE_SETTING, "cli_login")?;
+        store.set_setting(BROWSER_USE_CLOUD_API_KEY_ID_SETTING, &credential.api_key_id)?;
+        store.set_setting(
+            BROWSER_USE_CLOUD_API_KEY_PROJECT_SETTING,
+            &credential.project_id,
+        )?;
+        if let Some(expires_at) = credential.expires_at.as_deref() {
+            store.set_setting(BROWSER_USE_CLOUD_API_KEY_EXPIRES_SETTING, expires_at)?;
+        } else {
+            store.delete_setting(BROWSER_USE_CLOUD_API_KEY_EXPIRES_SETTING)?;
+        }
+        store.set_setting(
+            BROWSER_USE_CLOUD_API_KEY_SCOPES_SETTING,
+            &serde_json::to_string(&credential.scopes)?,
+        )?;
+    } else {
+        store.set_setting(BROWSER_USE_CLOUD_API_KEY_SOURCE_SETTING, "manual")?;
+        store.delete_setting(BROWSER_USE_CLOUD_API_KEY_ID_SETTING)?;
+        store.delete_setting(BROWSER_USE_CLOUD_API_KEY_PROJECT_SETTING)?;
+        store.delete_setting(BROWSER_USE_CLOUD_API_KEY_EXPIRES_SETTING)?;
+        store.delete_setting(BROWSER_USE_CLOUD_API_KEY_SCOPES_SETTING)?;
+    }
+    Ok(())
+}
+
+fn revoke_browser_use_cloud_api_key(api_key: &str) -> Result<()> {
+    let base_url = browser_use_cloud_api_base_url();
+    let response = reqwest::blocking::Client::builder()
+        .timeout(Duration::from_secs(15))
+        .build()
+        .context("build Browser Use Cloud auth client")?
+        .delete(format!("{base_url}/cloud/cli-auth/current-key"))
+        .header("X-Browser-Use-API-Key", api_key.trim())
+        .send()
+        .context("revoke Browser Use Cloud API key")?;
+    if response.status().is_success() {
+        return Ok(());
+    }
+    let status = response.status();
+    let body = response.text().unwrap_or_default();
+    bail!("Browser Use Cloud key revocation failed with {status}: {body}")
+}
+
+fn clear_browser_use_cloud_api_key(store: &Store) -> Result<()> {
+    store.delete_setting(BROWSER_USE_CLOUD_API_KEY_SETTING)?;
+    store.delete_setting(BROWSER_USE_CLOUD_API_KEY_ID_SETTING)?;
+    store.delete_setting(BROWSER_USE_CLOUD_API_KEY_SOURCE_SETTING)?;
+    store.delete_setting(BROWSER_USE_CLOUD_API_KEY_PROJECT_SETTING)?;
+    store.delete_setting(BROWSER_USE_CLOUD_API_KEY_EXPIRES_SETTING)?;
+    store.delete_setting(BROWSER_USE_CLOUD_API_KEY_SCOPES_SETTING)?;
+    Ok(())
+}
+
+fn auth_logout(store: &Store, account: AuthAccount, local_only: bool) -> Result<()> {
     match account {
         AuthAccount::Codex => {
             store.delete_setting("auth.codex.access_token")?;
@@ -3357,7 +4155,16 @@ fn auth_logout(store: &Store, account: AuthAccount) -> Result<()> {
             }
         }
         AuthAccount::BrowserUseCloud => {
-            store.delete_setting(BROWSER_USE_CLOUD_API_KEY_SETTING)?;
+            let source = store.get_setting(BROWSER_USE_CLOUD_API_KEY_SOURCE_SETTING)?;
+            let api_key = store.get_setting(BROWSER_USE_CLOUD_API_KEY_SETTING)?;
+            if !local_only && source.as_deref() == Some("cli_login") {
+                if let Some(api_key) = api_key.as_deref().filter(|value| !value.trim().is_empty()) {
+                    revoke_browser_use_cloud_api_key(api_key).with_context(|| {
+                        "remote revocation failed; rerun with --local-only to remove only the local credential"
+                    })?;
+                }
+            }
+            clear_browser_use_cloud_api_key(store)?;
         }
         AuthAccount::ClaudeCode => {
             store.delete_setting("auth.claude_code.access_token")?;
@@ -3386,6 +4193,35 @@ fn read_required_secret(value: Option<String>, prompt: &str) -> Result<String> {
         bail!("{prompt} cannot be empty");
     }
     Ok(trimmed)
+}
+
+fn codex_login(code: Option<String>, open_browser: bool) -> Result<CodexManagedAuth> {
+    if code.is_some() {
+        bail!("Codex OAuth --code is not supported because PKCE requires the verifier from the generated login URL");
+    }
+
+    let (verifier, challenge) = codex_oauth_pkce();
+    let state = codex_oauth_state();
+    let (tx, rx) = mpsc::channel();
+    let _callback = start_codex_callback_server(state.clone(), tx)?;
+    let url = codex_oauth_authorize_url(&challenge, &state);
+    println!("Open this URL to login with Codex OAuth:\n");
+    println!("{url}");
+    println!(
+        "\nWaiting for browser callback on http://localhost:{CODEX_CALLBACK_PORT}{CODEX_CALLBACK_PATH} ..."
+    );
+    if open_browser {
+        if let Err(error) = open::that(&url) {
+            eprintln!("Could not open browser automatically: {error}");
+        }
+    }
+    let parsed = rx
+        .recv_timeout(Duration::from_secs(300))
+        .context("timed out waiting for Codex browser callback")??;
+    let auth_code = parsed
+        .code
+        .context("Codex authorization code was missing")?;
+    exchange_codex_authorization_code(&auth_code, &verifier)
 }
 
 fn claude_code_login(
@@ -3450,6 +4286,205 @@ impl Drop for CallbackServerHandle {
         if let Some(thread) = self.thread.take() {
             let _ = thread.join();
         }
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct BrowserUseCloudAuthorization {
+    code: Option<String>,
+    state: Option<String>,
+    error: Option<String>,
+    error_description: Option<String>,
+}
+
+fn start_browser_use_cloud_callback_server(
+    expected_state: String,
+    sender: mpsc::Sender<Result<BrowserUseCloudAuthorization>>,
+) -> Result<(CallbackServerHandle, String)> {
+    let listener = TcpListener::bind(("127.0.0.1", 0))
+        .context("bind Browser Use Cloud OAuth callback on 127.0.0.1")?;
+    let redirect_uri = format!(
+        "http://127.0.0.1:{}{}",
+        listener
+            .local_addr()
+            .context("read Browser Use Cloud OAuth callback address")?
+            .port(),
+        BROWSER_USE_CLOUD_CALLBACK_PATH
+    );
+    listener
+        .set_nonblocking(true)
+        .context("configure Browser Use Cloud OAuth callback listener")?;
+    let (stop_tx, stop_rx) = mpsc::channel::<()>();
+    let thread = std::thread::spawn(move || {
+        let deadline = Instant::now() + Duration::from_secs(900);
+        loop {
+            if stop_rx.try_recv().is_ok() || Instant::now() >= deadline {
+                break;
+            }
+            match listener.accept() {
+                Ok((mut stream, _)) => {
+                    let result = handle_browser_use_cloud_callback(&mut stream, &expected_state);
+                    let _ = sender.send(result);
+                    break;
+                }
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                    std::thread::sleep(Duration::from_millis(50));
+                }
+                Err(error) => {
+                    let _ =
+                        sender.send(Err(error).context("accept Browser Use Cloud OAuth callback"));
+                    break;
+                }
+            }
+        }
+    });
+    Ok((
+        CallbackServerHandle {
+            stop: stop_tx,
+            thread: Some(thread),
+        },
+        redirect_uri,
+    ))
+}
+
+fn handle_browser_use_cloud_callback(
+    stream: &mut TcpStream,
+    expected_state: &str,
+) -> Result<BrowserUseCloudAuthorization> {
+    let mut request = [0_u8; 4096];
+    let read = stream
+        .read(&mut request)
+        .context("read Browser Use Cloud OAuth callback")?;
+    let request = String::from_utf8_lossy(&request[..read]);
+    let path = request
+        .lines()
+        .next()
+        .and_then(|line| line.split_whitespace().nth(1))
+        .context("parse Browser Use Cloud OAuth callback request")?;
+    let parsed = parse_browser_use_cloud_authorization_path(path)?;
+    let callback_path = Url::parse(&format!("http://127.0.0.1{path}"))
+        .ok()
+        .map(|url| url.path().to_string())
+        .unwrap_or_default();
+    let status = if callback_path != BROWSER_USE_CLOUD_CALLBACK_PATH {
+        404
+    } else if parsed.state.as_deref() != Some(expected_state) {
+        400
+    } else if parsed.code.is_none() && parsed.error.is_none() {
+        400
+    } else {
+        200
+    };
+    let text = match status {
+        200 if parsed.error.is_some() => {
+            "Browser Use Cloud authorization was cancelled. You can close this window."
+        }
+        200 => "Browser Use Cloud authentication completed. You can close this window.",
+        400 => "Browser Use Cloud authentication failed: missing code or state mismatch.",
+        _ => "Browser Use Cloud callback route not found.",
+    };
+    let body = format!("<html><body><p>{text}</p></body></html>");
+    let reason = match status {
+        200 => "OK",
+        400 => "Bad Request",
+        _ => "Not Found",
+    };
+    let response = format!(
+        "HTTP/1.1 {status} {reason}\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        body.len()
+    );
+    stream.write_all(response.as_bytes()).ok();
+    if status == 200 {
+        Ok(parsed)
+    } else {
+        bail!("{text}")
+    }
+}
+
+fn parse_browser_use_cloud_authorization_path(path: &str) -> Result<BrowserUseCloudAuthorization> {
+    let url = Url::parse(&format!("http://127.0.0.1{path}"))
+        .context("parse Browser Use Cloud OAuth callback URL")?;
+    let mut authorization = BrowserUseCloudAuthorization::default();
+    for (key, value) in url.query_pairs() {
+        match key.as_ref() {
+            "code" => authorization.code = Some(value.into_owned()),
+            "state" => authorization.state = Some(value.into_owned()),
+            "error" => authorization.error = Some(value.into_owned()),
+            "error_description" => authorization.error_description = Some(value.into_owned()),
+            _ => {}
+        }
+    }
+    Ok(authorization)
+}
+
+fn start_codex_callback_server(
+    expected_state: String,
+    sender: mpsc::Sender<Result<browser_use_providers::CodexAuthorization>>,
+) -> Result<CallbackServerHandle> {
+    let listener =
+        TcpListener::bind((CODEX_CALLBACK_HOST, CODEX_CALLBACK_PORT)).with_context(|| {
+            format!("bind Codex OAuth callback on {CODEX_CALLBACK_HOST}:{CODEX_CALLBACK_PORT}")
+        })?;
+    listener
+        .set_nonblocking(true)
+        .context("configure Codex OAuth callback listener")?;
+    let (stop_tx, stop_rx) = mpsc::channel::<()>();
+    let thread = std::thread::spawn(move || {
+        let deadline = Instant::now() + Duration::from_secs(300);
+        loop {
+            if stop_rx.try_recv().is_ok() || Instant::now() >= deadline {
+                break;
+            }
+            match listener.accept() {
+                Ok((mut stream, _)) => {
+                    let result = handle_codex_callback(&mut stream, &expected_state);
+                    let _ = sender.send(result);
+                    break;
+                }
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                    std::thread::sleep(Duration::from_millis(50));
+                }
+                Err(error) => {
+                    let _ = sender.send(Err(error).context("accept Codex OAuth callback"));
+                    break;
+                }
+            }
+        }
+    });
+    Ok(CallbackServerHandle {
+        stop: stop_tx,
+        thread: Some(thread),
+    })
+}
+
+fn handle_codex_callback(
+    stream: &mut TcpStream,
+    expected_state: &str,
+) -> Result<browser_use_providers::CodexAuthorization> {
+    let mut request = [0_u8; 4096];
+    let read = stream
+        .read(&mut request)
+        .context("read Codex OAuth callback")?;
+    let request = String::from_utf8_lossy(&request[..read]);
+    let path = request
+        .lines()
+        .next()
+        .and_then(|line| line.split_whitespace().nth(1))
+        .context("parse Codex OAuth callback request")?;
+    let parsed = parse_codex_authorization_input(path);
+    let status = codex_callback_status(path, expected_state, &parsed);
+    let page = codex_callback_page(status, &parsed);
+    let response = format!(
+        "HTTP/1.1 {status} {}\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+        page.status_text,
+        page.body.len(),
+        page.body
+    );
+    stream.write_all(response.as_bytes()).ok();
+    if status == 200 {
+        Ok(parsed)
+    } else {
+        bail!("{}", page.message)
     }
 }
 
@@ -3808,7 +4843,7 @@ struct JsonRpcRequest {
 }
 
 struct SdkServerContext {
-    journal: Arc<MemoryJournal>,
+    journal: Arc<SqliteJournal>,
     runtime: RuntimeHandle,
     store: SharedStore,
     _ephemeral_state_dir: Arc<tempfile::TempDir>,
@@ -3816,9 +4851,14 @@ struct SdkServerContext {
 
 impl SdkServerContext {
     fn memory() -> Result<Self> {
-        let (runtime, journal) = BrowserUseRuntime::memory();
         let ephemeral_state_dir = Arc::new(tempfile::Builder::new().prefix("but-sdk-").tempdir()?);
-        let store = Store::open_in_memory(ephemeral_state_dir.path())?;
+        let store = Store::open(ephemeral_state_dir.path())?;
+        let journal = Arc::new(SqliteJournal::from_store(Store::open(
+            ephemeral_state_dir.path(),
+        )?));
+        let persistence: Arc<dyn LiveThreadPersistence> = journal.clone();
+        let state_index: Arc<dyn StateIndex> = journal.clone();
+        let runtime = BrowserUseRuntime::new(persistence, state_index);
         Ok(Self {
             journal,
             runtime: runtime.handle(),
@@ -3852,6 +4892,7 @@ fn sdk_server_stdio() -> Result<()> {
         .spawn(move || -> Result<()> {
             let mut stdout = io::BufWriter::new(io::stdout().lock());
             for response in response_rx {
+                let response = sdk_transport_frame_value(&response);
                 writeln!(stdout, "{}", serde_json::to_string(&response)?)?;
                 stdout.flush()?;
             }
@@ -3877,6 +4918,20 @@ fn sdk_server_stdio() -> Result<()> {
                         match tokio::time::timeout(Duration::from_millis(100), rx.recv()).await {
                             Ok(Ok(event)) => {
                                 let projected = projection.apply_event(&event);
+                                let event_value = sdk_transport_value(
+                                    &serde_json::to_value(&event).unwrap_or_else(|error| {
+                                        serde_json::json!({
+                                            "serialization_error": error.to_string(),
+                                        })
+                                    }),
+                                );
+                                let projected_value = sdk_transport_value(
+                                    &serde_json::to_value(&projected).unwrap_or_else(|error| {
+                                        serde_json::json!({
+                                            "serialization_error": error.to_string(),
+                                        })
+                                    }),
+                                );
                                 let session_id =
                                     event.session_id.as_ref().map(|id| id.as_str().to_string());
                                 let run_id = event
@@ -3893,7 +4948,7 @@ fn sdk_server_stdio() -> Result<()> {
                                         "run_id": run_id.clone(),
                                         "session_id": session_id.clone(),
                                         "agent_id": agent_id.clone(),
-                                        "event": event,
+                                        "event": event_value,
                                     },
                                 });
                                 if response_tx.send(notification).is_err() {
@@ -3906,7 +4961,7 @@ fn sdk_server_stdio() -> Result<()> {
                                         "run_id": run_id,
                                         "session_id": session_id,
                                         "agent_id": agent_id,
-                                        "event": projected,
+                                        "event": projected_value,
                                     },
                                 });
                                 if response_tx.send(notification).is_err() {
@@ -3970,10 +5025,11 @@ fn sdk_server_stdio() -> Result<()> {
 }
 
 fn handle_sdk_json_rpc_line(context: &SdkServerContext, line: &str) -> Value {
-    match serde_json::from_str::<JsonRpcRequest>(line) {
+    let response = match serde_json::from_str::<JsonRpcRequest>(line) {
         Ok(request) => handle_sdk_json_rpc_request(context, request),
         Err(error) => json_rpc_error(None, -32700, format!("Parse error: {error}")),
-    }
+    };
+    sdk_transport_frame_value(&response)
 }
 
 fn handle_sdk_json_rpc_request(context: &SdkServerContext, request: JsonRpcRequest) -> Value {
@@ -3982,12 +5038,14 @@ fn handle_sdk_json_rpc_request(context: &SdkServerContext, request: JsonRpcReque
     }
     let id = request.id;
     let result = match request.method.as_str() {
-        "runtime.ping" => Ok(serde_json::json!({ "ok": true })),
+        "runtime.ping" => Ok(sdk_runtime_ping()),
+        "runtime.python_worker_ping" => sdk_runtime_python_worker_ping(context),
         "runtime.snapshot" => sdk_runtime_snapshot(&context.runtime),
         "browser.create" => sdk_browser_create(&context.runtime, &request.params),
         "browser.stop" | "browser.close" => sdk_browser_close(&context.runtime, &request.params),
         "agent.create" => sdk_agent_create(context, &request.params),
         "agent.snapshot" => sdk_agent_snapshot(context, &request.params),
+        "agent.run_task" => sdk_agent_run_task(context, &request.params),
         "agent.run" => sdk_agent_run(context, &request.params),
         "agent.stop" => sdk_agent_stop(context, &request.params),
         "agent.close" => sdk_agent_close(context, &request.params),
@@ -4006,6 +5064,43 @@ fn handle_sdk_json_rpc_request(context: &SdkServerContext, request: JsonRpcReque
     }
 }
 
+fn sdk_runtime_ping() -> Value {
+    serde_json::json!({
+        "ok": true,
+        "sdk_protocol_version": SDK_PROTOCOL_VERSION,
+        "terminal_version": env!("CARGO_PKG_VERSION"),
+        "capabilities": [
+            "browser.create",
+            "agent.run_task",
+            "agent.run",
+            "agent.stop",
+            "runtime.python_worker_ping",
+        ],
+    })
+}
+
+fn sdk_runtime_python_worker_ping(context: &SdkServerContext) -> Result<Value> {
+    let artifact_dir = context
+        ._ephemeral_state_dir
+        .path()
+        .join("python-worker-ping");
+    fs::create_dir_all(&artifact_dir)?;
+    let cwd = std::env::current_dir()?;
+    let mut worker =
+        PythonWorker::start_with_browser_mode_and_env(None, std::iter::empty::<(&str, &str)>())?;
+    let response = worker.run(
+        "sdk-python-worker-ping",
+        cwd,
+        artifact_dir,
+        "print('browser-use-python-worker-ok')",
+    )?;
+    Ok(serde_json::json!({
+        "ok": response.ok,
+        "text": response.text,
+        "error": response.error,
+    }))
+}
+
 fn sdk_runtime_snapshot(runtime: &RuntimeHandle) -> Result<Value> {
     Ok(serde_json::to_value(runtime.snapshot())?)
 }
@@ -4021,6 +5116,20 @@ fn sdk_browser_create(runtime: &RuntimeHandle, params: &Value) -> Result<Value> 
             .get("profile_id")
             .and_then(Value::as_str)
             .map(ToOwned::to_owned),
+        profile: sdk_string_param(params, "profile"),
+        proxy_country_code: sdk_string_param(params, "proxy_country_code"),
+        cdp_url: sdk_string_param(params, "cdp_url"),
+        cdp_headers: sdk_json_env_param(params, "cdp_headers"),
+        user_agent: sdk_string_param(params, "user_agent"),
+        viewport: sdk_json_env_param(params, "viewport"),
+        storage_state: sdk_json_env_param(params, "storage_state"),
+        downloads_path: sdk_string_param(params, "downloads_path"),
+        allowed_domains: sdk_json_env_param(params, "allowed_domains"),
+        blocked_domains: sdk_json_env_param(params, "blocked_domains"),
+        window_size: sdk_json_env_param(params, "window_size"),
+        state_dir: sdk_string_param(params, "state_dir"),
+        no_viewport: sdk_bool_param(params, "no_viewport"),
+        accept_downloads: sdk_bool_param(params, "accept_downloads"),
     };
     let browser_id = runtime.create_browser(config);
     Ok(serde_json::json!({ "browser_id": browser_id.as_str() }))
@@ -4076,11 +5185,6 @@ fn sdk_agent_create(context: &SdkServerContext, params: &Value) -> Result<Value>
                 agent.session_id().as_str().to_string(),
             )?;
         }
-        store.append_event(
-            agent.session_id().as_str(),
-            "session.input",
-            input_payload.clone(),
-        )?;
     }
     context.runtime.append_observed_session_event(
         agent.session_id().clone(),
@@ -4167,10 +5271,27 @@ fn sdk_agent_run(context: &SdkServerContext, params: &Value) -> Result<Value> {
 
     let events_before_run = context.runtime.events_for_session(&session_id)?;
     let task = task_from_events(&events_before_run).unwrap_or_else(|| "task".to_string());
-    let config = sdk_provider_run_config(params, Some(&task))?;
-    sdk_run_agent_with_runtime(context, &agent_id, &session_id, browser_id, config)?;
+    let browser_snapshot = browser_id
+        .as_ref()
+        .and_then(|browser_id| context.runtime.browsers().snapshot(browser_id).ok());
+    let config = sdk_provider_run_config(params, Some(&task), browser_snapshot.as_ref())?;
+    let browser_id_value = browser_id
+        .as_ref()
+        .map(|browser_id| browser_id.as_str().to_string());
+    let initial_input = sdk_initial_input_from_events(context, &session_id)?;
+    sdk_run_agent_with_runtime(
+        context,
+        &agent_id,
+        &session_id,
+        browser_id,
+        initial_input,
+        config,
+    )?;
 
     let events = context.runtime.events_for_session(&session_id)?;
+    let child_events = sdk_child_events_for_session(context, &session_id)?;
+    let mut usage_events = events.clone();
+    usage_events.extend(child_events.iter().cloned());
     let output = session_result_from_events(&events);
     let error = failure_from_events(&events);
     let final_projected_event = sdk_final_projected_event(
@@ -4183,25 +5304,401 @@ fn sdk_agent_run(context: &SdkServerContext, params: &Value) -> Result<Value> {
     )?;
     let event_values = events
         .iter()
-        .map(|event| {
-            serde_json::json!({
-                "seq": event.seq,
-                "id": event.id,
-                "event_type": event.event_type,
-                "payload": event.payload,
-            })
-        })
+        .map(sdk_transport_event_value)
+        .collect::<Vec<_>>();
+    let child_event_values = child_events
+        .iter()
+        .map(sdk_transport_event_value)
+        .collect::<Vec<_>>();
+    let usage_event_values = usage_events
+        .iter()
+        .map(sdk_transport_event_value)
         .collect::<Vec<_>>();
     Ok(serde_json::json!({
+        "agent_id": agent_id.as_str(),
+        "session_id": session_id.as_str(),
+        "browser_id": browser_id_value,
         "history": {
             "output": output,
             "success": error.is_none(),
             "done": true,
             "errors": error.into_iter().collect::<Vec<_>>(),
             "events": event_values,
+            "child_events": child_event_values,
+            "usage_events": usage_event_values,
+            "usage": sdk_usage_from_events(&usage_events),
+            "files": sdk_files_from_events(&usage_events),
         },
         "final_projected_event": final_projected_event,
     }))
+}
+
+fn sdk_child_events_for_session(
+    context: &SdkServerContext,
+    session_id: &SessionId,
+) -> Result<Vec<browser_use_protocol::EventRecord>> {
+    let store = context.store.lock().expect("sdk store mutex poisoned");
+    let mut seen = std::collections::BTreeSet::<String>::new();
+    let mut events = Vec::new();
+    sdk_collect_child_events(&store, session_id.as_str(), &mut seen, &mut events)?;
+    Ok(events)
+}
+
+fn sdk_collect_child_events(
+    store: &Store,
+    parent_session_id: &str,
+    seen: &mut std::collections::BTreeSet<String>,
+    events: &mut Vec<browser_use_protocol::EventRecord>,
+) -> Result<()> {
+    for child in store.list_child_agents(parent_session_id)? {
+        if !seen.insert(child.child_session_id.clone()) {
+            continue;
+        }
+        events.extend(store.events_for_session(&child.child_session_id)?);
+        sdk_collect_child_events(store, &child.child_session_id, seen, events)?;
+    }
+    Ok(())
+}
+
+fn sdk_transport_event_value(event: &browser_use_protocol::EventRecord) -> Value {
+    serde_json::json!({
+        "seq": event.seq,
+        "id": event.id,
+        "session_id": event.session_id,
+        "ts_ms": event.ts_ms,
+        "event_type": event.event_type,
+        "payload": sdk_transport_value(&event.payload),
+    })
+}
+
+fn sdk_transport_frame_value(value: &Value) -> Value {
+    let mut frame = sdk_transport_value(value);
+    if sdk_json_value_len(&frame) <= SDK_JSON_RPC_FRAME_LIMIT_BYTES {
+        return frame;
+    }
+
+    sdk_compact_final_projected_snapshot(&mut frame);
+    let mut tail_count = SDK_HISTORY_EVENTS_INITIAL_TAIL_COUNT;
+    loop {
+        sdk_compact_response_history_events(&mut frame, tail_count);
+        if sdk_json_value_len(&frame) <= SDK_JSON_RPC_FRAME_LIMIT_BYTES {
+            return frame;
+        }
+        if tail_count == 0 {
+            break;
+        }
+        tail_count /= 2;
+    }
+
+    let emergency = sdk_emergency_compact_json_rpc_frame(&frame);
+    if sdk_json_value_len(&emergency) <= SDK_JSON_RPC_FRAME_LIMIT_BYTES {
+        return emergency;
+    }
+    sdk_minimal_json_rpc_frame(&frame)
+}
+
+fn sdk_json_value_len(value: &Value) -> usize {
+    serde_json::to_string(value)
+        .map(|serialized| serialized.len())
+        .unwrap_or(usize::MAX)
+}
+
+fn sdk_compact_response_history_events(frame: &mut Value, tail_count: usize) -> bool {
+    let Some(history) = frame
+        .get_mut("result")
+        .and_then(Value::as_object_mut)
+        .and_then(|result| result.get_mut("history"))
+        .and_then(Value::as_object_mut)
+    else {
+        return false;
+    };
+    let Some(events) = history.get_mut("events").and_then(Value::as_array_mut) else {
+        return false;
+    };
+    let original_len = events.len();
+    let head_count = if tail_count == 0 {
+        0
+    } else {
+        SDK_HISTORY_EVENTS_HEAD_COUNT.min(original_len)
+    };
+    let tail_count = tail_count.min(original_len.saturating_sub(head_count));
+    if original_len <= head_count + tail_count + 1 {
+        return false;
+    }
+
+    let omitted = original_len.saturating_sub(head_count + tail_count);
+    let mut compacted = Vec::with_capacity(head_count + tail_count + 1);
+    compacted.extend(events.iter().take(head_count).cloned());
+    compacted.push(serde_json::json!({
+        "event_type": "sdk.transport.truncated",
+        "payload": {
+            "omitted_events": omitted,
+            "reason": "SDK JSON-RPC frame exceeded transport limit",
+            "frame_limit_bytes": SDK_JSON_RPC_FRAME_LIMIT_BYTES,
+        },
+    }));
+    if tail_count > 0 {
+        compacted.extend(events.iter().skip(original_len - tail_count).cloned());
+    }
+    *events = compacted;
+    history.insert(
+        "events_truncated_for_sdk_transport".to_string(),
+        Value::Bool(true),
+    );
+    history.insert(
+        "events_omitted_for_sdk_transport".to_string(),
+        Value::Number(serde_json::Number::from(omitted)),
+    );
+    true
+}
+
+fn sdk_compact_final_projected_snapshot(frame: &mut Value) -> bool {
+    let Some(projected) = frame
+        .get_mut("result")
+        .and_then(Value::as_object_mut)
+        .and_then(|result| result.get_mut("final_projected_event"))
+        .and_then(Value::as_object_mut)
+    else {
+        return false;
+    };
+    if !projected.contains_key("snapshot") {
+        return false;
+    }
+    projected.insert(
+        "snapshot".to_string(),
+        serde_json::json!({
+            "truncated_for_sdk_transport": true,
+            "reason": "SDK JSON-RPC frame exceeded transport limit",
+        }),
+    );
+    true
+}
+
+fn sdk_emergency_compact_json_rpc_frame(frame: &Value) -> Value {
+    let mut output = serde_json::Map::new();
+    output.insert(
+        "jsonrpc".to_string(),
+        frame
+            .get("jsonrpc")
+            .cloned()
+            .unwrap_or_else(|| Value::String("2.0".to_string())),
+    );
+    if let Some(id) = frame.get("id") {
+        output.insert("id".to_string(), id.clone());
+    }
+    if let Some(method) = frame.get("method") {
+        output.insert("method".to_string(), method.clone());
+        output.insert(
+            "params".to_string(),
+            sdk_emergency_compact_notification_params(frame.get("params")),
+        );
+        return sdk_transport_value(&Value::Object(output));
+    }
+    if let Some(error) = frame.get("error") {
+        output.insert("error".to_string(), sdk_transport_value(error));
+        return sdk_transport_value(&Value::Object(output));
+    }
+    output.insert(
+        "result".to_string(),
+        sdk_emergency_compact_result(frame.get("result")),
+    );
+    sdk_transport_value(&Value::Object(output))
+}
+
+fn sdk_emergency_compact_notification_params(params: Option<&Value>) -> Value {
+    let Some(params) = params.and_then(Value::as_object) else {
+        return serde_json::json!({
+            "transport_truncated": true,
+            "reason": "SDK JSON-RPC notification exceeded transport limit",
+        });
+    };
+    let mut output = serde_json::Map::new();
+    for key in ["run_id", "session_id", "agent_id"] {
+        if let Some(value) = params.get(key) {
+            output.insert(key.to_string(), value.clone());
+        }
+    }
+    if let Some(event) = params.get("event").and_then(Value::as_object) {
+        let mut compact_event = serde_json::Map::new();
+        for key in ["seq", "id", "event_type", "kind"] {
+            if let Some(value) = event.get(key) {
+                compact_event.insert(key.to_string(), value.clone());
+            }
+        }
+        compact_event.insert(
+            "payload".to_string(),
+            serde_json::json!({
+                "truncated_for_sdk_transport": true,
+                "reason": "SDK JSON-RPC notification exceeded transport limit",
+            }),
+        );
+        output.insert("event".to_string(), Value::Object(compact_event));
+    }
+    output.insert("transport_truncated".to_string(), Value::Bool(true));
+    Value::Object(output)
+}
+
+fn sdk_emergency_compact_result(result: Option<&Value>) -> Value {
+    let Some(result) = result.and_then(Value::as_object) else {
+        return serde_json::json!({
+            "transport_truncated": true,
+            "reason": "SDK JSON-RPC result exceeded transport limit",
+        });
+    };
+    let mut output = serde_json::Map::new();
+    for key in ["agent_id", "session_id", "browser_id"] {
+        if let Some(value) = result.get(key) {
+            output.insert(key.to_string(), value.clone());
+        }
+    }
+    if let Some(history) = result.get("history").and_then(Value::as_object) {
+        output.insert(
+            "history".to_string(),
+            sdk_emergency_compact_history(history),
+        );
+    }
+    if let Some(projected) = result
+        .get("final_projected_event")
+        .and_then(Value::as_object)
+    {
+        let mut compact_projected = serde_json::Map::new();
+        for key in ["source_event_id", "kind", "session_id", "payload"] {
+            if let Some(value) = projected.get(key) {
+                compact_projected.insert(key.to_string(), sdk_transport_value(value));
+            }
+        }
+        compact_projected.insert("transport_truncated".to_string(), Value::Bool(true));
+        output.insert(
+            "final_projected_event".to_string(),
+            Value::Object(compact_projected),
+        );
+    }
+    output.insert("transport_truncated".to_string(), Value::Bool(true));
+    Value::Object(output)
+}
+
+fn sdk_emergency_compact_history(history: &serde_json::Map<String, Value>) -> Value {
+    let mut output = serde_json::Map::new();
+    for key in ["output", "success", "done", "errors", "usage", "files"] {
+        if let Some(value) = history.get(key) {
+            output.insert(key.to_string(), sdk_transport_value(value));
+        }
+    }
+    let tail_events = history
+        .get("events")
+        .and_then(Value::as_array)
+        .map(|events| {
+            events
+                .iter()
+                .rev()
+                .take(20)
+                .cloned()
+                .collect::<Vec<_>>()
+                .into_iter()
+                .rev()
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    let mut events = Vec::with_capacity(tail_events.len() + 1);
+    events.push(serde_json::json!({
+        "event_type": "sdk.transport.truncated",
+        "payload": {
+            "reason": "SDK JSON-RPC result exceeded transport limit",
+            "frame_limit_bytes": SDK_JSON_RPC_FRAME_LIMIT_BYTES,
+        },
+    }));
+    events.extend(tail_events);
+    output.insert("events".to_string(), Value::Array(events));
+    output.insert("transport_truncated".to_string(), Value::Bool(true));
+    Value::Object(output)
+}
+
+fn sdk_minimal_json_rpc_frame(frame: &Value) -> Value {
+    let mut output = serde_json::Map::new();
+    output.insert("jsonrpc".to_string(), Value::String("2.0".to_string()));
+    if let Some(id) = frame.get("id") {
+        output.insert("id".to_string(), id.clone());
+    }
+    output.insert(
+        "result".to_string(),
+        serde_json::json!({
+            "transport_truncated": true,
+            "history": {
+                "success": false,
+                "done": true,
+                "errors": ["SDK JSON-RPC result exceeded transport limit"],
+                "events": [{
+                    "event_type": "sdk.transport.truncated",
+                    "payload": {
+                        "reason": "SDK JSON-RPC result exceeded transport limit",
+                        "frame_limit_bytes": SDK_JSON_RPC_FRAME_LIMIT_BYTES,
+                    }
+                }],
+            },
+        }),
+    );
+    Value::Object(output)
+}
+
+fn sdk_transport_value(value: &Value) -> Value {
+    match value {
+        Value::String(text) => Value::String(sdk_transport_string(text)),
+        Value::Array(items) => Value::Array(items.iter().map(sdk_transport_value).collect()),
+        Value::Object(map) => Value::Object(
+            map.iter()
+                .map(|(key, value)| (key.clone(), sdk_transport_value(value)))
+                .collect(),
+        ),
+        _ => value.clone(),
+    }
+}
+
+fn sdk_transport_string(text: &str) -> String {
+    if text.len() <= SDK_EVENT_STRING_LIMIT_BYTES {
+        return text.to_string();
+    }
+    let end = sdk_floor_char_boundary(text, SDK_EVENT_STRING_LIMIT_BYTES);
+    let omitted = text.len().saturating_sub(end);
+    format!(
+        "{}\n...[truncated {omitted} bytes for SDK transport; full output remains in terminal artifacts/events]",
+        &text[..end]
+    )
+}
+
+fn sdk_floor_char_boundary(text: &str, mut index: usize) -> usize {
+    index = index.min(text.len());
+    while index > 0 && !text.is_char_boundary(index) {
+        index -= 1;
+    }
+    index
+}
+
+fn sdk_agent_run_task(context: &SdkServerContext, params: &Value) -> Result<Value> {
+    let mut run_params = params.clone();
+    if let Value::Object(map) = &mut run_params {
+        if !map.contains_key("browser_id") {
+            if let Some(browser) = params.get("browser").filter(|value| value.is_object()) {
+                let created_browser = sdk_browser_create(&context.runtime, browser)?;
+                if let Some(browser_id) = created_browser.get("browser_id").and_then(Value::as_str)
+                {
+                    map.insert(
+                        "browser_id".to_string(),
+                        Value::String(browser_id.to_string()),
+                    );
+                }
+            }
+        }
+    }
+    let created = sdk_agent_create(context, &run_params)?;
+    let agent_id = created
+        .get("agent_id")
+        .and_then(Value::as_str)
+        .context("agent.run_task could not create agent")?
+        .to_string();
+    if let Value::Object(map) = &mut run_params {
+        map.insert("agent_id".to_string(), Value::String(agent_id));
+    }
+    sdk_agent_run(context, &run_params)
 }
 
 fn sdk_run_agent_with_runtime(
@@ -4209,9 +5706,11 @@ fn sdk_run_agent_with_runtime(
     agent_id: &AgentId,
     session_id: &SessionId,
     browser_id: Option<BrowserId>,
-    config: ProviderRunConfig,
+    initial_input: Option<Value>,
+    mut config: ProviderRunConfig,
 ) -> Result<()> {
     let runtime = context.runtime.clone();
+    attach_sdk_child_agent_runner(context, &mut config)?;
     let driver_runtime = runtime.clone();
     let store = Arc::clone(&context.store);
     let session_id_for_driver = session_id.as_str().to_string();
@@ -4238,11 +5737,11 @@ fn sdk_run_agent_with_runtime(
     if let Some(browser_id) = browser_id {
         request = request.with_browser_id(browser_id);
     }
+    if let Some(initial_input) = initial_input {
+        request = request.with_initial_input(initial_input);
+    }
 
-    let rt = tokio::runtime::Builder::new_current_thread()
-        .enable_time()
-        .build()
-        .context("build sdk run runtime")?;
+    let rt = build_sdk_run_runtime()?;
     rt.block_on(async move {
         runtime
             .run_agent(request, async move {
@@ -4260,6 +5759,50 @@ fn sdk_run_agent_with_runtime(
             .await?;
         Ok::<(), anyhow::Error>(())
     })
+}
+
+fn attach_sdk_child_agent_runner(
+    context: &SdkServerContext,
+    config: &mut ProviderRunConfig,
+) -> Result<()> {
+    let store = context.store.lock().expect("sdk store mutex poisoned");
+    let executor = cli_runtime_agent_executor(&store, context.runtime.clone())?;
+    attach_cli_child_agent_runner(&store, executor, config);
+    Ok(())
+}
+
+fn build_sdk_run_runtime() -> Result<tokio::runtime::Runtime> {
+    tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .thread_name("browser-use-sdk-run")
+        .build()
+        .context("build sdk run runtime")
+}
+
+fn sdk_initial_input_from_events(
+    context: &SdkServerContext,
+    session_id: &SessionId,
+) -> Result<Option<Value>> {
+    Ok(context
+        .runtime
+        .events_for_session(session_id)?
+        .into_iter()
+        .rev()
+        .find(|event| {
+            matches!(
+                event.event_type.as_str(),
+                "session.input" | "session.followup" | "agent.mailbox_input"
+            )
+        })
+        .map(|event| {
+            serde_json::json!({
+                "source": "durable_prompt_input",
+                "event_type": event.event_type,
+                "source_event_seq": event.seq,
+                "payload": event.payload,
+            })
+        }))
 }
 
 fn sdk_final_projected_event(
@@ -4407,7 +5950,11 @@ fn sdk_agent_close(context: &SdkServerContext, params: &Value) -> Result<Value> 
     Ok(serde_json::json!({ "ok": true }))
 }
 
-fn sdk_provider_run_config(params: &Value, task: Option<&str>) -> Result<ProviderRunConfig> {
+fn sdk_provider_run_config(
+    params: &Value,
+    task: Option<&str>,
+    browser_snapshot: Option<&browser_use_runtime::BrowserSnapshot>,
+) -> Result<ProviderRunConfig> {
     let llm = params.get("llm").unwrap_or(&Value::Null);
     let provider = llm
         .get("provider")
@@ -4423,13 +5970,10 @@ fn sdk_provider_run_config(params: &Value, task: Option<&str>) -> Result<Provide
         .unwrap_or("gpt-5.5");
     let backend = sdk_provider_backend(provider, model)?;
     let provider_id = sdk_provider_id(provider, backend);
+    let browser = params.get("browser").unwrap_or(&Value::Null);
+    let browser_mode = sdk_browser_mode_from_params(params, browser, browser_snapshot);
     let mut options = AgentRunOptions::default()
-        .with_browser_mode(
-            params
-                .get("browser_mode")
-                .and_then(Value::as_str)
-                .unwrap_or("local"),
-        )
+        .with_browser_mode(browser_mode)
         .with_model_compaction(true)
         .with_analytics_source("sdk")
         .with_model_provider_id(provider_id.clone());
@@ -4446,14 +5990,365 @@ fn sdk_provider_run_config(params: &Value, task: Option<&str>) -> Result<Provide
         options = options.with_final_output_json_schema(schema.clone(), true);
     }
     if let Some(timeout) = llm.get("timeout").and_then(Value::as_u64) {
-        options.python_tool_timeout_seconds = timeout;
+        options.model_stream_idle_timeout_ms = Some(timeout.saturating_mul(1000));
     }
+    let config_overrides = sdk_config_overrides_from_params(params)?;
+    if !config_overrides.is_empty() {
+        apply_runtime_config_overrides(&mut options, &config_overrides)?;
+        options = options.with_config_overrides(config_overrides);
+    }
+    options.python_env.extend(sdk_python_env_from_params(
+        params,
+        browser,
+        browser_snapshot,
+    )?);
 
     let mut config = ProviderRunConfig::new(backend, model).with_options(options);
     if backend == ProviderBackend::Fake {
         config = config.with_fake_result(fake_agent_result_text(task.unwrap_or("task"), None));
     }
     Ok(config)
+}
+
+fn sdk_config_overrides_from_params(params: &Value) -> Result<ConfigOverrides> {
+    let mut overrides = ConfigOverrides::new();
+    if let Some(raw) = params
+        .get("config_overrides")
+        .filter(|value| !value.is_null())
+    {
+        append_sdk_config_overrides(&mut overrides, raw)?;
+    }
+    for key in ["tool_allowlist", "tools"] {
+        if let Some(raw) = params.get(key).filter(|value| !value.is_null()) {
+            overrides.push(("tool_allowlist".to_string(), sdk_json_to_toml_value(raw)?));
+            break;
+        }
+    }
+    if let Some(raw) = params.get("can_write").filter(|value| !value.is_null()) {
+        overrides.push(("can_write".to_string(), sdk_json_to_toml_value(raw)?));
+    }
+    Ok(overrides)
+}
+
+fn append_sdk_config_overrides(overrides: &mut ConfigOverrides, raw: &Value) -> Result<()> {
+    match raw {
+        Value::Object(map) => {
+            for (key, value) in map {
+                if key.trim().is_empty() {
+                    bail!("config_overrides object keys must be non-empty");
+                }
+                overrides.push((key.trim().to_string(), sdk_json_to_toml_value(value)?));
+            }
+        }
+        Value::Array(items) => {
+            for item in items {
+                match item {
+                    Value::String(raw_override) => {
+                        overrides
+                            .extend(parse_config_overrides(std::slice::from_ref(raw_override))?);
+                    }
+                    Value::Object(map) => {
+                        let key = map
+                            .get("key")
+                            .or_else(|| map.get("name"))
+                            .and_then(Value::as_str)
+                            .map(str::trim)
+                            .filter(|value| !value.is_empty())
+                            .context("config_overrides records require string `key`")?;
+                        let value = map
+                            .get("value")
+                            .context("config_overrides records require `value`")?;
+                        overrides.push((key.to_string(), sdk_json_to_toml_value(value)?));
+                    }
+                    _ => bail!(
+                        "config_overrides array entries must be raw strings or key/value objects"
+                    ),
+                }
+            }
+        }
+        Value::String(raw_override) => {
+            overrides.extend(parse_config_overrides(std::slice::from_ref(raw_override))?);
+        }
+        _ => bail!("config_overrides must be an object, array, or raw override string"),
+    }
+    Ok(())
+}
+
+fn sdk_json_to_toml_value(value: &Value) -> Result<toml::Value> {
+    match value {
+        Value::Null => Ok(toml::Value::String(String::new())),
+        Value::Bool(value) => Ok(toml::Value::Boolean(*value)),
+        Value::Number(number) => {
+            if let Some(integer) = number.as_i64() {
+                return Ok(toml::Value::Integer(integer));
+            }
+            let float = number
+                .as_f64()
+                .context("JSON number cannot be represented as TOML float")?;
+            Ok(toml::Value::Float(float))
+        }
+        Value::String(value) => Ok(toml::Value::String(value.clone())),
+        Value::Array(items) => items
+            .iter()
+            .map(sdk_json_to_toml_value)
+            .collect::<Result<Vec<_>>>()
+            .map(toml::Value::Array),
+        Value::Object(map) => {
+            let mut table = toml::map::Map::new();
+            for (key, value) in map {
+                table.insert(key.clone(), sdk_json_to_toml_value(value)?);
+            }
+            Ok(toml::Value::Table(table))
+        }
+    }
+}
+
+fn sdk_browser_mode_from_params(
+    params: &Value,
+    browser: &Value,
+    browser_snapshot: Option<&browser_use_runtime::BrowserSnapshot>,
+) -> String {
+    if let Some(mode) = params
+        .get("browser_mode")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        return mode.to_string();
+    }
+    if sdk_string_param(browser, "cdp_url").is_some()
+        || sdk_string_param(params, "cdp_url").is_some()
+    {
+        return "remote-cdp".to_string();
+    }
+    if let Some(snapshot) = browser_snapshot {
+        if snapshot
+            .config
+            .cdp_url
+            .as_deref()
+            .is_some_and(|value| !value.trim().is_empty())
+        {
+            return "remote-cdp".to_string();
+        }
+        if snapshot.config.headless == Some(false) {
+            return "managed-headed".to_string();
+        }
+        if snapshot.config.headless == Some(true) {
+            return "managed-headless".to_string();
+        }
+    }
+    "managed-headless".to_string()
+}
+
+fn sdk_python_env_from_params(
+    params: &Value,
+    browser: &Value,
+    browser_snapshot: Option<&browser_use_runtime::BrowserSnapshot>,
+) -> Result<Vec<(String, String)>> {
+    let mut env = Vec::new();
+    let mut push = |key: &str, value: Option<String>| {
+        if let Some(value) = value.filter(|value| !value.trim().is_empty()) {
+            env.push((key.to_string(), value));
+        }
+    };
+    let snapshot_config = browser_snapshot.map(|snapshot| &snapshot.config);
+    push(
+        "BU_CDP_URL",
+        sdk_string_param(browser, "cdp_url")
+            .or_else(|| sdk_string_param(params, "cdp_url"))
+            .or_else(|| snapshot_config.and_then(|config| config.cdp_url.clone())),
+    );
+    push(
+        "BU_CDP_HEADERS",
+        sdk_json_env_param(browser, "cdp_headers")
+            .or_else(|| sdk_json_env_param(params, "cdp_headers"))
+            .or_else(|| snapshot_config.and_then(|config| config.cdp_headers.clone())),
+    );
+    push(
+        "BU_BROWSER_USER_AGENT",
+        sdk_string_param(browser, "user_agent")
+            .or_else(|| sdk_string_param(params, "user_agent"))
+            .or_else(|| snapshot_config.and_then(|config| config.user_agent.clone())),
+    );
+    push(
+        "BU_BROWSER_VIEWPORT",
+        sdk_json_env_param(browser, "viewport")
+            .or_else(|| sdk_json_env_param(params, "viewport"))
+            .or_else(|| snapshot_config.and_then(|config| config.viewport.clone())),
+    );
+    push(
+        "BU_BROWSER_STORAGE_STATE",
+        sdk_json_env_param(browser, "storage_state")
+            .or_else(|| sdk_json_env_param(params, "storage_state"))
+            .or_else(|| snapshot_config.and_then(|config| config.storage_state.clone())),
+    );
+    push(
+        "BU_BROWSER_DOWNLOADS_PATH",
+        sdk_string_param(browser, "downloads_path")
+            .or_else(|| sdk_string_param(params, "downloads_path"))
+            .or_else(|| snapshot_config.and_then(|config| config.downloads_path.clone())),
+    );
+    push(
+        "BU_BROWSER_ALLOWED_DOMAINS",
+        sdk_json_env_param(browser, "allowed_domains")
+            .or_else(|| sdk_json_env_param(params, "allowed_domains"))
+            .or_else(|| snapshot_config.and_then(|config| config.allowed_domains.clone())),
+    );
+    push(
+        "BU_BROWSER_PROHIBITED_DOMAINS",
+        sdk_json_env_param(browser, "blocked_domains")
+            .or_else(|| sdk_json_env_param(params, "blocked_domains"))
+            .or_else(|| snapshot_config.and_then(|config| config.blocked_domains.clone())),
+    );
+    push(
+        "BU_BROWSER_WINDOW_SIZE",
+        sdk_json_env_param(browser, "window_size")
+            .or_else(|| sdk_json_env_param(params, "window_size"))
+            .or_else(|| snapshot_config.and_then(|config| config.window_size.clone())),
+    );
+    push(
+        "BU_BROWSER_PROXY_COUNTRY_CODE",
+        sdk_string_param(browser, "proxy_country_code")
+            .or_else(|| sdk_string_param(params, "proxy_country_code"))
+            .or_else(|| snapshot_config.and_then(|config| config.proxy_country_code.clone())),
+    );
+    if let Some(value) = sdk_bool_param(browser, "no_viewport")
+        .or_else(|| sdk_bool_param(params, "no_viewport"))
+        .or_else(|| snapshot_config.and_then(|config| config.no_viewport))
+    {
+        env.push(("BU_BROWSER_NO_VIEWPORT".to_string(), value.to_string()));
+    }
+    if let Some(value) = sdk_bool_param(browser, "accept_downloads")
+        .or_else(|| sdk_bool_param(params, "accept_downloads"))
+        .or_else(|| snapshot_config.and_then(|config| config.accept_downloads))
+    {
+        env.push(("BU_BROWSER_ACCEPT_DOWNLOADS".to_string(), value.to_string()));
+    }
+    if params.get("calculate_cost").and_then(Value::as_bool) == Some(true) {
+        env.push(("BU_USE_CALCULATE_COST".to_string(), "true".to_string()));
+    }
+    if let Some(extra) = params.get("python_env") {
+        match extra {
+            Value::Object(map) => {
+                for (key, value) in map {
+                    if let Some(text) = value.as_str() {
+                        env.push((key.to_string(), text.to_string()));
+                    }
+                }
+            }
+            Value::Array(items) => {
+                for item in items {
+                    let Some(key) = item.get("key").and_then(Value::as_str) else {
+                        continue;
+                    };
+                    let Some(value) = item.get("value").and_then(Value::as_str) else {
+                        continue;
+                    };
+                    env.push((key.to_string(), value.to_string()));
+                }
+            }
+            _ => bail!("python_env must be an object or array of key/value records"),
+        }
+    }
+    Ok(env)
+}
+
+fn sdk_string_param(value: &Value, key: &str) -> Option<String> {
+    value
+        .get(key)
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
+}
+
+fn sdk_bool_param(value: &Value, key: &str) -> Option<bool> {
+    value.get(key).and_then(Value::as_bool)
+}
+
+fn sdk_json_env_param(value: &Value, key: &str) -> Option<String> {
+    let raw = value.get(key)?;
+    if raw.is_null() {
+        return None;
+    }
+    if let Some(text) = raw.as_str() {
+        return Some(text.to_string());
+    }
+    Some(serde_json::to_string(raw).ok()?)
+}
+
+fn sdk_usage_from_events(events: &[browser_use_protocol::EventRecord]) -> Value {
+    for event in events.iter().rev() {
+        let payload = &event.payload;
+        if event.event_type == "token_count" {
+            if let Some(info) = payload.get("info") {
+                if let Some(total) = info.get("total_token_usage") {
+                    return total.clone();
+                }
+                if let Some(last) = info.get("last_token_usage") {
+                    return last.clone();
+                }
+            }
+        }
+        if let Some(usage) = payload.get("usage") {
+            return usage.clone();
+        }
+    }
+    Value::Null
+}
+
+fn sdk_files_from_events(events: &[browser_use_protocol::EventRecord]) -> Value {
+    let mut files = Vec::new();
+    let mut seen = std::collections::BTreeSet::<String>::new();
+    for event in events {
+        let payload = &event.payload;
+        if event.event_type == "artifact.created" {
+            if let Some(artifact) = payload.get("artifact") {
+                sdk_push_file(&mut files, &mut seen, artifact);
+            }
+        }
+        if matches!(event.event_type.as_str(), "tool.output" | "tool.failed") {
+            if let Some(artifacts) = payload.get("artifacts").and_then(Value::as_array) {
+                for artifact in artifacts {
+                    sdk_push_file(&mut files, &mut seen, artifact);
+                }
+            }
+        }
+    }
+    Value::Array(files)
+}
+
+fn sdk_push_file(
+    files: &mut Vec<Value>,
+    seen: &mut std::collections::BTreeSet<String>,
+    artifact: &Value,
+) {
+    let Some(path) = artifact
+        .get("path")
+        .or_else(|| artifact.get("url"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    else {
+        return;
+    };
+    let mime = artifact
+        .get("mime")
+        .or_else(|| artifact.get("mime_type"))
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    if mime.starts_with("image/") {
+        return;
+    }
+    if !seen.insert(path.to_string()) {
+        return;
+    }
+    files.push(serde_json::json!({
+        "path": path,
+        "kind": artifact.get("kind").and_then(Value::as_str).unwrap_or("file"),
+        "mime": mime,
+        "bytes": artifact.get("bytes").cloned().unwrap_or(Value::Null),
+    }));
 }
 
 fn sdk_provider_backend(provider: &str, model: &str) -> Result<ProviderBackend> {
@@ -5540,6 +7435,9 @@ fn run_dataset_case_with_provider<R: DatasetRunner>(
         max_context_chars: AgentRunOptions::default().max_context_chars,
         browser_mode: Some(config.browser_mode.clone()),
         dynamic_browser_mode_from_store: AgentRunOptions::default().dynamic_browser_mode_from_store,
+        browser_profile_id: AgentRunOptions::default().browser_profile_id,
+        browser_profile_label: AgentRunOptions::default().browser_profile_label,
+        browser_local_browser: AgentRunOptions::default().browser_local_browser,
         collaboration_mode: AgentRunOptions::default().collaboration_mode,
         include_environment_context: true,
         include_permissions_instructions: true,
@@ -5553,6 +7451,7 @@ fn run_dataset_case_with_provider<R: DatasetRunner>(
         compact_prompt: None,
         model_provider_id: Some(config.provider.clone()),
         model_provider_id_source: RunConfigValueSource::Explicit,
+        model_stream_idle_timeout_ms: None,
         python_tool_timeout_seconds: config.python_timeout_seconds,
         python_env: dataset_python_env(run_id, case, attempt, &paths, &config),
         child_agent_runner: None,
@@ -5565,6 +7464,7 @@ fn run_dataset_case_with_provider<R: DatasetRunner>(
         analytics_source: Some("cli".to_string()),
         analytics_provider_kind: Some(config.provider.clone()),
         analytics_model: Some(config.model.clone()),
+        full_llm_input_events: false,
         // Provider-level runtime options are merged by ConfigDatasetRunner; this
         // per-case layer carries dataset-specific browser/python limits.
         mcp_servers: std::collections::HashMap::new(),
@@ -6876,8 +8776,28 @@ command = "test-mcp"
     }
 
     #[test]
+    fn run_codex_session_command_accepts_task_id_and_model() -> Result<()> {
+        let parsed = Args::try_parse_from([
+            "browser-use-terminal",
+            "run-codex-session",
+            "session-123",
+            "--model",
+            "gpt-test",
+        ])?;
+
+        match &parsed.command {
+            Command::RunCodexSession { task_id, model } => {
+                assert_eq!(task_id, "session-123");
+                assert_eq!(model, "gpt-test");
+                assert_eq!(command_name(&parsed.command), "run_codex_session");
+            }
+            other => panic!("expected run-codex-session command, got {other:?}"),
+        }
+        Ok(())
+    }
+
+    #[test]
     fn sdk_json_rpc_ping_and_create_methods_use_runtime() -> Result<()> {
-        let temp = unique_cli_test_dir("sdk-json-rpc")?;
         let context = SdkServerContext::memory()?;
 
         let ping = handle_sdk_json_rpc_line(
@@ -6885,6 +8805,11 @@ command = "test-mcp"
             r#"{"jsonrpc":"2.0","id":1,"method":"runtime.ping","params":{}}"#,
         );
         assert_eq!(ping["result"]["ok"], true);
+        assert_eq!(ping["result"]["sdk_protocol_version"], SDK_PROTOCOL_VERSION);
+        assert_eq!(
+            ping["result"]["terminal_version"],
+            env!("CARGO_PKG_VERSION")
+        );
         let snapshot = handle_sdk_json_rpc_line(
             &context,
             r#"{"jsonrpc":"2.0","id":10,"method":"runtime.snapshot","params":{}}"#,
@@ -6954,18 +8879,11 @@ command = "test-mcp"
         assert!(events
             .iter()
             .any(|event| event.event_type == "session.input"));
-        assert!(
-            !temp.join("state.db").exists(),
-            "SDK memory context must not create a SQLite database"
-        );
-
-        std::fs::remove_dir_all(temp)?;
         Ok(())
     }
 
     #[test]
     fn sdk_json_rpc_reports_protocol_errors() -> Result<()> {
-        let temp = unique_cli_test_dir("sdk-json-rpc-errors")?;
         let context = SdkServerContext::memory()?;
 
         let parse = handle_sdk_json_rpc_line(&context, "{not-json");
@@ -6976,18 +8894,276 @@ command = "test-mcp"
             r#"{"jsonrpc":"2.0","id":4,"method":"missing.method","params":{}}"#,
         );
         assert_eq!(missing["error"]["code"], -32601);
-        assert!(
-            !temp.join("state.db").exists(),
-            "SDK memory context must not create a SQLite database"
-        );
+        Ok(())
+    }
 
-        std::fs::remove_dir_all(temp)?;
+    #[test]
+    fn sdk_json_rpc_browser_create_preserves_browser_use_settings() -> Result<()> {
+        let context = SdkServerContext::memory()?;
+        let request = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 30,
+            "method": "browser.create",
+            "params": {
+                "keep_alive": true,
+                "headless": false,
+                "profile_id": "profile-a",
+                "profile": "local-profile-a",
+                "proxy_country_code": "US",
+                "cdp_url": "wss://browser.example.test/cdp",
+                "cdp_headers": {"Authorization": "Bearer test"},
+                "user_agent": "BrowserUseTest/1.0",
+                "viewport": {"width": 1280, "height": 720},
+                "window_size": {"width": 1440, "height": 900},
+                "storage_state": {"cookies": []},
+                "downloads_path": "/tmp/browser-use-downloads",
+                "allowed_domains": ["example.com"],
+                "blocked_domains": ["*.tracking.example"],
+                "state_dir": "/tmp/browser-use-state",
+                "no_viewport": true,
+                "accept_downloads": true
+            }
+        });
+
+        let response = handle_sdk_json_rpc_line(&context, &serde_json::to_string(&request)?);
+
+        let browser_id = response["result"]["browser_id"]
+            .as_str()
+            .context("browser id")?;
+        let snapshot = context
+            .runtime
+            .browsers()
+            .snapshot(&BrowserId::from_string(browser_id.to_string())?)?;
+        assert!(snapshot.config.keep_alive);
+        assert_eq!(snapshot.config.headless, Some(false));
+        assert_eq!(snapshot.config.profile_id.as_deref(), Some("profile-a"));
+        assert_eq!(snapshot.config.profile.as_deref(), Some("local-profile-a"));
+        assert_eq!(snapshot.config.proxy_country_code.as_deref(), Some("US"));
+        assert_eq!(
+            snapshot.config.cdp_url.as_deref(),
+            Some("wss://browser.example.test/cdp")
+        );
+        assert_eq!(
+            snapshot.config.user_agent.as_deref(),
+            Some("BrowserUseTest/1.0")
+        );
+        assert_eq!(
+            snapshot.config.downloads_path.as_deref(),
+            Some("/tmp/browser-use-downloads")
+        );
+        assert_eq!(
+            snapshot.config.state_dir.as_deref(),
+            Some("/tmp/browser-use-state")
+        );
+        assert_eq!(snapshot.config.no_viewport, Some(true));
+        assert_eq!(snapshot.config.accept_downloads, Some(true));
+        assert!(snapshot
+            .config
+            .cdp_headers
+            .as_deref()
+            .is_some_and(|value| value.contains("Authorization")));
+        assert!(snapshot
+            .config
+            .viewport
+            .as_deref()
+            .is_some_and(|value| value.contains("1280")));
+        assert!(snapshot
+            .config
+            .window_size
+            .as_deref()
+            .is_some_and(|value| value.contains("1440")));
+        assert!(snapshot
+            .config
+            .allowed_domains
+            .as_deref()
+            .is_some_and(|value| value.contains("example.com")));
+        assert!(snapshot
+            .config
+            .blocked_domains
+            .as_deref()
+            .is_some_and(|value| value.contains("tracking.example")));
+        assert!(snapshot
+            .config
+            .storage_state
+            .as_deref()
+            .is_some_and(|value| value.contains("cookies")));
+        Ok(())
+    }
+
+    #[test]
+    fn sdk_provider_run_config_maps_browser_use_options_to_rust_core() -> Result<()> {
+        let params = serde_json::json!({
+            "task": "inspect",
+            "max_steps": 12,
+            "output_schema": {"type": "object", "properties": {"answer": {"type": "string"}}},
+            "calculate_cost": true,
+            "llm": {"provider": "anthropic", "model": "claude-sonnet-4-6", "timeout": 45},
+            "browser": {
+                "cdp_url": "wss://browser.example.test/cdp",
+                "cdp_headers": {"Authorization": "Bearer test"},
+                "user_agent": "BrowserUseTest/1.0",
+                "viewport": {"width": 1365, "height": 768},
+                "window_size": {"width": 1440, "height": 900},
+                "storage_state": {"origins": []},
+                "downloads_path": "/tmp/downloads",
+                "allowed_domains": ["example.com"],
+                "blocked_domains": ["*.tracking.example"],
+                "proxy_country_code": "DE",
+                "no_viewport": true,
+                "accept_downloads": true
+            },
+            "python_env": {"CUSTOM_ENV": "custom-value"}
+        });
+
+        let config = sdk_provider_run_config(&params, Some("inspect"), None)?;
+
+        assert_eq!(config.model, "claude-sonnet-4-6");
+        assert_eq!(config.options.max_turns, 12);
+        assert_eq!(config.options.browser_mode.as_deref(), Some("remote-cdp"));
+        assert_eq!(
+            config.options.final_output_json_schema,
+            params.get("output_schema").cloned()
+        );
+        assert_eq!(config.options.python_tool_timeout_seconds, 300);
+        assert_eq!(config.options.model_stream_idle_timeout_ms, Some(45_000));
+        assert!(config
+            .options
+            .python_env
+            .iter()
+            .any(|(key, value)| key == "BU_CDP_URL" && value == "wss://browser.example.test/cdp"));
+        assert!(config
+            .options
+            .python_env
+            .iter()
+            .any(|(key, value)| { key == "BU_CDP_HEADERS" && value.contains("Authorization") }));
+        assert!(config
+            .options
+            .python_env
+            .iter()
+            .any(|(key, value)| { key == "BU_BROWSER_VIEWPORT" && value.contains("1365") }));
+        assert!(config
+            .options
+            .python_env
+            .iter()
+            .any(|(key, value)| { key == "BU_BROWSER_WINDOW_SIZE" && value.contains("1440") }));
+        assert!(config.options.python_env.iter().any(|(key, value)| {
+            key == "BU_BROWSER_ALLOWED_DOMAINS" && value.contains("example.com")
+        }));
+        assert!(config.options.python_env.iter().any(|(key, value)| {
+            key == "BU_BROWSER_PROHIBITED_DOMAINS" && value.contains("tracking.example")
+        }));
+        assert!(config
+            .options
+            .python_env
+            .iter()
+            .any(|(key, value)| key == "BU_BROWSER_PROXY_COUNTRY_CODE" && value == "DE"));
+        assert!(config
+            .options
+            .python_env
+            .iter()
+            .any(|(key, value)| key == "BU_BROWSER_NO_VIEWPORT" && value == "true"));
+        assert!(config
+            .options
+            .python_env
+            .iter()
+            .any(|(key, value)| key == "BU_USE_CALCULATE_COST" && value == "true"));
+        assert!(config
+            .options
+            .python_env
+            .iter()
+            .any(|(key, value)| key == "CUSTOM_ENV" && value == "custom-value"));
+        Ok(())
+    }
+
+    #[test]
+    fn sdk_provider_run_config_accepts_browser_use_tool_allowlist() -> Result<()> {
+        let params = serde_json::json!({
+            "task": "inspect",
+            "llm": {"provider": "fake", "model": "fake"},
+            "config_overrides": {
+                "tool_allowlist": ["browser", "browser_script", "done"]
+            }
+        });
+
+        let config = sdk_provider_run_config(&params, Some("inspect"), None)?;
+
+        let allowlist = config
+            .options
+            .config_overrides
+            .iter()
+            .rev()
+            .find(|(key, _)| key == "tool_allowlist")
+            .and_then(|(_, value)| value.as_array())
+            .context("tool_allowlist override")?;
+        let names = allowlist
+            .iter()
+            .filter_map(toml::Value::as_str)
+            .collect::<Vec<_>>();
+        assert_eq!(names, vec!["browser", "browser_script", "done"]);
+        Ok(())
+    }
+
+    #[test]
+    fn sdk_run_runtime_supports_model_transport_blocking_bridge() -> Result<()> {
+        let rt = build_sdk_run_runtime()?;
+
+        let value = rt.block_on(async {
+            tokio::task::block_in_place(|| {
+                tokio::runtime::Handle::current().block_on(async {
+                    tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+                    7
+                })
+            })
+        });
+
+        assert_eq!(value, 7);
+        Ok(())
+    }
+
+    #[test]
+    fn sdk_context_uses_temporary_sqlite_store_for_child_agents() -> Result<()> {
+        let context = SdkServerContext::memory()?;
+        let state_dir = context
+            .store
+            .lock()
+            .expect("sdk store mutex poisoned")
+            .state_dir()
+            .to_path_buf();
+
+        assert!(
+            state_dir.join("state.db").exists(),
+            "SDK context must use Store-backed state so child agents share runtime/session data"
+        );
+        assert!(state_dir.starts_with(context._ephemeral_state_dir.path()));
+        Ok(())
+    }
+
+    #[test]
+    fn sdk_run_attaches_child_agent_runner_to_provider_config() -> Result<()> {
+        let context = SdkServerContext::memory()?;
+        let mut config = sdk_provider_run_config(
+            &serde_json::json!({
+                "task": "inspect",
+                "llm": {"provider": "fake", "model": "fake"}
+            }),
+            Some("inspect"),
+            None,
+        )?;
+
+        assert!(config.options.child_agent_runner.is_none());
+
+        attach_sdk_child_agent_runner(&context, &mut config)?;
+
+        assert!(config.options.multi_agent_v2.enabled);
+        assert!(
+            config.options.child_agent_runner.is_some(),
+            "SDK runs should expose terminal sub-agent tools through the same child runner as CLI runs"
+        );
         Ok(())
     }
 
     #[test]
     fn sdk_json_rpc_agent_run_executes_fake_backend() -> Result<()> {
-        let temp = unique_cli_test_dir("sdk-json-rpc-run-fake")?;
         let context = SdkServerContext::memory()?;
         let agent = handle_sdk_json_rpc_line(
             &context,
@@ -7037,6 +9213,14 @@ command = "test-mcp"
         let events = context
             .runtime
             .events_for_session(&SessionId::from_string(session_id.to_string())?)?;
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| event.event_type == "session.input")
+                .count(),
+            1,
+            "SDK agent creation should persist the initial task input exactly once"
+        );
         assert!(events
             .iter()
             .any(|event| event.event_type == "mailbox.enqueued"));
@@ -7049,10 +9233,6 @@ command = "test-mcp"
         assert!(events
             .iter()
             .any(|event| event.event_type == "session.followup.runtime_queued"));
-        assert!(
-            !temp.join("state.db").exists(),
-            "SDK memory runs must not create Store-backed agent_messages or SQLite state"
-        );
         let browser_snapshot = context
             .runtime
             .browsers()
@@ -7063,8 +9243,240 @@ command = "test-mcp"
             browser_use_runtime::BrowserStatus::Released
         );
 
-        std::fs::remove_dir_all(temp)?;
         Ok(())
+    }
+
+    #[test]
+    fn sdk_json_rpc_agent_run_returns_child_usage_events_separately() -> Result<()> {
+        let context = SdkServerContext::memory()?;
+        let agent = handle_sdk_json_rpc_line(
+            &context,
+            r#"{"jsonrpc":"2.0","id":1,"method":"agent.create","params":{"task":"inspect","cwd":"/tmp"}}"#,
+        );
+        let agent_id = agent["result"]["agent_id"].as_str().context("agent id")?;
+        let session_id = agent["result"]
+            .get("session_id")
+            .and_then(Value::as_str)
+            .context("session id")?;
+        let child = {
+            let store = context.store.lock().expect("sdk store mutex poisoned");
+            let child = store.create_child_session(
+                session_id,
+                "/tmp",
+                Some("/root/research"),
+                None,
+                None,
+            )?;
+            store.append_event(
+                &child.id,
+                "token_count",
+                serde_json::json!({
+                    "info": {
+                        "last_token_usage": {
+                            "input_tokens": 4,
+                            "output_tokens": 2,
+                            "total_tokens": 6
+                        },
+                        "total_token_usage": {
+                            "input_tokens": 4,
+                            "output_tokens": 2,
+                            "total_tokens": 6
+                        }
+                    }
+                }),
+            )?;
+            child
+        };
+        let request = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "agent.run",
+            "params": {
+                "agent_id": agent_id,
+                "max_steps": 2,
+                "llm": {"provider": "fake", "model": "fake"}
+            }
+        });
+
+        let result = handle_sdk_json_rpc_line(&context, &serde_json::to_string(&request)?);
+
+        assert_eq!(result["result"]["history"]["success"], true);
+        let events = result["result"]["history"]["events"]
+            .as_array()
+            .context("parent events")?;
+        assert!(events
+            .iter()
+            .all(|event| event["session_id"].as_str() == Some(session_id)));
+        let child_events = result["result"]["history"]["child_events"]
+            .as_array()
+            .context("child events")?;
+        assert!(child_events.iter().any(|event| {
+            event["session_id"].as_str() == Some(child.id.as_str())
+                && event["event_type"] == "token_count"
+        }));
+        let usage_events = result["result"]["history"]["usage_events"]
+            .as_array()
+            .context("usage events")?;
+        assert!(usage_events.iter().any(|event| {
+            event["session_id"].as_str() == Some(child.id.as_str())
+                && event["event_type"] == "token_count"
+        }));
+        assert_eq!(result["result"]["history"]["usage"]["total_tokens"], 6);
+        Ok(())
+    }
+
+    #[test]
+    fn sdk_json_rpc_agent_run_task_executes_fake_backend_with_normalized_history() -> Result<()> {
+        let context = SdkServerContext::memory()?;
+        let request = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 40,
+            "method": "agent.run_task",
+            "params": {
+                "task": "summarize the loaded page",
+                "cwd": "/tmp",
+                "max_steps": 3,
+                "llm": {"provider": "fake", "model": "fake"},
+                "browser": {"cdp_url": "wss://browser.example.test/cdp"},
+                "output_schema": {"type": "object", "properties": {"answer": {"type": "string"}}}
+            }
+        });
+
+        let response = handle_sdk_json_rpc_line(&context, &serde_json::to_string(&request)?);
+
+        assert!(response.get("error").is_none(), "{response}");
+        let result = response.get("result").context("run_task result")?;
+        assert!(result["agent_id"].as_str().is_some());
+        assert!(result["session_id"].as_str().is_some());
+        assert!(result["browser_id"].as_str().is_some());
+        assert_eq!(result["history"]["done"], true);
+        assert_eq!(result["history"]["success"], true);
+        assert_eq!(
+            result["history"]["output"],
+            serde_json::Value::String("Fake result for: summarize the loaded page".to_string())
+        );
+        let session_id = result["session_id"].as_str().context("session id")?;
+        let events = context
+            .runtime
+            .events_for_session(&SessionId::from_string(session_id.to_string())?)?;
+        let event_types = events
+            .iter()
+            .map(|event| event.event_type.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            event_types
+                .iter()
+                .filter(|event_type| **event_type == "session.input")
+                .count(),
+            1,
+            "SDK run_task should not duplicate the initial task input"
+        );
+        assert!(event_types.contains(&"agent.input.accepted"));
+        assert!(event_types.contains(&"agent.input.consumed"));
+        assert!(result["history"]["events"]
+            .as_array()
+            .is_some_and(|events| !events.is_empty()));
+        assert!(result["history"]["usage"].is_null() || result["history"]["usage"].is_object());
+        assert!(result["history"]["files"].as_array().is_some());
+        assert_eq!(
+            result["final_projected_event"]["kind"],
+            serde_json::Value::String("turn_completed".to_string())
+        );
+        let browser_snapshot = context
+            .runtime
+            .browsers()
+            .snapshots()
+            .into_iter()
+            .next()
+            .context("run_task browser snapshot")?;
+        assert_eq!(
+            browser_snapshot.config.cdp_url.as_deref(),
+            Some("wss://browser.example.test/cdp")
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn sdk_transport_event_value_truncates_oversized_nested_strings() {
+        let oversized = format!("{}é", "x".repeat(SDK_EVENT_STRING_LIMIT_BYTES));
+        let event = browser_use_protocol::EventRecord {
+            seq: 1,
+            id: "event-1".to_string(),
+            session_id: "session-1".to_string(),
+            ts_ms: 123,
+            event_type: "tool.output".to_string(),
+            payload: serde_json::json!({
+                "name": "browser_script",
+                "nested": {
+                    "text": oversized,
+                },
+            }),
+        };
+
+        let value = sdk_transport_event_value(&event);
+        let text = value["payload"]["nested"]["text"]
+            .as_str()
+            .expect("truncated text");
+
+        assert!(text.len() < SDK_EVENT_STRING_LIMIT_BYTES + 200);
+        assert!(text.contains("truncated"));
+        assert!(text.contains("SDK transport"));
+        assert_eq!(value["event_type"], "tool.output");
+    }
+
+    #[test]
+    fn sdk_transport_frame_value_caps_oversized_history_response() {
+        let large_text = "x".repeat(SDK_EVENT_STRING_LIMIT_BYTES);
+        let events = (0..12)
+            .map(|index| {
+                serde_json::json!({
+                    "seq": index,
+                    "id": format!("event-{index}"),
+                    "event_type": "tool.output",
+                    "payload": {
+                        "text": large_text.clone(),
+                    },
+                })
+            })
+            .collect::<Vec<_>>();
+        let response = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 42,
+            "result": {
+                "agent_id": "agent-1",
+                "session_id": "session-1",
+                "history": {
+                    "output": "final answer",
+                    "success": true,
+                    "done": true,
+                    "errors": [],
+                    "events": events,
+                    "usage": null,
+                    "files": [],
+                },
+                "final_projected_event": {
+                    "kind": "turn_completed",
+                    "snapshot": {
+                        "huge": "y".repeat(SDK_EVENT_STRING_LIMIT_BYTES),
+                    },
+                },
+            },
+        });
+
+        let bounded = sdk_transport_frame_value(&response);
+        let serialized = serde_json::to_string(&bounded).expect("bounded response serializes");
+
+        assert!(serialized.len() <= SDK_JSON_RPC_FRAME_LIMIT_BYTES);
+        assert_eq!(bounded["result"]["history"]["output"], "final answer");
+        assert_eq!(
+            bounded["result"]["history"]["events"][0]["event_type"],
+            "sdk.transport.truncated"
+        );
+        assert_eq!(
+            bounded["result"]["final_projected_event"]["snapshot"]["truncated_for_sdk_transport"],
+            true
+        );
     }
 
     #[test]

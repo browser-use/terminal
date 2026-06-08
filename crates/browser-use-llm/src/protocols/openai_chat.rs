@@ -701,6 +701,7 @@ fn parse_usage(usage: &Value) -> Usage {
     Usage {
         input_tokens: u("prompt_tokens"),
         cached_input_tokens: cached,
+        cache_creation_input_tokens: 0,
         output_tokens: u("completion_tokens"),
         reasoning_output_tokens: reasoning,
         total_tokens: u("total_tokens"),
@@ -974,6 +975,7 @@ mod tests {
         let usage = Usage {
             input_tokens: 10,
             cached_input_tokens: 0,
+            cache_creation_input_tokens: 0,
             output_tokens: 5,
             reasoning_output_tokens: 0,
             total_tokens: 15,
@@ -1048,6 +1050,7 @@ mod tests {
         let usage = Usage {
             input_tokens: 3,
             cached_input_tokens: 0,
+            cache_creation_input_tokens: 0,
             output_tokens: 1,
             reasoning_output_tokens: 0,
             total_tokens: 4, // computed: 3 + 1

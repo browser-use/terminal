@@ -277,6 +277,9 @@ pub struct AgentRunOptions {
     pub max_context_chars: usize,
     pub browser_mode: Option<String>,
     pub dynamic_browser_mode_from_store: bool,
+    pub browser_profile_id: Option<String>,
+    pub browser_profile_label: Option<String>,
+    pub browser_local_browser: Option<String>,
     pub collaboration_mode: CollaborationModeKind,
     pub include_environment_context: bool,
     pub include_permissions_instructions: bool,
@@ -290,6 +293,7 @@ pub struct AgentRunOptions {
     pub compact_prompt: Option<String>,
     pub model_provider_id: Option<String>,
     pub model_provider_id_source: RunConfigValueSource,
+    pub model_stream_idle_timeout_ms: Option<u64>,
     pub python_tool_timeout_seconds: u64,
     pub python_env: Vec<(String, String)>,
     pub child_agent_runner: Option<ChildAgentRunner>,
@@ -301,6 +305,10 @@ pub struct AgentRunOptions {
     pub analytics_source: Option<String>,
     pub analytics_provider_kind: Option<String>,
     pub analytics_model: Option<String>,
+    /// Persist exact provider input (system/messages/tool schemas) in
+    /// `model.turn.request` events. Default `false` keeps local CLI/TUI history
+    /// compact and avoids duplicating screenshots/prompt text every turn.
+    pub full_llm_input_events: bool,
     /// MCP servers to connect to and expose via the model-callable `mcp` tool.
     ///
     /// Empty (the default) registers no `mcp` tool, preserving prior behavior.
@@ -342,6 +350,9 @@ impl Default for AgentRunOptions {
             max_context_chars: DEFAULT_MAX_CONTEXT_CHARS,
             browser_mode: None,
             dynamic_browser_mode_from_store: false,
+            browser_profile_id: None,
+            browser_profile_label: None,
+            browser_local_browser: None,
             collaboration_mode: CollaborationModeKind::Default,
             include_environment_context: true,
             include_permissions_instructions: true,
@@ -355,7 +366,8 @@ impl Default for AgentRunOptions {
             compact_prompt: None,
             model_provider_id: None,
             model_provider_id_source: RunConfigValueSource::Default,
-            python_tool_timeout_seconds: 120,
+            model_stream_idle_timeout_ms: None,
+            python_tool_timeout_seconds: 300,
             python_env: Vec::new(),
             child_agent_runner: None,
             final_output_json_schema: None,
@@ -366,6 +378,7 @@ impl Default for AgentRunOptions {
             analytics_source: None,
             analytics_provider_kind: None,
             analytics_model: None,
+            full_llm_input_events: false,
             mcp_servers: HashMap::new(),
             // Default preserves the prior non-interactive behavior: tools
             // auto-approve, the approver is never consulted.
@@ -386,6 +399,21 @@ impl AgentRunOptions {
 
     pub fn with_dynamic_browser_mode_from_store(mut self, dynamic: bool) -> Self {
         self.dynamic_browser_mode_from_store = dynamic;
+        self
+    }
+
+    pub fn with_browser_profile_id(mut self, profile_id: impl Into<String>) -> Self {
+        self.browser_profile_id = Some(profile_id.into());
+        self
+    }
+
+    pub fn with_browser_profile_label(mut self, profile_label: impl Into<String>) -> Self {
+        self.browser_profile_label = Some(profile_label.into());
+        self
+    }
+
+    pub fn with_browser_local_browser(mut self, browser: impl Into<String>) -> Self {
+        self.browser_local_browser = Some(browser.into());
         self
     }
 
@@ -733,41 +761,69 @@ pub fn apply_child_request_runtime_config(
     config: &mut ProviderRunConfig,
     request: &ChildAgentRunRequest,
 ) -> Result<()> {
-    let overrides = &request.config_overrides;
+    apply_runtime_config_overrides(&mut config.options, &request.config_overrides)
+}
+
+/// Apply config keys that mutate in-memory runtime options.
+///
+/// The raw override list is still retained for downstream consumers that read
+/// less common config keys directly, but options that are consulted before those
+/// consumers run must be materialized here.
+pub fn apply_runtime_config_overrides(
+    options: &mut AgentRunOptions,
+    overrides: &ConfigOverrides,
+) -> Result<()> {
+    if let Some(value) = config_override_u64(overrides, "max_turns") {
+        options.max_turns = usize::try_from(value)
+            .context("max_turns does not fit in usize")?
+            .max(1);
+    }
     if let Some(value) = config_override_str(overrides, "browser_mode") {
-        config.options.browser_mode = Some(value);
+        options.browser_mode = Some(value);
     }
     if let Some(value) = config_override_str(overrides, "base_instructions") {
-        config.options.base_instructions = Some(value);
+        options.base_instructions = Some(value);
     }
     if let Some(value) = config_override_str(overrides, "developer_instructions") {
-        config.options.developer_instructions = Some(value);
+        options.developer_instructions = Some(value);
     }
     if let Some(value) = config_override_str(overrides, "compact_prompt") {
-        config.options.compact_prompt = Some(value);
+        options.compact_prompt = Some(value);
     }
     if let Some(value) = config_override_u64(overrides, "python_tool_timeout_seconds") {
-        config.options.python_tool_timeout_seconds = value;
+        options.python_tool_timeout_seconds = value;
+    }
+    if let Some(value) = config_override_u64(overrides, "model_stream_idle_timeout_ms") {
+        options.model_stream_idle_timeout_ms = Some(value);
     }
     if let Some(value) = config_override_bool(overrides, "model_compaction_enabled") {
-        config.options.model_compaction_enabled = value;
+        options.model_compaction_enabled = value;
+    }
+    if let Some(value) = config_override_bool_any(
+        overrides,
+        &[
+            "full_llm_input_events",
+            "observability.full_llm_input_events",
+        ],
+    ) {
+        options.full_llm_input_events = value;
     }
     if let Some(value) = config_override_i64(overrides, "model_auto_compact_token_limit") {
-        config.options.model_auto_compact_token_limit = Some(value);
+        options.model_auto_compact_token_limit = Some(value);
     }
     if let Some(value) = config_override_str(overrides, "model_auto_compact_token_limit_scope") {
-        config.options.model_auto_compact_token_limit_scope =
+        options.model_auto_compact_token_limit_scope =
             parse_auto_compact_token_limit_scope(&value)?;
     }
     if let Some(value) = config_override_str(overrides, "approval_policy")
         .or_else(|| config_override_str(overrides, "ask_for_approval"))
     {
-        config.options.approval_policy = parse_approval_policy(&value)?;
+        options.approval_policy = parse_approval_policy(&value)?;
     }
     if let Some(value) = config_override_bool(overrides, "use_guardian")
         .or_else(|| config_override_bool(overrides, "guardian"))
     {
-        config.options.use_guardian = value;
+        options.use_guardian = value;
     }
     Ok(())
 }
@@ -1542,6 +1598,14 @@ fn config_override_bool(overrides: &ConfigOverrides, key: &str) -> Option<bool> 
         .and_then(|(_, value)| value.as_bool())
 }
 
+fn config_override_bool_any(overrides: &ConfigOverrides, keys: &[&str]) -> Option<bool> {
+    overrides
+        .iter()
+        .rev()
+        .find(|(candidate, _)| keys.iter().any(|key| candidate == key))
+        .and_then(|(_, value)| value.as_bool())
+}
+
 fn config_override_i64(overrides: &ConfigOverrides, key: &str) -> Option<i64> {
     overrides
         .iter()
@@ -1798,7 +1862,7 @@ command = "profile-server"
             options.model_provider_id_source,
             RunConfigValueSource::Default
         );
-        assert_eq!(options.python_tool_timeout_seconds, 120);
+        assert_eq!(options.python_tool_timeout_seconds, 300);
         assert!(options.python_env.is_empty());
         assert!(options.child_agent_runner.is_none());
         assert!(options.final_output_json_schema.is_none());
@@ -1807,6 +1871,7 @@ command = "profile-server"
         assert!(options.analytics_source.is_none());
         assert!(options.analytics_provider_kind.is_none());
         assert!(options.analytics_model.is_none());
+        assert!(!options.full_llm_input_events);
         assert!(options.mcp_servers.is_empty());
         // Approval defaults preserve prior non-interactive behavior.
         assert_eq!(options.approval_policy, AskForApproval::Never);
@@ -1814,6 +1879,41 @@ command = "profile-server"
         assert_eq!(options.multi_agent_v2, MultiAgentV2Options::default());
         assert!(!options.collab_enabled);
         assert!(options.agent_roles.is_empty());
+    }
+
+    #[test]
+    fn runtime_config_overrides_materialize_max_turns_and_browser_mode() {
+        let overrides = parse_config_overrides(&ov(&[
+            "max_turns=100",
+            "browser_mode=\"remote-cdp\"",
+            "python_tool_timeout_seconds=45",
+            "model_compaction_enabled=false",
+            "full_llm_input_events=true",
+        ]))
+        .unwrap();
+        let mut options = AgentRunOptions::default();
+
+        apply_runtime_config_overrides(&mut options, &overrides).unwrap();
+
+        assert_eq!(options.max_turns, 100);
+        assert_eq!(options.browser_mode.as_deref(), Some("remote-cdp"));
+        assert_eq!(options.python_tool_timeout_seconds, 45);
+        assert!(!options.model_compaction_enabled);
+        assert!(options.full_llm_input_events);
+    }
+
+    #[test]
+    fn runtime_config_overrides_materialize_observability_full_llm_input_alias() {
+        let overrides = parse_config_overrides(&ov(&[
+            "full_llm_input_events=false",
+            "observability.full_llm_input_events=true",
+        ]))
+        .unwrap();
+        let mut options = AgentRunOptions::default();
+
+        apply_runtime_config_overrides(&mut options, &overrides).unwrap();
+
+        assert!(options.full_llm_input_events);
     }
 
     #[test]

@@ -35,13 +35,16 @@ use browser_use_runtime::{
 use browser_use_store::{Store, StoreNotifier};
 
 use crate::settings::{
-    browser_use_cloud_env_key_present, AgentBackend, BROWSER_USE_CLOUD,
+    browser_use_cloud_env_key_present, AgentBackend, BROWSER_LOCAL_CHROME, BROWSER_USE_CLOUD,
     BROWSER_USE_CLOUD_API_KEY_ENV, BROWSER_USE_CLOUD_API_KEY_SETTING,
 };
+use crate::{LOCAL_CHROME_CLOUD_PROMO_EVENT, LOCAL_CHROME_CLOUD_PROMO_TEXT};
 
 static TUI_LIVE_RUNTIMES: OnceLock<Mutex<HashMap<PathBuf, RuntimeHandle>>> = OnceLock::new();
 static TUI_RUNTIME_AGENT_EXECUTORS: OnceLock<Mutex<HashMap<PathBuf, RuntimeAgentExecutor>>> =
     OnceLock::new();
+const LOCAL_CHROME_CLOUD_PROMO_QUALIFIED_TASK_COUNT_SETTING: &str =
+    "session.cloud_promo.local_chrome_qualified_task_count";
 
 fn tui_live_runtimes() -> &'static Mutex<HashMap<PathBuf, RuntimeHandle>> {
     TUI_LIVE_RUNTIMES.get_or_init(|| Mutex::new(HashMap::new()))
@@ -281,18 +284,29 @@ pub(crate) fn spawn_tui_agent_run(
     model: String,
     model_provider_id: Option<String>,
     browser: String,
+    browser_profile_id: Option<String>,
+    browser_profile_label: Option<String>,
+    browser_local_browser: Option<String>,
     collaboration_mode: CollaborationModeKind,
     config_profile: Option<String>,
     config_overrides: ConfigOverrides,
     notifier: Option<StoreNotifier>,
 ) -> Result<()> {
+    let selected_browser = browser.clone();
+    let local_chrome_cloud_promo_user_turn_seq = {
+        let store = Store::open(&state_dir)?;
+        local_chrome_cloud_promo_user_turn_seq(&store, &session_id, &selected_browser)?
+    };
     let (executor, config) = prepare_tui_agent_run(
-        state_dir,
+        state_dir.clone(),
         &session_id,
         backend,
         model,
         model_provider_id,
         browser,
+        browser_profile_id,
+        browser_profile_label,
+        browser_local_browser,
         collaboration_mode,
         config_profile,
         config_overrides,
@@ -304,6 +318,17 @@ pub(crate) fn spawn_tui_agent_run(
         move |completion| {
             if let Some(error) = completion.error_message() {
                 eprintln!("tui agent failed: {error}");
+                return;
+            }
+            if let Err(error) = Store::open(&state_dir).and_then(|store| {
+                maybe_append_local_chrome_cloud_promo(
+                    &store,
+                    &session_id,
+                    &selected_browser,
+                    local_chrome_cloud_promo_user_turn_seq,
+                )
+            }) {
+                eprintln!("tui local Chrome cloud promo append failed: {error:#}");
             }
         },
     )?;
@@ -317,6 +342,9 @@ fn prepare_tui_agent_run(
     model: String,
     model_provider_id: Option<String>,
     browser: String,
+    browser_profile_id: Option<String>,
+    browser_profile_label: Option<String>,
+    browser_local_browser: Option<String>,
     collaboration_mode: CollaborationModeKind,
     config_profile: Option<String>,
     config_overrides: ConfigOverrides,
@@ -351,6 +379,9 @@ fn prepare_tui_agent_run(
             &session_id,
             collaboration_mode,
             model_provider_id.as_deref(),
+            browser_profile_id.as_deref(),
+            browser_profile_label.as_deref(),
+            browser_local_browser.as_deref(),
             browser_use_cloud_api_key.as_deref(),
             config_profile.clone(),
             config_overrides.clone(),
@@ -374,12 +405,138 @@ fn prepare_tui_agent_run(
         model,
         model_provider_id,
         browser,
+        browser_profile_id,
+        browser_profile_label,
+        browser_local_browser,
         collaboration_mode,
         config_profile,
         config_overrides,
         &mut config,
     );
     Ok((executor, config))
+}
+
+fn maybe_append_local_chrome_cloud_promo(
+    store: &Store,
+    session_id: &str,
+    browser: &str,
+    user_turn_seq: Option<i64>,
+) -> Result<()> {
+    if browser != BROWSER_LOCAL_CHROME {
+        return Ok(());
+    }
+    let Some(user_turn_seq) = user_turn_seq else {
+        return Ok(());
+    };
+    let events = store.events_for_session(session_id)?;
+    if !should_append_local_chrome_cloud_promo(&events, user_turn_seq) {
+        return Ok(());
+    }
+    let qualified_count = increment_local_chrome_cloud_promo_qualified_task_count(store)?;
+    if qualified_count % 5 != 1 {
+        return Ok(());
+    }
+    store.append_event(
+        session_id,
+        LOCAL_CHROME_CLOUD_PROMO_EVENT,
+        serde_json::json!({ "text": LOCAL_CHROME_CLOUD_PROMO_TEXT }),
+    )?;
+    Ok(())
+}
+
+fn local_chrome_cloud_promo_user_turn_seq(
+    store: &Store,
+    session_id: &str,
+    browser: &str,
+) -> Result<Option<i64>> {
+    if browser != BROWSER_LOCAL_CHROME {
+        return Ok(None);
+    }
+    let events = store.events_for_session(session_id)?;
+    let latest_user_turn = events.iter().rev().find(|event| {
+        event.event_type == "session.input" || event.event_type.starts_with("session.followup")
+    });
+    Ok(latest_user_turn
+        .filter(|event| event.event_type == "session.input")
+        .map(|event| event.seq))
+}
+
+fn increment_local_chrome_cloud_promo_qualified_task_count(store: &Store) -> Result<u64> {
+    store.increment_u64_setting(LOCAL_CHROME_CLOUD_PROMO_QUALIFIED_TASK_COUNT_SETTING)
+}
+
+fn should_append_local_chrome_cloud_promo(
+    events: &[browser_use_protocol::EventRecord],
+    user_turn_seq: i64,
+) -> bool {
+    let Some(user_turn_index) = events.iter().position(|event| event.seq == user_turn_seq) else {
+        return false;
+    };
+    if events[user_turn_index].event_type != "session.input" {
+        return false;
+    }
+    let next_user_turn_index = events
+        .iter()
+        .enumerate()
+        .skip(user_turn_index + 1)
+        .find(|(_, event)| {
+            event.event_type == "session.input" || event.event_type.starts_with("session.followup")
+        })
+        .map(|(index, _)| index)
+        .unwrap_or(events.len());
+    let current_user_message_events = &events[user_turn_index..next_user_turn_index];
+    let has_browser_connection = current_user_message_events
+        .iter()
+        .any(event_indicates_browser_connected);
+    let has_success = current_user_message_events
+        .iter()
+        .any(|event| event.event_type == "session.done");
+    let has_terminal_failure = current_user_message_events.iter().any(|event| {
+        matches!(
+            event.event_type.as_str(),
+            "session.failed" | "session.cancelled"
+        )
+    });
+    let already_prompted = events
+        .iter()
+        .any(|event| event.event_type == LOCAL_CHROME_CLOUD_PROMO_EVENT);
+    has_browser_connection && has_success && !has_terminal_failure && !already_prompted
+}
+
+fn event_indicates_browser_connected(event: &browser_use_protocol::EventRecord) -> bool {
+    if event.event_type == "browser.connected" {
+        return true;
+    }
+    if event.event_type != "tool.output" {
+        return false;
+    }
+    if event
+        .payload
+        .get("name")
+        .and_then(serde_json::Value::as_str)
+        != Some("browser")
+    {
+        return false;
+    }
+    if event.payload.get("ok").and_then(serde_json::Value::as_bool) == Some(false) {
+        return false;
+    }
+    let Some(text) = event
+        .payload
+        .get("text")
+        .and_then(serde_json::Value::as_str)
+    else {
+        return false;
+    };
+    serde_json::from_str::<serde_json::Value>(text)
+        .ok()
+        .and_then(|value| {
+            value
+                .get("connection")
+                .and_then(serde_json::Value::as_str)
+                .map(|connection| connection == "connected")
+        })
+        .unwrap_or(false)
 }
 
 fn browser_use_cloud_api_key(store: &Store) -> Result<Option<String>> {
@@ -402,6 +559,9 @@ fn attach_tui_child_agent_runner(
     model: String,
     model_provider_id: Option<String>,
     browser: String,
+    browser_profile_id: Option<String>,
+    browser_profile_label: Option<String>,
+    browser_local_browser: Option<String>,
     collaboration_mode: CollaborationModeKind,
     config_profile: Option<String>,
     config_overrides: ConfigOverrides,
@@ -415,6 +575,9 @@ fn attach_tui_child_agent_runner(
             model.clone(),
             model_provider_id.clone(),
             browser.clone(),
+            browser_profile_id.clone(),
+            browser_profile_label.clone(),
+            browser_local_browser.clone(),
             collaboration_mode,
             config_profile.clone(),
             config_overrides.clone(),
@@ -431,6 +594,9 @@ fn spawn_tui_child_agent(
     model: String,
     model_provider_id: Option<String>,
     browser: String,
+    browser_profile_id: Option<String>,
+    browser_profile_label: Option<String>,
+    browser_local_browser: Option<String>,
     collaboration_mode: CollaborationModeKind,
     config_profile: Option<String>,
     mut config_overrides: ConfigOverrides,
@@ -484,6 +650,9 @@ fn spawn_tui_child_agent(
         child_model,
         child_model_provider_id,
         child_browser,
+        browser_profile_id,
+        browser_profile_label,
+        browser_local_browser,
         collaboration_mode,
         config_profile,
         config_overrides,
@@ -768,6 +937,7 @@ fn child_request_browser(request: &ChildAgentRunRequest) -> Option<String> {
         .filter(|value| !value.is_empty())?;
     match browser_mode {
         "managed-headless" => Some("Headless Chromium".to_string()),
+        "managed-headed" => Some("Managed Chromium".to_string()),
         "cloud" => Some(BROWSER_USE_CLOUD.to_string()),
         "local" => Some("Local Chrome".to_string()),
         _ => None,
@@ -829,6 +999,9 @@ fn tui_agent_options(
     _session_id: &str,
     collaboration_mode: CollaborationModeKind,
     model_provider_id: Option<&str>,
+    browser_profile_id: Option<&str>,
+    browser_profile_label: Option<&str>,
+    browser_local_browser: Option<&str>,
     browser_use_cloud_api_key: Option<&str>,
     config_profile: Option<String>,
     config_overrides: ConfigOverrides,
@@ -838,14 +1011,17 @@ fn tui_agent_options(
         "Headless Chromium" => AgentRunOptions::default()
             .with_collaboration_mode(collaboration_mode)
             .with_browser_mode("managed-headless")
-            .with_dynamic_browser_mode_from_store(true)
+            .with_model_compaction(true)
+            .with_analytics_source("tui"),
+        "Managed Chromium" => AgentRunOptions::default()
+            .with_collaboration_mode(collaboration_mode)
+            .with_browser_mode("managed-headed")
             .with_model_compaction(true)
             .with_analytics_source("tui"),
         BROWSER_USE_CLOUD => {
             let mut options = AgentRunOptions::default()
                 .with_collaboration_mode(collaboration_mode)
                 .with_browser_mode("cloud")
-                .with_dynamic_browser_mode_from_store(true)
                 .with_model_compaction(true)
                 .with_analytics_source("tui");
             if let Some(api_key) =
@@ -861,10 +1037,27 @@ fn tui_agent_options(
         _ => AgentRunOptions::default()
             .with_collaboration_mode(collaboration_mode)
             .with_browser_mode("local")
-            .with_dynamic_browser_mode_from_store(true)
             .with_model_compaction(true)
             .with_analytics_source("tui"),
     };
+    if let Some(profile_id) = browser_profile_id
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        options = options.with_browser_profile_id(profile_id.to_string());
+    }
+    if let Some(profile_label) = browser_profile_label
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        options = options.with_browser_profile_label(profile_label.to_string());
+    }
+    if let Some(local_browser) = browser_local_browser
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        options = options.with_browser_local_browser(local_browser.to_string());
+    }
     if let Some(policy) = resolve_approval_policy_for_profile(profile_ref, &config_overrides, None)?
     {
         options = options.with_approval_policy(policy);
@@ -907,6 +1100,10 @@ fn tui_agent_options(
 mod tests {
     use super::*;
     use browser_use_agent::tools::AskForApproval;
+    use browser_use_protocol::EventRecord;
+    use std::sync::{Mutex, OnceLock};
+
+    static ENV_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 
     fn env_value<'a>(options: &'a AgentRunOptions, key: &str) -> Option<&'a str> {
         options
@@ -914,6 +1111,33 @@ mod tests {
             .iter()
             .find(|(candidate, _)| candidate == key)
             .map(|(_, value)| value.as_str())
+    }
+
+    fn event(seq: i64, event_type: &str) -> EventRecord {
+        event_with_payload(seq, event_type, serde_json::json!({}))
+    }
+
+    fn event_with_payload(seq: i64, event_type: &str, payload: serde_json::Value) -> EventRecord {
+        EventRecord {
+            seq,
+            id: format!("event-{seq}"),
+            session_id: "session-1".to_string(),
+            ts_ms: seq,
+            event_type: event_type.to_string(),
+            payload,
+        }
+    }
+
+    fn browser_status_connected_event(seq: i64) -> EventRecord {
+        event_with_payload(
+            seq,
+            "tool.output",
+            serde_json::json!({
+                "name": "browser",
+                "ok": true,
+                "text": "{\"connection\":\"connected\"}"
+            }),
+        )
     }
 
     #[test]
@@ -937,12 +1161,43 @@ mod tests {
             Some("codex"),
             None,
             None,
+            None,
+            None,
+            None,
             Vec::new(),
         )
         .unwrap();
         assert_eq!(options.browser_mode.as_deref(), Some("local"));
-        assert!(options.dynamic_browser_mode_from_store);
+        assert!(!options.dynamic_browser_mode_from_store);
         assert!(options.python_env.is_empty());
+    }
+
+    #[test]
+    fn local_chrome_options_carry_session_profile_snapshot() {
+        let options = tui_agent_options(
+            "Local Chrome",
+            "abc123",
+            CollaborationModeKind::Default,
+            Some("codex"),
+            Some("google-chrome:Profile 1"),
+            Some("Work"),
+            Some("Google Chrome"),
+            None,
+            None,
+            Vec::new(),
+        )
+        .unwrap();
+        assert_eq!(options.browser_mode.as_deref(), Some("local"));
+        assert_eq!(
+            options.browser_profile_id.as_deref(),
+            Some("google-chrome:Profile 1")
+        );
+        assert_eq!(options.browser_profile_label.as_deref(), Some("Work"));
+        assert_eq!(
+            options.browser_local_browser.as_deref(),
+            Some("Google Chrome")
+        );
+        assert!(!options.dynamic_browser_mode_from_store);
     }
 
     #[test]
@@ -954,11 +1209,14 @@ mod tests {
             Some("codex"),
             None,
             None,
+            None,
+            None,
+            None,
             Vec::new(),
         )
         .unwrap();
         assert_eq!(options.browser_mode.as_deref(), Some("managed-headless"));
-        assert!(options.dynamic_browser_mode_from_store);
+        assert!(!options.dynamic_browser_mode_from_store);
         assert!(options.python_env.is_empty());
     }
 
@@ -969,6 +1227,9 @@ mod tests {
             "abc123",
             CollaborationModeKind::Plan,
             Some("codex"),
+            None,
+            None,
+            None,
             None,
             None,
             Vec::new(),
@@ -987,11 +1248,14 @@ mod tests {
             Some("codex"),
             None,
             None,
+            None,
+            None,
+            None,
             Vec::new(),
         )
         .unwrap();
         assert_eq!(options.browser_mode.as_deref(), Some("cloud"));
-        assert!(options.dynamic_browser_mode_from_store);
+        assert!(!options.dynamic_browser_mode_from_store);
         assert!(options.python_env.is_empty());
     }
 
@@ -1002,6 +1266,9 @@ mod tests {
             "abc123",
             CollaborationModeKind::Default,
             Some("codex"),
+            None,
+            None,
+            None,
             Some("bu-test"),
             None,
             Vec::new(),
@@ -1015,11 +1282,242 @@ mod tests {
     }
 
     #[test]
+    fn local_chrome_cloud_promo_requires_browser_connection() {
+        let no_browser_events = vec![event(1, "session.input"), event(2, "session.done")];
+        assert!(!should_append_local_chrome_cloud_promo(
+            &no_browser_events,
+            1
+        ));
+
+        let events = vec![
+            event(1, "session.input"),
+            event(2, "browser.connected"),
+            event(3, "session.done"),
+        ];
+        assert!(should_append_local_chrome_cloud_promo(&events, 1));
+
+        let tool_output_events = vec![
+            event(1, "session.input"),
+            browser_status_connected_event(2),
+            event(3, "session.done"),
+        ];
+        assert!(should_append_local_chrome_cloud_promo(
+            &tool_output_events,
+            1
+        ));
+    }
+
+    #[test]
+    fn local_chrome_cloud_promo_requires_browser_connection_before_followup_and_skips_existing_promos(
+    ) {
+        let browser_connected_before_followup = vec![
+            event(1, "session.input"),
+            event(2, "browser.connected"),
+            event(3, "session.done"),
+            event(4, "session.followup"),
+        ];
+        assert!(should_append_local_chrome_cloud_promo(
+            &browser_connected_before_followup,
+            1
+        ));
+
+        let browser_connected_after_followup = vec![
+            event(1, "session.input"),
+            event(2, "session.followup"),
+            event(3, "browser.connected"),
+            event(4, "session.done"),
+        ];
+        assert!(!should_append_local_chrome_cloud_promo(
+            &browser_connected_after_followup,
+            1
+        ));
+        assert!(!should_append_local_chrome_cloud_promo(
+            &browser_connected_after_followup,
+            2
+        ));
+
+        let already_prompted = vec![
+            event(1, "session.input"),
+            event(2, "browser.connected"),
+            event(3, "session.done"),
+            event(4, LOCAL_CHROME_CLOUD_PROMO_EVENT),
+        ];
+        assert!(!should_append_local_chrome_cloud_promo(
+            &already_prompted,
+            1
+        ));
+    }
+
+    #[test]
+    fn local_chrome_cloud_promo_appends_on_first_and_every_fifth_browser_connected_initial_success(
+    ) -> Result<()> {
+        let _guard = ENV_LOCK
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .expect("env lock poisoned");
+        let saved = std::env::var(BROWSER_USE_CLOUD_API_KEY_ENV).ok();
+        unsafe {
+            std::env::remove_var(BROWSER_USE_CLOUD_API_KEY_ENV);
+        }
+
+        let result = (|| -> Result<()> {
+            let temp = tempfile::tempdir()?;
+            let store = Store::open(temp.path())?;
+            for idx in 1..=6 {
+                let session = store.create_session(None, std::env::current_dir()?)?;
+                store.append_event(
+                    &session.id,
+                    "session.input",
+                    serde_json::json!({"text": format!("task {idx}")}),
+                )?;
+                let user_turn_seq = local_chrome_cloud_promo_user_turn_seq(
+                    &store,
+                    &session.id,
+                    BROWSER_LOCAL_CHROME,
+                )?;
+                assert!(user_turn_seq.is_some(), "expected user turn at task {idx}");
+                store.append_event(
+                    &session.id,
+                    "browser.connected",
+                    serde_json::json!({"url": "https://example.com"}),
+                )?;
+                store.append_event(
+                    &session.id,
+                    "session.done",
+                    serde_json::json!({"result": "done"}),
+                )?;
+
+                maybe_append_local_chrome_cloud_promo(
+                    &store,
+                    &session.id,
+                    BROWSER_LOCAL_CHROME,
+                    user_turn_seq,
+                )?;
+                let events = store.events_for_session(&session.id)?;
+                let prompted = events
+                    .iter()
+                    .any(|event| event.event_type == LOCAL_CHROME_CLOUD_PROMO_EVENT);
+                assert_eq!(
+                    prompted,
+                    idx == 1 || idx == 6,
+                    "unexpected prompt state at task {idx}"
+                );
+            }
+
+            let profile_session = store.create_session(None, std::env::current_dir()?)?;
+            store.append_event(
+                &profile_session.id,
+                "session.input",
+                serde_json::json!({"text": "use Hacker News"}),
+            )?;
+            store.append_event(
+                &profile_session.id,
+                "session.done",
+                serde_json::json!({"result": "Which browser profile should I use?"}),
+            )?;
+            store.append_event(
+                &profile_session.id,
+                "session.followup",
+                serde_json::json!({"text": "1"}),
+            )?;
+            let profile_user_turn_seq = local_chrome_cloud_promo_user_turn_seq(
+                &store,
+                &profile_session.id,
+                BROWSER_LOCAL_CHROME,
+            )?;
+            assert!(
+                profile_user_turn_seq.is_none(),
+                "profile selection follow-up should not qualify"
+            );
+            store.append_event(
+                &profile_session.id,
+                "tool.output",
+                serde_json::json!({
+                    "name": "browser",
+                    "ok": true,
+                    "text": "{\"connection\":\"connected\"}"
+                }),
+            )?;
+            store.append_event(
+                &profile_session.id,
+                "session.done",
+                serde_json::json!({"result": "done"}),
+            )?;
+            maybe_append_local_chrome_cloud_promo(
+                &store,
+                &profile_session.id,
+                BROWSER_LOCAL_CHROME,
+                profile_user_turn_seq,
+            )?;
+            assert!(!store
+                .events_for_session(&profile_session.id)?
+                .iter()
+                .any(|event| event.event_type == LOCAL_CHROME_CLOUD_PROMO_EVENT));
+
+            assert_eq!(
+                store
+                    .get_setting(LOCAL_CHROME_CLOUD_PROMO_QUALIFIED_TASK_COUNT_SETTING)?
+                    .as_deref(),
+                Some("6")
+            );
+            Ok(())
+        })();
+
+        if let Some(value) = saved {
+            unsafe {
+                std::env::set_var(BROWSER_USE_CLOUD_API_KEY_ENV, value);
+            }
+        }
+        result
+    }
+
+    #[test]
+    fn local_chrome_cloud_promo_appends_even_when_cloud_key_is_stored() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let store = Store::open(temp.path())?;
+        store.set_setting(BROWSER_USE_CLOUD_API_KEY_SETTING, "bu-test")?;
+        let session = store.create_session(None, std::env::current_dir()?)?;
+        store.append_event(
+            &session.id,
+            "session.input",
+            serde_json::json!({"text": "research Hacker News"}),
+        )?;
+        let user_turn_seq =
+            local_chrome_cloud_promo_user_turn_seq(&store, &session.id, BROWSER_LOCAL_CHROME)?;
+        store.append_event(
+            &session.id,
+            "browser.connected",
+            serde_json::json!({"status": "connected"}),
+        )?;
+        store.append_event(
+            &session.id,
+            "session.done",
+            serde_json::json!({"result": "done"}),
+        )?;
+
+        maybe_append_local_chrome_cloud_promo(
+            &store,
+            &session.id,
+            BROWSER_LOCAL_CHROME,
+            user_turn_seq,
+        )?;
+
+        assert!(store
+            .events_for_session(&session.id)?
+            .iter()
+            .any(|event| event.event_type == LOCAL_CHROME_CLOUD_PROMO_EVENT));
+        Ok(())
+    }
+
+    #[test]
     fn tui_agent_options_leaves_provider_id_unset_for_config_resolution() {
         let options = tui_agent_options(
             "Local Chrome",
             "abc123",
             CollaborationModeKind::Default,
+            None,
+            None,
+            None,
             None,
             None,
             None,
@@ -1041,6 +1539,9 @@ mod tests {
             "abc123",
             CollaborationModeKind::Default,
             Some("codex"),
+            None,
+            None,
+            None,
             None,
             Some("work".to_string()),
             config_overrides,
@@ -1084,6 +1585,9 @@ command = "test-mcp"
             "abc123",
             CollaborationModeKind::Default,
             Some("codex"),
+            None,
+            None,
+            None,
             None,
             None,
             Vec::new(),

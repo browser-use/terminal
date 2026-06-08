@@ -4,6 +4,7 @@
 use std::time::Instant;
 
 use ratatui::text::{Line, Span};
+use unicode_width::UnicodeWidthStr;
 
 use crate::theme::{bold, muted, text_style};
 
@@ -212,6 +213,7 @@ const LOGO_STROKE: f32 = 1.15;
 
 // Boxed splash: logo, product name, version, shortcuts hint — all centered.
 const LOGO_TO_TITLE_GAP: usize = 1;
+const BANNER_TO_LOGO_GAP: usize = 1;
 const VERSION_TO_HINT_GAP: usize = 2;
 const TITLE: &str = "Browser Use";
 const VERSION: &str = concat!("v", env!("CARGO_PKG_VERSION"));
@@ -223,9 +225,14 @@ fn hint_width() -> usize {
     HINT_PREFIX.chars().count() + HINT_KEY.chars().count() + HINT_SUFFIX.chars().count()
 }
 
-fn splash_block_h() -> usize {
+fn splash_block_h(banner_rows: usize) -> usize {
     // logo + gap + title(1) + version(1) + gap + hint(1)
-    LOGO_H + LOGO_TO_TITLE_GAP + 1 + 1 + VERSION_TO_HINT_GAP + 1
+    let banner_h = if banner_rows > 0 {
+        banner_rows + BANNER_TO_LOGO_GAP
+    } else {
+        0
+    };
+    banner_h + LOGO_H + LOGO_TO_TITLE_GAP + 1 + 1 + VERSION_TO_HINT_GAP + 1
 }
 
 /// Compute the on-screen rect of the logo inside the welcome surface so the
@@ -234,14 +241,20 @@ fn splash_block_h() -> usize {
 pub fn logo_screen_rect(
     body_rect: ratatui::layout::Rect,
     has_status_notice: bool,
+    banner_rows: usize,
 ) -> ratatui::layout::Rect {
     let status_notice_rows: u16 = if has_status_notice { 2 } else { 0 };
     const HEADER_H: u16 = 1;
     let target = body_rect.height.saturating_sub(status_notice_rows);
     let available_below_header = target.saturating_sub(HEADER_H);
-    let block_h = splash_block_h() as u16;
+    let block_h = splash_block_h(banner_rows) as u16;
     let pad_top = (available_below_header.saturating_sub(block_h) / 2).max(1);
-    let top_offset = status_notice_rows + HEADER_H + pad_top;
+    let banner_rows = if banner_rows > 0 {
+        (banner_rows + BANNER_TO_LOGO_GAP) as u16
+    } else {
+        0
+    };
+    let top_offset = status_notice_rows + HEADER_H + pad_top + banner_rows;
     let col_offset = body_rect.width.saturating_sub(LOGO_W as u16) / 2;
     ratatui::layout::Rect {
         x: body_rect.x.saturating_add(col_offset),
@@ -257,11 +270,12 @@ pub fn welcome_lines(
     anim: &WelcomeAnim,
     _selected_idx: usize,
     target_h: u16,
+    banner: Option<Vec<Line<'static>>>,
 ) -> Vec<Line<'static>> {
     let mut out: Vec<Line<'static>> = Vec::new();
     let width = width as usize;
 
-    let block_h = splash_block_h();
+    let block_h = splash_block_h(banner.as_ref().map_or(0, Vec::len));
     let header_h = 0_usize;
     let target = target_h as usize;
     let available_below_header = target.saturating_sub(header_h);
@@ -269,6 +283,16 @@ pub fn welcome_lines(
 
     for _ in 0..pad_top {
         out.push(Line::from(""));
+    }
+
+    if let Some(banner) = banner {
+        for mut line in banner {
+            center_line(&mut line, width);
+            out.push(line);
+        }
+        for _ in 0..BANNER_TO_LOGO_GAP {
+            out.push(Line::from(""));
+        }
     }
 
     // Logo, centered.
@@ -319,6 +343,16 @@ pub fn welcome_lines(
     }
 
     out
+}
+
+fn center_line(line: &mut Line<'static>, width: usize) {
+    let line_w = line
+        .spans
+        .iter()
+        .map(|span| UnicodeWidthStr::width(span.content.as_ref()))
+        .sum::<usize>();
+    let line_pad = " ".repeat(width.saturating_sub(line_w) / 2);
+    line.spans.insert(0, Span::raw(line_pad));
 }
 
 // ─────────────────────── Session header ───────────────────────

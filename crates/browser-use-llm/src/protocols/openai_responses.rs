@@ -712,6 +712,7 @@ fn parse_usage(usage: Option<&Value>) -> Option<Usage> {
     Some(Usage {
         input_tokens: input,
         cached_input_tokens: cached,
+        cache_creation_input_tokens: 0,
         output_tokens: output,
         reasoning_output_tokens: reasoning,
         total_tokens: total,
@@ -971,6 +972,7 @@ mod tests {
                 usage: Usage {
                     input_tokens: 11,
                     cached_input_tokens: 4,
+                    cache_creation_input_tokens: 0,
                     output_tokens: 7,
                     reasoning_output_tokens: 2,
                     total_tokens: 18,
@@ -981,6 +983,7 @@ mod tests {
                 usage: Usage {
                     input_tokens: 11,
                     cached_input_tokens: 4,
+                    cache_creation_input_tokens: 0,
                     output_tokens: 7,
                     reasoning_output_tokens: 2,
                     total_tokens: 18,
@@ -1082,6 +1085,7 @@ mod tests {
                     usage: Usage {
                         input_tokens: 1,
                         cached_input_tokens: 0,
+                        cache_creation_input_tokens: 0,
                         output_tokens: 1,
                         reasoning_output_tokens: 0,
                         total_tokens: 2,
@@ -1092,6 +1096,7 @@ mod tests {
                     usage: Usage {
                         input_tokens: 1,
                         cached_input_tokens: 0,
+                        cache_creation_input_tokens: 0,
                         output_tokens: 1,
                         reasoning_output_tokens: 0,
                         total_tokens: 2,

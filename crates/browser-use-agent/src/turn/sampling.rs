@@ -54,12 +54,13 @@
 use std::collections::HashMap;
 use std::future::Future;
 use std::pin::Pin;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 
 use browser_use_llm::route::{ModelClient, Route};
 use browser_use_llm::schema::{
-    ContentPart, FinishReason, LlmError, LlmErrorReason, LlmEvent, LlmRequest, Message,
+    CacheHint, ContentPart, FinishReason, LlmError, LlmErrorReason, LlmEvent, LlmRequest, Message,
     MessageRole, SystemPart, TextPhase, Usage,
 };
 use futures_util::{Stream, StreamExt};
@@ -343,6 +344,7 @@ pub struct ModelSamplingDriver<
     transport: T,
     sink: Arc<dyn EventSink>,
     ctx: TurnCtx,
+    next_turn_idx: AtomicUsize,
     /// Retry budget (codex `provider.stream_max_retries()`).
     max_retries: u32,
     /// Whether to apply I/O-layer jitter to the post-decision backoff sleep.
@@ -362,6 +364,10 @@ pub struct ModelSamplingDriver<
     /// stops the current response and reports follow-up so the turn loop drains
     /// that mail on the next iteration.
     mailbox_preemption_probe: Option<MailboxPreemptionProbe>,
+    /// Include the full provider input in `model.turn.request` events. Disabled
+    /// for normal CLI/TUI persistence because it can duplicate large screenshots
+    /// and prompt text into the local event log on every turn.
+    full_llm_input_events: bool,
 }
 
 impl<T: SamplingTransport> ModelSamplingDriver<T> {
@@ -378,6 +384,7 @@ impl<T: SamplingTransport> ModelSamplingDriver<T> {
         Self {
             transport,
             sink,
+            next_turn_idx: AtomicUsize::new(ctx.turn_idx),
             ctx,
             max_retries,
             jitter: true,
@@ -385,6 +392,7 @@ impl<T: SamplingTransport> ModelSamplingDriver<T> {
             recorder: None,
             goal_store: None,
             mailbox_preemption_probe: None,
+            full_llm_input_events: false,
         }
     }
 
@@ -406,6 +414,7 @@ impl<T: SamplingTransport> ModelSamplingDriver<T> {
         ModelSamplingDriver {
             transport: self.transport,
             sink: self.sink,
+            next_turn_idx: self.next_turn_idx,
             ctx: self.ctx,
             max_retries: self.max_retries,
             jitter: self.jitter,
@@ -413,6 +422,7 @@ impl<T: SamplingTransport> ModelSamplingDriver<T> {
             recorder: Some(recorder),
             goal_store: self.goal_store,
             mailbox_preemption_probe: self.mailbox_preemption_probe,
+            full_llm_input_events: self.full_llm_input_events,
         }
     }
 }
@@ -434,6 +444,11 @@ impl<T: SamplingTransport, R: CallRunner + 'static> ModelSamplingDriver<T, R> {
         self
     }
 
+    pub fn with_full_llm_input_events(mut self, enabled: bool) -> Self {
+        self.full_llm_input_events = enabled;
+        self
+    }
+
     async fn has_mailbox_preemption(&self) -> bool {
         match &self.mailbox_preemption_probe {
             Some(probe) => probe().await,
@@ -442,22 +457,36 @@ impl<T: SamplingTransport, R: CallRunner + 'static> ModelSamplingDriver<T, R> {
     }
 
     /// Map an [`LlmEvent`] to UI events and emit them through the sink.
-    fn emit_event(&self, ev: &LlmEvent) {
-        for pending in events::map_llm_event(&self.ctx, ev) {
+    fn ctx_for_turn(&self, turn_idx: usize) -> TurnCtx {
+        let mut ctx = self.ctx.clone();
+        ctx.turn_idx = turn_idx;
+        ctx
+    }
+
+    fn emit_event(&self, ev: &LlmEvent, turn_idx: usize) {
+        let ctx = self.ctx_for_turn(turn_idx);
+        for pending in events::map_llm_event(&ctx, ev) {
             self.sink.emit(pending);
         }
     }
 
-    fn emit_turn_request(&self, attempt: u32, composition: &Value) {
+    fn emit_turn_request(
+        &self,
+        turn_idx: usize,
+        attempt: u32,
+        composition: &Value,
+        llm_input: &Value,
+    ) {
         self.sink.emit(PendingEvent::new(
             self.ctx.session_id.clone(),
             names::MODEL_TURN_REQUEST,
             serde_json::json!({
                 "model": &self.ctx.model,
                 "provider": &self.ctx.provider,
-                "turn_idx": self.ctx.turn_idx,
+                "turn_idx": turn_idx,
                 "attempt": attempt,
                 "composition": composition,
+                "llm_input": llm_input,
             }),
         ));
     }
@@ -465,13 +494,6 @@ impl<T: SamplingTransport, R: CallRunner + 'static> ModelSamplingDriver<T, R> {
     fn emit_tool_result(&self, call: &ContentPart, output: &Message) {
         let (tool_call_id, name) = tool_call_identity(call);
         let (text, is_error) = tool_result_text_and_status(output);
-        if name == "browser_script" {
-            // Browser script calls persist rich tool.output/tool.failed events
-            // from the handler itself (summary, artifacts, images, diagnosis).
-            // Emitting the generic text-only event here would duplicate the TUI
-            // row and lose the structured browser contract.
-            return;
-        }
         let mut payload = serde_json::json!({
             "name": name,
             "tool_call_id": tool_call_id,
@@ -552,9 +574,10 @@ impl<T: SamplingTransport, R: CallRunner + 'static> ModelSamplingDriver<T, R> {
         acc: &mut TurnAccumulator,
         ev: LlmEvent,
         started_at: Instant,
+        turn_idx: usize,
     ) -> Result<StreamProgress, AgentError> {
         // Emit UI events first (map is pure; emit is the only side effect).
-        self.emit_event(&ev);
+        self.emit_event(&ev, turn_idx);
         match ev {
             LlmEvent::TextDelta { id, delta } => {
                 let has_content = !delta.trim().is_empty();
@@ -700,18 +723,31 @@ fn calls_done_tool(tool_calls: &[ContentPart]) -> bool {
 
 /// The final summary carried by the model's `done` call, if any.
 ///
-/// Reads the `text` field from the first `done` tool call's JSON arguments
-/// (matching the `done` handler's `DoneRequest { text }`). Returns `None` when
-/// there is no `done` call or it carried no (non-empty) summary, so the caller
-/// only overrides the turn result when there is a real message to surface.
+/// Reads the `result` field from the first `done` tool call's JSON arguments,
+/// falling back to the legacy `text` alias and then to a compact `result_file`
+/// pointer. Returns `None` when there is no `done` call or it carried no
+/// non-empty completion payload, so the caller only overrides the turn result
+/// when there is a real message to surface.
 fn done_summary(tool_calls: &[ContentPart]) -> Option<String> {
     tool_calls.iter().find_map(|p| match p {
-        ContentPart::ToolCall { name, input, .. } if name == DONE_TOOL_NAME => input
-            .get("text")
-            .and_then(|t| t.as_str())
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-            .map(str::to_string),
+        ContentPart::ToolCall { name, input, .. } if name == DONE_TOOL_NAME => {
+            for field in ["result", "text"] {
+                if let Some(value) = input
+                    .get(field)
+                    .and_then(|value| value.as_str())
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                {
+                    return Some(value.to_string());
+                }
+            }
+            input
+                .get("result_file")
+                .and_then(|value| value.as_str())
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(|path| format!("Result file: {path}"))
+        }
         _ => None,
     })
 }
@@ -860,6 +896,7 @@ impl<T: SamplingTransport + 'static, R: CallRunner + 'static> SamplingDriver
         // the populated conversation, not an empty body.
         let input = self.input_with_goal_context(input);
         let mut req = build_request(&self.ctx, input);
+        let turn_idx = self.next_turn_idx.fetch_add(1, Ordering::Relaxed);
         // Advertise the tool catalog. When a dispatcher is attached (the fused
         // path), it carries the registry's model-visible definitions; we copy them
         // verbatim (order-stable) into `req.tools` so the model can actually emit
@@ -874,9 +911,10 @@ impl<T: SamplingTransport + 'static, R: CallRunner + 'static> SamplingDriver
         // exist here (they are never persisted as message events). Uses the same
         // byte->token estimator the agent uses elsewhere, so it stays consistent.
         let composition = request_composition(&req);
+        let llm_input = request_observability_input(&req, self.full_llm_input_events);
         let mut attempt: u32 = 0;
         loop {
-            self.emit_turn_request(attempt, &composition);
+            self.emit_turn_request(turn_idx, attempt, &composition, &llm_input);
             // ---- open the stream (codex: `client.stream(&prompt).await`) ----
             let mut stream = match self.transport.open_stream(&req) {
                 Ok(s) => s,
@@ -908,7 +946,7 @@ impl<T: SamplingTransport + 'static, R: CallRunner + 'static> SamplingDriver
                 match maybe_event {
                     Some(Ok(ev)) => {
                         let check_mailbox_preemption = checks_mailbox_preemption_after_event(&ev);
-                        match self.consume_event(&mut acc, ev, started_at)? {
+                        match self.consume_event(&mut acc, ev, started_at, turn_idx)? {
                             StreamProgress::Continue => {
                                 if check_mailbox_preemption && self.has_mailbox_preemption().await {
                                     preempted_for_mailbox = true;
@@ -1032,8 +1070,9 @@ impl<T: SamplingTransport + 'static, R: CallRunner + 'static> SamplingDriver
 /// unit-reachable while the fused driver still advertises the catalog.
 fn build_request(ctx: &TurnCtx, input: Vec<Message>) -> LlmRequest {
     let mut req = LlmRequest::new(ctx.model.clone(), ctx.provider.clone());
-    req.system
-        .push(SystemPart::new(ctx.base_instructions.clone()));
+    let mut base_system = SystemPart::new(ctx.base_instructions.clone());
+    base_system.cache = Some(CacheHint::Ephemeral);
+    req.system.push(base_system);
     req.messages = input;
     if let Some(instruction) = ctx.browser_mode_instruction.as_deref() {
         req.messages.insert(
@@ -1044,7 +1083,49 @@ fn build_request(ctx: &TurnCtx, input: Vec<Message>) -> LlmRequest {
             ),
         );
     }
+    mark_message_cache_breakpoints(&mut req.messages);
     req
+}
+
+fn mark_message_cache_breakpoints(messages: &mut [Message]) {
+    const LOOKBACK_TARGET_BLOCKS: usize = 16;
+    const MAX_MESSAGE_BREAKPOINTS: usize = 2;
+
+    for message in messages.iter_mut() {
+        message.cache = None;
+    }
+
+    let eligible: Vec<(usize, usize)> = messages
+        .iter()
+        .enumerate()
+        .filter(|(_, message)| {
+            !matches!(message.role, MessageRole::System | MessageRole::Developer)
+        })
+        .map(|(index, message)| (index, message.content.len().max(1)))
+        .collect();
+    let Some((last_index, _)) = eligible.last().copied() else {
+        return;
+    };
+
+    let mut selected = vec![last_index];
+    let mut blocks_since_last = 0usize;
+    for (index, block_count) in eligible.into_iter().rev().skip(1) {
+        blocks_since_last = blocks_since_last.saturating_add(block_count);
+        if blocks_since_last >= LOOKBACK_TARGET_BLOCKS {
+            selected.push(index);
+            break;
+        }
+    }
+    selected.sort_unstable();
+    selected.dedup();
+    if selected.len() > MAX_MESSAGE_BREAKPOINTS {
+        selected.drain(0..selected.len() - MAX_MESSAGE_BREAKPOINTS);
+    }
+    for index in selected {
+        if let Some(message) = messages.get_mut(index) {
+            message.cache = Some(CacheHint::Ephemeral);
+        }
+    }
 }
 
 /// Token attribution for the per-turn request, computed from the REAL assembled
@@ -1074,4 +1155,73 @@ fn request_composition(req: &LlmRequest) -> Value {
         "system_prompt_tokens": system_prompt_tokens,
         "tools": tools,
     })
+}
+
+fn request_observability_input(req: &LlmRequest, include_full_input: bool) -> Value {
+    let message_count = req.messages.len();
+    if !include_full_input {
+        return serde_json::json!({
+            "message_count": message_count,
+            "system_count": req.system.len(),
+            "tools_count": req.tools.len(),
+            "omitted_earlier_messages": message_count,
+            "truncated": true,
+            "full_input_omitted": true,
+        });
+    }
+
+    let messages: Vec<Value> = req.messages.iter().map(observability_json_value).collect();
+    let system: Vec<Value> = req.system.iter().map(observability_json_value).collect();
+    let tools: Vec<Value> = req.tools.iter().map(observability_json_value).collect();
+
+    serde_json::json!({
+        "system": system,
+        "messages": messages,
+        "tools": tools,
+        "tools_count": tools.len(),
+        "message_count": message_count,
+        "omitted_earlier_messages": 0,
+        "truncated": false,
+    })
+}
+
+fn observability_json_value<T: serde::Serialize>(value: &T) -> Value {
+    serde_json::to_value(value)
+        .map(sanitize_observability_value)
+        .unwrap_or(Value::Null)
+}
+
+fn sanitize_observability_value(value: Value) -> Value {
+    match value {
+        Value::Object(map) => {
+            let mut out = serde_json::Map::with_capacity(map.len());
+            for (key, value) in map {
+                if is_observability_secret_key(&key) {
+                    out.insert(key, Value::String("[redacted]".to_string()));
+                } else {
+                    out.insert(key, sanitize_observability_value(value));
+                }
+            }
+            Value::Object(out)
+        }
+        Value::Array(values) => Value::Array(
+            values
+                .into_iter()
+                .map(sanitize_observability_value)
+                .collect(),
+        ),
+        other => other,
+    }
+}
+
+fn is_observability_secret_key(key: &str) -> bool {
+    let key = key.to_ascii_lowercase();
+    key.contains("api_key")
+        || key.contains("apikey")
+        || key.contains("authorization")
+        || key.contains("auth_token")
+        || key.contains("password")
+        || key.contains("secret")
+        || key.contains("token")
+        || key.contains("cookie")
 }

@@ -6,7 +6,14 @@
 //!
 //! Reference: <https://docs.anthropic.com/en/api/messages>.
 
+use std::io::Cursor;
+
+use base64::{engine::general_purpose, Engine as _};
+use image::imageops::FilterType;
 use serde_json::{json, Map, Value};
+
+const ANTHROPIC_MAX_MANY_IMAGE_DIMENSION: u32 = 2_000;
+const ANTHROPIC_MAX_INLINE_IMAGE_BASE64_CHARS: usize = 8 * 1024 * 1024;
 
 use crate::protocols::utils::{Lifecycle, ToolStream};
 use crate::route::framing::SseFrame;
@@ -67,7 +74,13 @@ impl Protocol for AnthropicMessagesProtocol {
 
         // Tool definitions.
         if !req.tools.is_empty() {
-            let tools: Vec<Value> = req.tools.iter().map(build_tool).collect();
+            let mut tools: Vec<Value> = req.tools.iter().map(build_tool).collect();
+            if let Some(Value::Object(last_tool)) = tools.last_mut() {
+                last_tool.insert(
+                    "cache_control".to_string(),
+                    cache_control(CacheHint::Ephemeral),
+                );
+            }
             body.insert("tools".to_string(), Value::Array(tools));
         }
 
@@ -115,13 +128,34 @@ fn build_message(message: &Message) -> Result<Value, LlmError> {
         }
     };
 
-    let content: Result<Vec<Value>, LlmError> =
-        message.content.iter().map(build_content_block).collect();
+    let mut content: Vec<Value> = message
+        .content
+        .iter()
+        .map(build_content_block)
+        .collect::<Result<Vec<Value>, LlmError>>()?;
+    apply_cache_control_to_last_content_block(&mut content, message.cache);
 
     Ok(json!({
         "role": role,
-        "content": content?,
+        "content": content,
     }))
+}
+
+fn apply_cache_control_to_last_content_block(content: &mut [Value], cache: Option<CacheHint>) {
+    let Some(cache) = cache else {
+        return;
+    };
+
+    for block in content.iter_mut().rev() {
+        let Some(obj) = block.as_object_mut() else {
+            continue;
+        };
+        if obj.get("type").and_then(Value::as_str) == Some("image") {
+            continue;
+        }
+        obj.insert("cache_control".to_string(), cache_control(cache));
+        break;
+    }
 }
 
 /// Translate a canonical [`ContentPart`] into an Anthropic content block.
@@ -135,7 +169,9 @@ fn build_content_block(part: &ContentPart) -> Result<Value, LlmError> {
             ..
         } => {
             let source = if let Some(data) = data {
-                json!({ "type": "base64", "media_type": mime_type, "data": data })
+                let (media_type, data) = anthropic_safe_inline_image(mime_type, data)?
+                    .unwrap_or_else(|| (mime_type.clone(), data.clone()));
+                json!({ "type": "base64", "media_type": media_type, "data": data })
             } else if let Some(url) = url {
                 json!({ "type": "url", "url": url })
             } else {
@@ -159,15 +195,24 @@ fn build_content_block(part: &ContentPart) -> Result<Value, LlmError> {
             content,
             is_error,
         } => {
-            let blocks: Result<Vec<Value>, LlmError> =
-                content.iter().map(build_content_block).collect();
+            let blocks = if *is_error {
+                vec![json!({
+                    "type": "text",
+                    "text": flatten_error_tool_result_content(content),
+                })]
+            } else {
+                content
+                    .iter()
+                    .map(build_content_block)
+                    .collect::<Result<Vec<Value>, LlmError>>()?
+            };
             let mut block = Map::new();
             block.insert("type".to_string(), Value::String("tool_result".to_string()));
             block.insert(
                 "tool_use_id".to_string(),
                 Value::String(tool_call_id.clone()),
             );
-            block.insert("content".to_string(), Value::Array(blocks?));
+            block.insert("content".to_string(), Value::Array(blocks));
             if *is_error {
                 block.insert("is_error".to_string(), Value::Bool(true));
             }
@@ -188,6 +233,95 @@ fn build_content_block(part: &ContentPart) -> Result<Value, LlmError> {
                 block.insert("signature".to_string(), Value::String(signature));
             }
             Ok(Value::Object(block))
+        }
+    }
+}
+
+fn anthropic_safe_inline_image(
+    mime_type: &str,
+    data: &str,
+) -> Result<Option<(String, String)>, LlmError> {
+    if !mime_type.starts_with("image/") {
+        return Ok(None);
+    }
+    if data.len() > ANTHROPIC_MAX_INLINE_IMAGE_BASE64_CHARS {
+        return Err(LlmError::new(
+            LlmErrorReason::InvalidRequest,
+            format!(
+                "inline image is too large to normalize safely: {} base64 chars exceeds {}",
+                data.len(),
+                ANTHROPIC_MAX_INLINE_IMAGE_BASE64_CHARS
+            ),
+        ));
+    }
+    let bytes = match general_purpose::STANDARD.decode(data.as_bytes()) {
+        Ok(bytes) => bytes,
+        Err(_) => return Ok(None),
+    };
+    let image = match image::load_from_memory(&bytes) {
+        Ok(image) => image,
+        Err(_) => return Ok(None),
+    };
+    let width = image.width();
+    let height = image.height();
+    if width <= ANTHROPIC_MAX_MANY_IMAGE_DIMENSION && height <= ANTHROPIC_MAX_MANY_IMAGE_DIMENSION {
+        return Ok(None);
+    }
+
+    let scale = (ANTHROPIC_MAX_MANY_IMAGE_DIMENSION as f32 / width as f32)
+        .min(ANTHROPIC_MAX_MANY_IMAGE_DIMENSION as f32 / height as f32);
+    let resized_width = ((width as f32 * scale).round() as u32).max(1);
+    let resized_height = ((height as f32 * scale).round() as u32).max(1);
+    let resized = image.resize(resized_width, resized_height, FilterType::Lanczos3);
+    let mut encoded = Cursor::new(Vec::new());
+    resized
+        .write_to(&mut encoded, image::ImageFormat::Png)
+        .map_err(|err| LlmError::new(LlmErrorReason::InvalidRequest, err.to_string()))?;
+    Ok(Some((
+        "image/png".to_string(),
+        general_purpose::STANDARD.encode(encoded.into_inner()),
+    )))
+}
+
+fn flatten_error_tool_result_content(content: &[ContentPart]) -> String {
+    let mut chunks = Vec::new();
+    collect_error_tool_result_text(content, &mut chunks);
+    if chunks.is_empty() {
+        return "Tool call failed.".to_string();
+    }
+    chunks.join("\n")
+}
+
+fn collect_error_tool_result_text(content: &[ContentPart], chunks: &mut Vec<String>) {
+    for part in content {
+        match part {
+            ContentPart::Text { text } | ContentPart::Reasoning { text, .. } => {
+                if !text.trim().is_empty() {
+                    chunks.push(text.clone());
+                }
+            }
+            ContentPart::Media {
+                mime_type,
+                data,
+                url,
+                ..
+            } => {
+                let pointer = url
+                    .as_deref()
+                    .map(|url| format!(" at {url}"))
+                    .unwrap_or_else(|| {
+                        data.as_ref()
+                            .map(|_| " inline".to_string())
+                            .unwrap_or_default()
+                    });
+                chunks.push(format!("[{mime_type} media{pointer}]"));
+            }
+            ContentPart::ToolCall { name, .. } => {
+                chunks.push(format!("[nested tool call: {name}]"));
+            }
+            ContentPart::ToolResult { content, .. } => {
+                collect_error_tool_result_text(content, chunks);
+            }
         }
     }
 }
@@ -445,14 +579,33 @@ impl AnthropicMessagesStream {
     /// Merge any usage fields present in `usage` into the running total.
     fn apply_usage(&mut self, usage: &Value) {
         if let Some(v) = usage.get("input_tokens").and_then(Value::as_u64) {
-            self.usage.input_tokens = v;
+            self.set_uncached_input_tokens(v);
         }
         if let Some(v) = usage.get("output_tokens").and_then(Value::as_u64) {
             self.usage.output_tokens = v;
         }
         if let Some(v) = usage.get("cache_read_input_tokens").and_then(Value::as_u64) {
-            self.usage.cached_input_tokens = v;
+            self.set_cached_input_tokens(v);
         }
+        if let Some(v) = usage
+            .get("cache_creation_input_tokens")
+            .and_then(Value::as_u64)
+        {
+            self.usage.cache_creation_input_tokens = v;
+        }
+    }
+
+    fn set_uncached_input_tokens(&mut self, raw_input_tokens: u64) {
+        self.usage.input_tokens = raw_input_tokens.saturating_add(self.usage.cached_input_tokens);
+    }
+
+    fn set_cached_input_tokens(&mut self, cached_input_tokens: u64) {
+        let raw_input_tokens = self
+            .usage
+            .input_tokens
+            .saturating_sub(self.usage.cached_input_tokens);
+        self.usage.cached_input_tokens = cached_input_tokens;
+        self.usage.input_tokens = raw_input_tokens.saturating_add(cached_input_tokens);
     }
 
     /// Flush open blocks and emit `StepFinish` + `Finish` (idempotent).
@@ -625,13 +778,50 @@ mod tests {
                         "type": "object",
                         "properties": { "city": { "type": "string" } },
                         "required": ["city"],
-                    }
+                    },
+                    "cache_control": { "type": "ephemeral" }
                 }
             ])
         );
 
         // tool_choice: Auto -> {"type":"auto"}.
         assert_eq!(body["tool_choice"], json!({ "type": "auto" }));
+    }
+
+    #[test]
+    fn build_body_marks_cache_control_breakpoints() {
+        let mut req = LlmRequest::new("claude-sonnet-4-6", "anthropic");
+        let mut system = SystemPart::new("Stable system prompt.");
+        system.cache = Some(CacheHint::Ephemeral);
+        req.system.push(system);
+        req.messages
+            .push(Message::user_text("Current browser state.").with_cache(CacheHint::Ephemeral));
+        for name in ["first_tool", "last_tool"] {
+            req.tools.push(ToolDefinition {
+                name: name.into(),
+                description: String::new(),
+                input_schema: json!({ "type": "object" }),
+                output_schema: None,
+                namespace: None,
+                namespace_description: None,
+            });
+        }
+
+        let body = AnthropicMessagesProtocol::new().build_body(&req).unwrap();
+
+        assert_eq!(
+            body["system"][0]["cache_control"],
+            json!({ "type": "ephemeral" })
+        );
+        assert_eq!(
+            body["messages"][0]["content"][0]["cache_control"],
+            json!({ "type": "ephemeral" })
+        );
+        assert!(body["tools"][0].get("cache_control").is_none());
+        assert_eq!(
+            body["tools"][1]["cache_control"],
+            json!({ "type": "ephemeral" })
+        );
     }
 
     #[test]
@@ -697,6 +887,50 @@ mod tests {
                             "type": "tool_result",
                             "tool_use_id": "toolu_1",
                             "content": [ { "type": "text", "text": "Sunny, 20C" } ]
+                        }
+                    ]
+                }
+            ])
+        );
+    }
+
+    #[test]
+    fn build_body_flattens_error_tool_result_content_to_text_blocks() {
+        let mut req = LlmRequest::new("m", "anthropic");
+        req.messages.push(Message::new(
+            MessageRole::Tool,
+            vec![ContentPart::ToolResult {
+                tool_call_id: "toolu_error".into(),
+                content: vec![
+                    ContentPart::text("browser script failed"),
+                    ContentPart::Media {
+                        mime_type: "image/png".into(),
+                        data: Some("base64-image".into()),
+                        url: None,
+                        detail: None,
+                    },
+                ],
+                is_error: true,
+            }],
+        ));
+
+        let body = AnthropicMessagesProtocol::new().build_body(&req).unwrap();
+        assert_eq!(
+            body["messages"],
+            json!([
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "tool_result",
+                            "tool_use_id": "toolu_error",
+                            "is_error": true,
+                            "content": [
+                                {
+                                    "type": "text",
+                                    "text": "browser script failed\n[image/png media inline]"
+                                }
+                            ]
                         }
                     ]
                 }
@@ -784,6 +1018,62 @@ mod tests {
                 "source": { "type": "base64", "media_type": "image/png", "data": "AAAA" }
             })
         );
+    }
+
+    #[test]
+    fn build_body_downsamples_oversized_inline_media_for_anthropic() {
+        let oversized = image::DynamicImage::ImageRgba8(image::RgbaImage::from_pixel(
+            2400,
+            1200,
+            image::Rgba([10, 20, 30, 255]),
+        ));
+        let mut png = Cursor::new(Vec::new());
+        oversized
+            .write_to(&mut png, image::ImageFormat::Png)
+            .unwrap();
+        let original_data = general_purpose::STANDARD.encode(png.into_inner());
+
+        let mut req = LlmRequest::new("m", "anthropic");
+        req.messages.push(Message::new(
+            MessageRole::User,
+            vec![ContentPart::Media {
+                mime_type: "image/png".into(),
+                data: Some(original_data.clone()),
+                url: None,
+                detail: None,
+            }],
+        ));
+
+        let body = AnthropicMessagesProtocol::new().build_body(&req).unwrap();
+        let source = &body["messages"][0]["content"][0]["source"];
+        assert_eq!(source["media_type"], "image/png");
+        let data = source["data"].as_str().expect("base64 image data");
+        assert_ne!(data, original_data);
+        let bytes = general_purpose::STANDARD.decode(data).unwrap();
+        let resized = image::load_from_memory(&bytes).unwrap();
+        assert_eq!(resized.width(), 2000);
+        assert_eq!(resized.height(), 1000);
+    }
+
+    #[test]
+    fn build_body_rejects_unbounded_inline_image_normalization() {
+        let mut req = LlmRequest::new("m", "anthropic");
+        req.messages.push(Message::new(
+            MessageRole::User,
+            vec![ContentPart::Media {
+                mime_type: "image/png".into(),
+                data: Some("A".repeat(ANTHROPIC_MAX_INLINE_IMAGE_BASE64_CHARS + 1)),
+                url: None,
+                detail: None,
+            }],
+        ));
+
+        let err = AnthropicMessagesProtocol::new()
+            .build_body(&req)
+            .expect_err("oversized inline image should fail before decode");
+
+        assert_eq!(err.reason, LlmErrorReason::InvalidRequest);
+        assert!(err.message.contains("inline image is too large"));
     }
 
     #[test]
@@ -937,6 +1227,58 @@ mod tests {
         ];
 
         assert_eq!(events, expected);
+    }
+
+    #[test]
+    fn decoder_normalizes_anthropic_cached_usage_to_inclusive_input() {
+        let frames = vec![
+            frame(
+                "message_start",
+                json!({
+                    "type": "message_start",
+                    "message": {
+                        "id": "msg_cache",
+                        "role": "assistant",
+                        "content": [],
+                        "usage": {
+                            "input_tokens": 12,
+                            "cache_creation_input_tokens": 44,
+                            "output_tokens": 0
+                        }
+                    }
+                }),
+            ),
+            frame(
+                "message_delta",
+                json!({
+                    "type": "message_delta",
+                    "delta": { "stop_reason": "end_turn", "stop_sequence": null },
+                    "usage": {
+                        "output_tokens": 3088,
+                        "cache_read_input_tokens": 183250
+                    }
+                }),
+            ),
+            frame("message_stop", json!({ "type": "message_stop" })),
+        ];
+
+        let events = drive(&frames);
+        let usage = Usage {
+            input_tokens: 183262,
+            cached_input_tokens: 183250,
+            cache_creation_input_tokens: 44,
+            output_tokens: 3088,
+            ..Default::default()
+        };
+
+        assert!(events.contains(&LlmEvent::StepFinish {
+            usage,
+            finish_reason: Some(FinishReason::Stop),
+        }));
+        assert!(events.contains(&LlmEvent::Finish {
+            usage,
+            finish_reason: Some(FinishReason::Stop),
+        }));
     }
 
     #[test]

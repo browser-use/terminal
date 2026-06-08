@@ -952,8 +952,8 @@ pub mod definitions {
                     "observe_timeout_ms": {
                         "type": "integer",
                         "minimum": 1,
-                        "maximum": 10000,
-                        "description": "How long observe should wait for new output or completion before returning still-running/no-new-output. Defaults to 1000."
+                        "maximum": 120000,
+                        "description": "How long observe should wait for new output or completion before returning still-running/no-new-output. Defaults to 30000. Use longer windows, up to 120000, for long-running extraction or navigation scripts instead of repeatedly polling the same run_id."
                     }
                 },
                 "additionalProperties": false
@@ -1109,22 +1109,29 @@ to the single frame that proves the task succeeded."
     }
 
     /// `done`: the completion tool the model calls to declare the task finished,
-    /// carrying its final summary. Parity: codex/legacy completion (`done`) tool
-    /// (`{ "text"?: string }`). The handler's
-    /// [`DoneRequest`](crate::tools::handlers::done::DoneRequest) accepts an
-    /// optional `text` summary.
+    /// carrying its final answer. The handler accepts Browser Use-style
+    /// `{ "result"?: string, "result_file"?: string }` and the legacy
+    /// `{ "text"?: string }` alias.
     pub fn done() -> ToolDefinition {
         ToolDefinition {
             name: "done".to_string(),
             description:
-                "Signal that the task is finished, with an optional final summary message."
+                "Signal that the task is finished, carrying the user-facing final answer. If the wall-clock or step budget is nearly exhausted, call done with the best verified partial result instead of continuing until external cancellation; clearly mark unknown, unavailable, or incomplete fields and name the remaining gaps."
                     .to_string(),
             input_schema: json!({
                 "type": "object",
                 "properties": {
+                    "result": {
+                        "type": "string",
+                        "description": "The complete final answer to show the user or evaluator. Include all requested data here when the task asks for inline JSON, CSV, markdown, a table, links, or a schema-shaped response."
+                    },
                     "text": {
                         "type": "string",
-                        "description": "The final summary message describing what was accomplished."
+                        "description": "Legacy alias for result. Prefer result for new calls."
+                    },
+                    "result_file": {
+                        "type": "string",
+                        "description": "Optional path to a saved final-result artifact when a file pointer satisfies the task or supplements the inline result."
                     }
                 },
                 "additionalProperties": false
@@ -1156,9 +1163,8 @@ to the single frame that proves the task succeeded."
     }
 
     /// `search`: a web search via the browser-use search API
-    /// (`search.browser-use.com`). Unlike the hosted
-    /// [`web_search`](definitions::web_search), the client performs the API
-    /// call itself and returns the parsed results as text.
+    /// (`search.browser-use.com`). Unlike the hosted [`web_search`], the client
+    /// performs the API call itself and returns the parsed results as text.
     pub fn search() -> ToolDefinition {
         ToolDefinition {
             name: "search".to_string(),

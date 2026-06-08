@@ -8,7 +8,7 @@ use std::time::{Duration, Instant};
 use anyhow::{bail, Context, Result};
 use browser_use_protocol::{ArtifactMeta, EventRecord, SessionMeta, SessionStatus};
 use chrono::Utc;
-use rusqlite::{params, Connection, OptionalExtension};
+use rusqlite::{params, Connection, OptionalExtension, Transaction, TransactionBehavior};
 use serde_json::Value;
 use uuid::Uuid;
 
@@ -985,6 +985,33 @@ impl Store {
         Ok(())
     }
 
+    pub fn increment_u64_setting(&self, key: &str) -> Result<u64> {
+        let tx = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
+        let current = tx
+            .query_row(
+                "SELECT value FROM app_settings WHERE key = ?1",
+                params![key],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?
+            .and_then(|value| value.trim().parse::<u64>().ok())
+            .unwrap_or(0);
+        let next = current.saturating_add(1);
+        tx.execute(
+            r#"
+            INSERT INTO app_settings(key, value, updated_ms)
+            VALUES (?1, ?2, ?3)
+            ON CONFLICT(key) DO UPDATE SET
+                value = excluded.value,
+                updated_ms = excluded.updated_ms
+            "#,
+            params![key, next.to_string(), now_ms()],
+        )?;
+        tx.commit()?;
+        self.notify(StoreNotification::SettingsChanged);
+        Ok(next)
+    }
+
     pub fn delete_setting(&self, key: &str) -> Result<()> {
         self.conn
             .execute("DELETE FROM app_settings WHERE key = ?1", params![key])?;
@@ -1835,6 +1862,45 @@ mod tests {
         assert_eq!(
             store.list_settings()?,
             vec![("setup.complete".to_string(), "1".to_string())]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn increments_u64_settings_atomically_across_connections() -> Result<()> {
+        use std::sync::{Arc, Barrier};
+
+        let temp = tempfile::tempdir()?;
+        Store::open(temp.path())?;
+        let state_dir = temp.path().to_path_buf();
+        let thread_count = 8;
+        let increments_per_thread = 25;
+        let barrier = Arc::new(Barrier::new(thread_count));
+
+        let handles = (0..thread_count)
+            .map(|_| {
+                let state_dir = state_dir.clone();
+                let barrier = Arc::clone(&barrier);
+                std::thread::spawn(move || -> Result<()> {
+                    let store = Store::open(&state_dir)?;
+                    barrier.wait();
+                    for _ in 0..increments_per_thread {
+                        store.increment_u64_setting("promo.count")?;
+                    }
+                    Ok(())
+                })
+            })
+            .collect::<Vec<_>>();
+
+        for handle in handles {
+            handle.join().expect("worker thread panicked")?;
+        }
+
+        let store = Store::open(temp.path())?;
+        let expected = (thread_count * increments_per_thread).to_string();
+        assert_eq!(
+            store.get_setting("promo.count")?.as_deref(),
+            Some(expected.as_str())
         );
         Ok(())
     }

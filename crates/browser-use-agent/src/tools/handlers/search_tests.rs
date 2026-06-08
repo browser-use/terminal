@@ -438,11 +438,9 @@ fn approval_accessors() {
 fn search_is_serial_by_default() {
     // A conservative scheduling default for a billed API call.
     let tool = SearchTool::with_backend(Arc::new(StubBackend(String::new())));
-    assert_eq!(
-        tool.parallel_safe(&SearchRequest::new("parallel")),
-        SEARCH_PARALLEL_SAFE
-    );
-    assert!(!SEARCH_PARALLEL_SAFE);
+    let req = SearchRequest::new("parallel");
+    assert_eq!(tool.parallel_safe(&req), SEARCH_PARALLEL_SAFE);
+    assert!(!tool.parallel_safe(&req), "search must be serial");
 }
 
 #[test]

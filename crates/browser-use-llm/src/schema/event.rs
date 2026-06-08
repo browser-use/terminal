@@ -10,15 +10,20 @@ use serde_json::Value;
 use super::ids::FinishReason;
 use super::messages::ContentPart;
 
-/// Token usage with an explicitly **non-overlapping** breakdown, so consumers
-/// never have to subtract. `total_tokens` is the inclusive total reported (or
-/// computed) for the turn.
+/// Token usage normalized for Browser Use cost accounting.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Usage {
+    /// Regular input plus cache-read input. Anthropic cache-write input is kept
+    /// separate in `cache_creation_input_tokens` so it can be billed at the
+    /// cache-write rate without also being charged as base input.
     #[serde(default)]
     pub input_tokens: u64,
+    /// Cache-read input tokens. These are included in `input_tokens`.
     #[serde(default)]
     pub cached_input_tokens: u64,
+    /// Cache-write input tokens. These are not included in `input_tokens`.
+    #[serde(default)]
+    pub cache_creation_input_tokens: u64,
     #[serde(default)]
     pub output_tokens: u64,
     #[serde(default)]
@@ -29,10 +34,13 @@ pub struct Usage {
 
 impl Usage {
     /// Sum of the breakdown fields (use when a provider does not report an
-    /// inclusive total). `cached_input_tokens` is a subset of `input_tokens`
-    /// and is therefore not added again.
+    /// inclusive total). `cached_input_tokens` is included in `input_tokens`,
+    /// while cache-creation tokens are a separate Anthropic billing bucket.
     pub fn computed_total(&self) -> u64 {
-        self.input_tokens + self.output_tokens + self.reasoning_output_tokens
+        self.input_tokens
+            + self.cache_creation_input_tokens
+            + self.output_tokens
+            + self.reasoning_output_tokens
     }
 }
 

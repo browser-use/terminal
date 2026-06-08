@@ -12,8 +12,9 @@
 //! parallel_safe = false; (4) backend error -> ToolError; (5) an
 //! orchestrator-driven run with the fake backend.
 
+use std::ffi::OsString;
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use browser_use_browser::{BrowserCommandOutput, BrowserScriptOutput};
 use browser_use_llm::schema::ContentPart;
@@ -23,7 +24,8 @@ use serde_json::json;
 use super::browser::{
     browser_command_is_passive, desired_browser_connect_command,
     enrich_local_connect_recovery_with_default_profile, BrowserAction, BrowserBackend,
-    BrowserRequest, BrowserTool, BROWSER_SCRIPT_CONTENT_STDOUT_PREFIX,
+    BrowserRequest, BrowserTool, BROWSER_SCRIPT_CONTENT_STDOUT_PREFIX, DEFAULT_OBSERVE_TIMEOUT_MS,
+    MAX_INLINE_BROWSER_SCRIPT_STDOUT_BYTES, MAX_OBSERVE_TIMEOUT_MS,
 };
 use crate::session::SharedStore;
 use crate::tools::approval::AskForApproval;
@@ -54,15 +56,65 @@ struct FakeBackend {
     last: Mutex<LastCall>,
     commands: Mutex<Vec<String>>,
     local_profiles: Mutex<Option<serde_json::Value>>,
+    cloud_profiles: Mutex<Option<serde_json::Value>>,
     local_list: Mutex<Option<serde_json::Value>>,
     active_local_profile_id: Mutex<Option<String>>,
     browser_page_ready: Mutex<bool>,
     last_session: Mutex<Option<String>>,
     last_paths: Mutex<Option<(PathBuf, PathBuf)>>,
     last_timeout_secs: Mutex<Option<u64>>,
+    last_observe_timeout_ms: Mutex<Option<u64>>,
+    script_text: Mutex<Option<String>>,
+    script_outputs: Mutex<Vec<serde_json::Value>>,
+    script_summary: Mutex<Vec<serde_json::Value>>,
     script_images: Mutex<Vec<serde_json::Value>>,
     fail: bool,
     fail_local_profiles: bool,
+}
+
+struct EnvVarGuard {
+    key: &'static str,
+    previous: Option<OsString>,
+    _lock: std::sync::MutexGuard<'static, ()>,
+}
+
+impl EnvVarGuard {
+    fn set(key: &'static str, value: &str) -> Self {
+        let lock = env_var_test_lock().lock().unwrap();
+        let previous = std::env::var_os(key);
+        std::env::set_var(key, value);
+        Self {
+            key,
+            previous,
+            _lock: lock,
+        }
+    }
+
+    fn remove(key: &'static str) -> Self {
+        let lock = env_var_test_lock().lock().unwrap();
+        let previous = std::env::var_os(key);
+        std::env::remove_var(key);
+        Self {
+            key,
+            previous,
+            _lock: lock,
+        }
+    }
+}
+
+fn env_var_test_lock() -> &'static Mutex<()> {
+    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    LOCK.get_or_init(|| Mutex::new(()))
+}
+
+impl Drop for EnvVarGuard {
+    fn drop(&mut self) {
+        if let Some(previous) = &self.previous {
+            std::env::set_var(self.key, previous);
+        } else {
+            std::env::remove_var(self.key);
+        }
+    }
 }
 
 impl FakeBackend {
@@ -98,6 +150,14 @@ impl FakeBackend {
         *self.last_timeout_secs.lock().unwrap()
     }
 
+    fn last_observe_timeout_ms(&self) -> Option<u64> {
+        *self.last_observe_timeout_ms.lock().unwrap()
+    }
+
+    fn set_script_text(&self, text: impl Into<String>) {
+        *self.script_text.lock().unwrap() = Some(text.into());
+    }
+
     fn record_paths(&self, cwd: &std::path::Path, artifact_dir: &std::path::Path) {
         *self.last_paths.lock().unwrap() = Some((cwd.to_path_buf(), artifact_dir.to_path_buf()));
     }
@@ -130,6 +190,24 @@ impl FakeBackend {
         })
     }
 
+    fn default_cloud_profiles() -> serde_json::Value {
+        json!({
+            "status": "ok",
+            "profiles": [
+                {
+                    "id": "cloud-work",
+                    "name": "Browser Use - Work",
+                    "cookieDomains": ["app.example.com", "accounts.example.com"]
+                },
+                {
+                    "id": "cloud-personal",
+                    "name": "Personal Profile",
+                    "cookieDomains": ["shopping.example"]
+                }
+            ]
+        })
+    }
+
     fn command_output_for(&self, command: &str) -> BrowserCommandOutput {
         if let Some(profile_id) = command
             .strip_prefix("browser local open --profile ")
@@ -157,6 +235,12 @@ impl FakeBackend {
                 .unwrap()
                 .clone()
                 .unwrap_or_else(Self::default_local_profiles),
+            "browser remote profiles --json" => self
+                .cloud_profiles
+                .lock()
+                .unwrap()
+                .clone()
+                .unwrap_or_else(Self::default_cloud_profiles),
             "browser local list --json" => self
                 .local_list
                 .lock()
@@ -191,20 +275,28 @@ impl FakeBackend {
         })
     }
 
-    fn ok_script(status: Option<&str>, ok: bool) -> BrowserScriptOutput {
+    fn ok_script_with_text(status: Option<&str>, ok: bool, text: String) -> BrowserScriptOutput {
         BrowserScriptOutput {
             ok,
             status: status.map(|s| s.to_string()),
             run_id: Some("run-1".to_string()),
-            text: "script-output".to_string(),
+            text,
             ..Default::default()
         }
     }
 
     fn ok_script_with_images(&self, status: Option<&str>, ok: bool) -> BrowserScriptOutput {
+        let text = self
+            .script_text
+            .lock()
+            .unwrap()
+            .clone()
+            .unwrap_or_else(|| "script-output".to_string());
         BrowserScriptOutput {
+            outputs: self.script_outputs.lock().unwrap().clone(),
+            summary: self.script_summary.lock().unwrap().clone(),
             images: self.script_images(),
-            ..Self::ok_script(status, ok)
+            ..Self::ok_script_with_text(status, ok, text)
         }
     }
 }
@@ -275,9 +367,10 @@ impl BrowserBackend for FakeBackend {
         &self,
         session_id: &str,
         run_id: &str,
-        _observe_timeout_ms: u64,
+        observe_timeout_ms: u64,
     ) -> anyhow::Result<BrowserScriptOutput> {
         *self.last_session.lock().unwrap() = Some(session_id.to_string());
+        *self.last_observe_timeout_ms.lock().unwrap() = Some(observe_timeout_ms);
         *self.last.lock().unwrap() = LastCall::Observe(run_id.to_string());
         if self.fail {
             anyhow::bail!("unknown browser_script run_id {run_id:?}");
@@ -466,6 +559,60 @@ async fn bare_browser_connect_resolves_to_selected_cloud_mode() {
 }
 
 #[tokio::test]
+async fn bare_browser_connect_resolves_to_selected_remote_cdp_mode() {
+    let _guard = EnvVarGuard::set(
+        "BU_CDP_URL",
+        "ws://127.0.0.1:9222/devtools/browser/session-id",
+    );
+    let backend = Arc::new(FakeBackend::default());
+    let tool =
+        tool_with(Arc::clone(&backend)).with_selected_browser_mode(Some("remote-cdp".to_string()));
+
+    let req = BrowserRequest::command("sess-1", "browser connect");
+    let out = run_direct(&tool, &req).await.unwrap();
+
+    assert_eq!(out.exit_code, 0);
+    assert_eq!(
+        backend.last(),
+        LastCall::Command(
+            "browser connect remote-cdp --ws ws://127.0.0.1:9222/devtools/browser/session-id"
+                .to_string()
+        )
+    );
+}
+
+#[tokio::test]
+async fn selected_remote_cdp_rewrites_wrong_browser_family_commands() {
+    let _guard = EnvVarGuard::set(
+        "BU_CDP_URL",
+        "ws://127.0.0.1:9222/devtools/browser/session-id",
+    );
+    let backend = Arc::new(FakeBackend::default());
+    let tool =
+        tool_with(Arc::clone(&backend)).with_selected_browser_mode(Some("remote-cdp".to_string()));
+
+    for command in [
+        "browser connect managed --headed",
+        "browser connect managed --headless",
+        "browser connect local",
+        "browser remote start",
+    ] {
+        let req = BrowserRequest::command("sess-1", command);
+        let out = run_direct(&tool, &req).await.unwrap();
+
+        assert_eq!(out.exit_code, 0, "{command}");
+        assert_eq!(
+            backend.last(),
+            LastCall::Command(
+                "browser connect remote-cdp --ws ws://127.0.0.1:9222/devtools/browser/session-id"
+                    .to_string()
+            ),
+            "{command}"
+        );
+    }
+}
+
+#[tokio::test]
 async fn selected_browser_mode_rejects_wrong_connection_family() {
     let backend = Arc::new(FakeBackend::default());
     let tool =
@@ -504,6 +651,7 @@ async fn browser_preference_command_is_store_backed_and_synthetic() {
 
 #[tokio::test]
 async fn stored_cloud_profile_influences_bare_connect_when_mode_unlocked() {
+    let _guard = EnvVarGuard::remove("BU_BROWSER_PROXY_COUNTRY_CODE");
     let backend = Arc::new(FakeBackend::default());
     let (_dir, store, session) = shared_store();
     {
@@ -525,6 +673,185 @@ async fn stored_cloud_profile_influences_bare_connect_when_mode_unlocked() {
         backend.last(),
         LastCall::Command("browser remote start --profile-id 'profile with space'".to_string())
     );
+}
+
+#[tokio::test]
+async fn stored_cloud_profile_uses_sdk_proxy_country_env_when_connecting() {
+    let _guard = EnvVarGuard::set("BU_BROWSER_PROXY_COUNTRY_CODE", "DE");
+    let backend = Arc::new(FakeBackend::default());
+    let (_dir, store, session) = shared_store();
+    {
+        let store = store.lock().unwrap();
+        store
+            .set_setting("browser.preference.mode", "cloud")
+            .unwrap();
+        store
+            .set_setting("browser.preference.profile", "profile with space")
+            .unwrap();
+    }
+    let tool = tool_with(Arc::clone(&backend)).with_persistence(store, session);
+
+    let req = BrowserRequest::command("sess-1", "browser connect");
+    let out = run_direct(&tool, &req).await.unwrap();
+
+    assert_eq!(out.exit_code, 0);
+    assert_eq!(
+        backend.last(),
+        LastCall::Command(
+            "browser remote start --profile-id 'profile with space' --proxy-country DE".to_string()
+        )
+    );
+}
+
+#[tokio::test]
+async fn stored_cloud_profile_influences_bare_connect_when_mode_locked() {
+    let _guard = EnvVarGuard::remove("BU_BROWSER_PROXY_COUNTRY_CODE");
+    let backend = Arc::new(FakeBackend::default());
+    let (_dir, store, session) = shared_store();
+    {
+        let store = store.lock().unwrap();
+        store
+            .set_setting("browser.preference.mode", "cloud")
+            .unwrap();
+        store
+            .set_setting("browser.preference.profile", "cloud-work")
+            .unwrap();
+    }
+    let tool = tool_with(Arc::clone(&backend))
+        .with_selected_browser_mode(Some("cloud".to_string()))
+        .with_persistence(store, session);
+
+    let req = BrowserRequest::command("sess-1", "browser connect");
+    let out = run_direct(&tool, &req).await.unwrap();
+
+    assert_eq!(out.exit_code, 0);
+    assert_eq!(
+        backend.last(),
+        LastCall::Command("browser remote start --profile-id cloud-work".to_string())
+    );
+}
+
+#[tokio::test]
+async fn selected_cloud_mode_ignores_stored_local_profile_on_bare_connect() {
+    let _guard = EnvVarGuard::remove("BU_BROWSER_PROXY_COUNTRY_CODE");
+    let backend = Arc::new(FakeBackend::default());
+    let (_dir, store, session) = shared_store();
+    {
+        let store = store.lock().unwrap();
+        store
+            .set_setting("browser.preference.mode", "local")
+            .unwrap();
+        store
+            .set_setting("browser.preference.profile", "google-chrome:Profile 1")
+            .unwrap();
+    }
+    let tool = tool_with(Arc::clone(&backend))
+        .with_selected_browser_mode(Some("cloud".to_string()))
+        .with_persistence(store, session);
+
+    let req = BrowserRequest::command("sess-1", "browser connect");
+    let out = run_direct(&tool, &req).await.unwrap();
+
+    assert_eq!(out.exit_code, 0);
+    assert_eq!(
+        backend.last(),
+        LastCall::Command("browser remote start".to_string())
+    );
+}
+
+#[tokio::test]
+async fn cloud_profile_suggest_lists_matching_cloud_profiles() {
+    let backend = Arc::new(FakeBackend::default());
+    let (_dir, store, session) = shared_store();
+    {
+        let store = store.lock().unwrap();
+        store
+            .set_setting("browser.preference.mode", "cloud")
+            .unwrap();
+    }
+    let tool = tool_with(Arc::clone(&backend))
+        .with_selected_browser_mode(Some("cloud".to_string()))
+        .with_persistence(store, session);
+
+    let req = BrowserRequest::command(
+        "sess-1",
+        "browser profile suggest --domain example[.]com$ --json",
+    );
+    let out = run_direct(&tool, &req).await.unwrap();
+
+    assert_eq!(out.exit_code, 0);
+    assert!(out.stdout.contains("\"mode\":\"cloud\""), "{}", out.stdout);
+    assert!(out.stdout.contains("\"cloud_profiles\""), "{}", out.stdout);
+    let parsed: serde_json::Value = serde_json::from_str(&out.stdout).unwrap();
+    assert_eq!(parsed["default_profile_id"], serde_json::Value::Null);
+    assert_eq!(
+        parsed["matching_profiles"][0]["matching_cookie_domains"],
+        json!(["app.example.com", "accounts.example.com"])
+    );
+    assert_eq!(
+        parsed["matching_profiles"][0]["cookie_domain_count"],
+        json!(2)
+    );
+    assert!(parsed["matching_profiles"][0]
+        .get("cookieDomains")
+        .is_none());
+    assert!(parsed["matching_profiles"][0]
+        .get("sample_cookie_domains")
+        .is_none());
+    assert!(parsed["cloud_profiles"][0].get("cookieDomains").is_none());
+    assert!(parsed["cloud_profiles"][0]
+        .get("sample_cookie_domains")
+        .is_none());
+    assert!(parsed["profile_choices"][0].get("cookie_domains").is_none());
+    assert!(parsed["profile_choices"][0]
+        .get("sample_cookie_domains")
+        .is_none());
+    assert!(out.stdout.contains("cloud-work"), "{}", out.stdout);
+    assert_eq!(
+        backend.commands(),
+        vec!["browser remote profiles --json".to_string()]
+    );
+}
+
+#[tokio::test]
+async fn cloud_profile_remember_sets_mode_and_cloud_next_step() {
+    let backend = Arc::new(FakeBackend::default());
+    let (_dir, store, session) = shared_store();
+    let tool = tool_with(Arc::clone(&backend))
+        .with_selected_browser_mode(Some("cloud".to_string()))
+        .with_persistence(store.clone(), session);
+
+    let req = BrowserRequest::command(
+        "sess-1",
+        "browser profile remember --mode cloud --profile cloud-work",
+    );
+    let out = run_direct(&tool, &req).await.unwrap();
+
+    assert_eq!(out.exit_code, 0);
+    assert!(out.stdout.contains("\"mode\":\"cloud\""), "{}", out.stdout);
+    assert!(
+        out.stdout
+            .contains("\"next_step\":\"browser remote start --profile-id cloud-work\""),
+        "{}",
+        out.stdout
+    );
+    {
+        let store = store.lock().unwrap();
+        assert_eq!(
+            store
+                .get_setting("browser.preference.mode")
+                .unwrap()
+                .as_deref(),
+            Some("cloud")
+        );
+        assert_eq!(
+            store
+                .get_setting("browser.preference.profile")
+                .unwrap()
+                .as_deref(),
+            Some("cloud-work")
+        );
+    }
 }
 
 #[tokio::test]
@@ -1034,6 +1361,84 @@ async fn script_images_are_appended_as_structured_stdout_payload() {
 }
 
 #[tokio::test]
+async fn script_oversized_stdout_is_truncated_for_model_output() {
+    let backend = Arc::new(FakeBackend::default());
+    backend.set_script_text("x".repeat(MAX_INLINE_BROWSER_SCRIPT_STDOUT_BYTES + 5_000));
+    let tool = tool_with(Arc::clone(&backend));
+
+    let req = BrowserRequest::execute("sess-1", "document.body.innerText", false);
+    let out = run_direct(&tool, &req).await.unwrap();
+
+    assert_eq!(out.exit_code, 0);
+    assert!(
+        out.stdout.len() < MAX_INLINE_BROWSER_SCRIPT_STDOUT_BYTES + 1_000,
+        "stdout should be capped, got {} bytes",
+        out.stdout.len()
+    );
+    assert!(
+        out.stdout.contains("[browser_script stdout truncated"),
+        "stdout: {}",
+        out.stdout
+    );
+    assert!(
+        !out.stdout
+            .contains(&"x".repeat(MAX_INLINE_BROWSER_SCRIPT_STDOUT_BYTES + 100)),
+        "uncapped browser_script output leaked into model stdout"
+    );
+}
+
+#[tokio::test]
+async fn script_truncated_structured_output_preserves_summary_first() {
+    let backend = Arc::new(FakeBackend::default());
+    backend.script_summary.lock().unwrap().push(json!({
+        "kind": "extracted",
+        "message": "Read 40 candidate rows",
+        "output_label": "candidate_rows"
+    }));
+    backend.script_outputs.lock().unwrap().push(json!({
+        "label": "candidate_rows",
+        "value": "x".repeat(MAX_INLINE_BROWSER_SCRIPT_STDOUT_BYTES + 8_000)
+    }));
+    let tool = tool_with(Arc::clone(&backend));
+
+    let req = BrowserRequest::execute("sess-1", "emit_output(rows, label='candidate_rows')", false);
+    let out = run_direct(&tool, &req).await.unwrap();
+
+    assert_eq!(out.exit_code, 0);
+    assert!(
+        out.stdout.contains("summary:"),
+        "summary should remain visible before large raw output: {}",
+        out.stdout
+    );
+    assert!(
+        out.stdout.contains("Read 40 candidate rows"),
+        "stdout: {}",
+        out.stdout
+    );
+    assert!(
+        out.stdout.contains("[browser_script stdout truncated"),
+        "stdout: {}",
+        out.stdout
+    );
+    assert!(
+        out.stdout
+            .contains("Use a narrower browser_script extraction"),
+        "stdout: {}",
+        out.stdout
+    );
+    assert!(
+        out.stdout.find("summary:") < out.stdout.find("outputs:"),
+        "summary should precede raw outputs: {}",
+        out.stdout
+    );
+}
+
+#[test]
+fn browser_script_stdout_cap_defaults_to_four_kib_for_eval_cost() {
+    assert_eq!(MAX_INLINE_BROWSER_SCRIPT_STDOUT_BYTES, 4 * 1024);
+}
+
+#[tokio::test]
 async fn script_unreadable_images_warn_in_stdout() {
     let temp = tempfile::tempdir().expect("tempdir");
     let missing_path = temp.path().join("missing.png");
@@ -1059,6 +1464,46 @@ async fn script_unreadable_images_warn_in_stdout() {
     assert!(
         !out.stdout.contains(BROWSER_SCRIPT_CONTENT_STDOUT_PREFIX),
         "unreadable-only images should not emit a media marker: {}",
+        out.stdout
+    );
+}
+
+#[tokio::test]
+async fn script_oversized_png_images_warn_in_stdout_without_media_payload() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let image_path = temp.path().join("wide.png");
+    let mut png = vec![0_u8; 24];
+    png[0..8].copy_from_slice(b"\x89PNG\r\n\x1a\n");
+    png[12..16].copy_from_slice(b"IHDR");
+    png[16..20].copy_from_slice(&8001_u32.to_be_bytes());
+    png[20..24].copy_from_slice(&600_u32.to_be_bytes());
+    std::fs::write(&image_path, png).expect("write png");
+
+    let backend = Arc::new(FakeBackend::default());
+    backend.script_images.lock().unwrap().push(json!({
+        "path": image_path,
+        "mime_type": "image/png",
+        "detail": "auto",
+        "label": "wide",
+    }));
+    let tool = tool_with(Arc::clone(&backend));
+
+    let req = BrowserRequest::execute("sess-1", "capture_screenshot()", false);
+    let out = run_direct(&tool, &req).await.unwrap();
+    assert!(
+        out.stdout
+            .contains("dimensions 8001x600 exceed provider limit"),
+        "stdout: {}",
+        out.stdout
+    );
+    assert!(
+        out.stdout.contains("artifact remains at"),
+        "stdout: {}",
+        out.stdout
+    );
+    assert!(
+        !out.stdout.contains(BROWSER_SCRIPT_CONTENT_STDOUT_PREFIX),
+        "oversized-only images should not emit a media marker: {}",
         out.stdout
     );
 }
@@ -1125,7 +1570,42 @@ async fn observe_routes_to_observe_script() {
     let out = run_direct(&tool, &req).await.unwrap();
 
     assert_eq!(backend.last(), LastCall::Observe("run-1".to_string()));
+    assert_eq!(
+        backend.last_observe_timeout_ms(),
+        Some(DEFAULT_OBSERVE_TIMEOUT_MS)
+    );
     assert_eq!(out.exit_code, 0);
+}
+
+#[tokio::test]
+async fn observe_timeout_is_clamped_to_coarse_poll_window() {
+    let backend = Arc::new(FakeBackend::default());
+    let tool = tool_with(Arc::clone(&backend));
+
+    let mut req = BrowserRequest {
+        action: BrowserAction::Observe {
+            run_id: "run-1".to_string(),
+        },
+        session_id: "sess-1".to_string(),
+        cwd: None,
+        artifact_dir: None,
+        timeout_secs: None,
+        observe_timeout_ms: Some(5_000),
+    };
+    let out = run_direct(&tool, &req).await.unwrap();
+    assert_eq!(out.exit_code, 0);
+    assert_eq!(
+        backend.last_observe_timeout_ms(),
+        Some(DEFAULT_OBSERVE_TIMEOUT_MS)
+    );
+
+    req.observe_timeout_ms = Some(180_000);
+    let out = run_direct(&tool, &req).await.unwrap();
+    assert_eq!(out.exit_code, 0);
+    assert_eq!(
+        backend.last_observe_timeout_ms(),
+        Some(MAX_OBSERVE_TIMEOUT_MS)
+    );
 }
 
 // (2) Cancel routes to cancel_script.
@@ -1276,7 +1756,13 @@ async fn configured_session_id_keeps_tool_call_id_for_persistence() {
         .expect("browser_script tool.output");
     assert_eq!(output.payload["name"], "browser_script");
     assert_eq!(output.payload["tool_call_id"], "model-call-123");
-    assert_eq!(output.payload["text"], "script-output");
+    assert!(
+        output.payload["text"]
+            .as_str()
+            .is_some_and(|text| text.starts_with("script-output\nrun_id: run-1")),
+        "unexpected browser_script output text: {:?}",
+        output.payload["text"]
+    );
 }
 
 #[tokio::test]
