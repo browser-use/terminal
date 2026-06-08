@@ -279,6 +279,9 @@ pub struct AgentRunOptions {
     pub max_context_chars: usize,
     pub browser_mode: Option<String>,
     pub dynamic_browser_mode_from_store: bool,
+    pub browser_profile_id: Option<String>,
+    pub browser_profile_label: Option<String>,
+    pub browser_local_browser: Option<String>,
     pub collaboration_mode: CollaborationModeKind,
     pub include_environment_context: bool,
     pub include_permissions_instructions: bool,
@@ -349,6 +352,9 @@ impl Default for AgentRunOptions {
             max_context_chars: DEFAULT_MAX_CONTEXT_CHARS,
             browser_mode: None,
             dynamic_browser_mode_from_store: false,
+            browser_profile_id: None,
+            browser_profile_label: None,
+            browser_local_browser: None,
             collaboration_mode: CollaborationModeKind::Default,
             include_environment_context: true,
             include_permissions_instructions: true,
@@ -395,6 +401,21 @@ impl AgentRunOptions {
 
     pub fn with_dynamic_browser_mode_from_store(mut self, dynamic: bool) -> Self {
         self.dynamic_browser_mode_from_store = dynamic;
+        self
+    }
+
+    pub fn with_browser_profile_id(mut self, profile_id: impl Into<String>) -> Self {
+        self.browser_profile_id = Some(profile_id.into());
+        self
+    }
+
+    pub fn with_browser_profile_label(mut self, profile_label: impl Into<String>) -> Self {
+        self.browser_profile_label = Some(profile_label.into());
+        self
+    }
+
+    pub fn with_browser_local_browser(mut self, browser: impl Into<String>) -> Self {
+        self.browser_local_browser = Some(browser.into());
         self
     }
 

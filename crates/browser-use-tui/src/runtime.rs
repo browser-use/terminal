@@ -284,6 +284,9 @@ pub(crate) fn spawn_tui_agent_run(
     model: String,
     model_provider_id: Option<String>,
     browser: String,
+    browser_profile_id: Option<String>,
+    browser_profile_label: Option<String>,
+    browser_local_browser: Option<String>,
     collaboration_mode: CollaborationModeKind,
     config_profile: Option<String>,
     config_overrides: ConfigOverrides,
@@ -301,6 +304,9 @@ pub(crate) fn spawn_tui_agent_run(
         model,
         model_provider_id,
         browser,
+        browser_profile_id,
+        browser_profile_label,
+        browser_local_browser,
         collaboration_mode,
         config_profile,
         config_overrides,
@@ -336,6 +342,9 @@ fn prepare_tui_agent_run(
     model: String,
     model_provider_id: Option<String>,
     browser: String,
+    browser_profile_id: Option<String>,
+    browser_profile_label: Option<String>,
+    browser_local_browser: Option<String>,
     collaboration_mode: CollaborationModeKind,
     config_profile: Option<String>,
     config_overrides: ConfigOverrides,
@@ -370,6 +379,9 @@ fn prepare_tui_agent_run(
             &session_id,
             collaboration_mode,
             model_provider_id.as_deref(),
+            browser_profile_id.as_deref(),
+            browser_profile_label.as_deref(),
+            browser_local_browser.as_deref(),
             browser_use_cloud_api_key.as_deref(),
             config_profile.clone(),
             config_overrides.clone(),
@@ -393,6 +405,9 @@ fn prepare_tui_agent_run(
         model,
         model_provider_id,
         browser,
+        browser_profile_id,
+        browser_profile_label,
+        browser_local_browser,
         collaboration_mode,
         config_profile,
         config_overrides,
@@ -544,6 +559,9 @@ fn attach_tui_child_agent_runner(
     model: String,
     model_provider_id: Option<String>,
     browser: String,
+    browser_profile_id: Option<String>,
+    browser_profile_label: Option<String>,
+    browser_local_browser: Option<String>,
     collaboration_mode: CollaborationModeKind,
     config_profile: Option<String>,
     config_overrides: ConfigOverrides,
@@ -557,6 +575,9 @@ fn attach_tui_child_agent_runner(
             model.clone(),
             model_provider_id.clone(),
             browser.clone(),
+            browser_profile_id.clone(),
+            browser_profile_label.clone(),
+            browser_local_browser.clone(),
             collaboration_mode,
             config_profile.clone(),
             config_overrides.clone(),
@@ -573,6 +594,9 @@ fn spawn_tui_child_agent(
     model: String,
     model_provider_id: Option<String>,
     browser: String,
+    browser_profile_id: Option<String>,
+    browser_profile_label: Option<String>,
+    browser_local_browser: Option<String>,
     collaboration_mode: CollaborationModeKind,
     config_profile: Option<String>,
     mut config_overrides: ConfigOverrides,
@@ -626,6 +650,9 @@ fn spawn_tui_child_agent(
         child_model,
         child_model_provider_id,
         child_browser,
+        browser_profile_id,
+        browser_profile_label,
+        browser_local_browser,
         collaboration_mode,
         config_profile,
         config_overrides,
@@ -972,6 +999,9 @@ fn tui_agent_options(
     _session_id: &str,
     collaboration_mode: CollaborationModeKind,
     model_provider_id: Option<&str>,
+    browser_profile_id: Option<&str>,
+    browser_profile_label: Option<&str>,
+    browser_local_browser: Option<&str>,
     browser_use_cloud_api_key: Option<&str>,
     config_profile: Option<String>,
     config_overrides: ConfigOverrides,
@@ -981,20 +1011,17 @@ fn tui_agent_options(
         "Headless Chromium" => AgentRunOptions::default()
             .with_collaboration_mode(collaboration_mode)
             .with_browser_mode("managed-headless")
-            .with_dynamic_browser_mode_from_store(true)
             .with_model_compaction(true)
             .with_analytics_source("tui"),
         "Managed Chromium" => AgentRunOptions::default()
             .with_collaboration_mode(collaboration_mode)
             .with_browser_mode("managed-headed")
-            .with_dynamic_browser_mode_from_store(true)
             .with_model_compaction(true)
             .with_analytics_source("tui"),
         BROWSER_USE_CLOUD => {
             let mut options = AgentRunOptions::default()
                 .with_collaboration_mode(collaboration_mode)
                 .with_browser_mode("cloud")
-                .with_dynamic_browser_mode_from_store(true)
                 .with_model_compaction(true)
                 .with_analytics_source("tui");
             if let Some(api_key) =
@@ -1010,10 +1037,27 @@ fn tui_agent_options(
         _ => AgentRunOptions::default()
             .with_collaboration_mode(collaboration_mode)
             .with_browser_mode("local")
-            .with_dynamic_browser_mode_from_store(true)
             .with_model_compaction(true)
             .with_analytics_source("tui"),
     };
+    if let Some(profile_id) = browser_profile_id
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        options = options.with_browser_profile_id(profile_id.to_string());
+    }
+    if let Some(profile_label) = browser_profile_label
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        options = options.with_browser_profile_label(profile_label.to_string());
+    }
+    if let Some(local_browser) = browser_local_browser
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        options = options.with_browser_local_browser(local_browser.to_string());
+    }
     if let Some(policy) = resolve_approval_policy_for_profile(profile_ref, &config_overrides, None)?
     {
         options = options.with_approval_policy(policy);
@@ -1117,12 +1161,43 @@ mod tests {
             Some("codex"),
             None,
             None,
+            None,
+            None,
+            None,
             Vec::new(),
         )
         .unwrap();
         assert_eq!(options.browser_mode.as_deref(), Some("local"));
-        assert!(options.dynamic_browser_mode_from_store);
+        assert!(!options.dynamic_browser_mode_from_store);
         assert!(options.python_env.is_empty());
+    }
+
+    #[test]
+    fn local_chrome_options_carry_session_profile_snapshot() {
+        let options = tui_agent_options(
+            "Local Chrome",
+            "abc123",
+            CollaborationModeKind::Default,
+            Some("codex"),
+            Some("google-chrome:Profile 1"),
+            Some("Work"),
+            Some("Google Chrome"),
+            None,
+            None,
+            Vec::new(),
+        )
+        .unwrap();
+        assert_eq!(options.browser_mode.as_deref(), Some("local"));
+        assert_eq!(
+            options.browser_profile_id.as_deref(),
+            Some("google-chrome:Profile 1")
+        );
+        assert_eq!(options.browser_profile_label.as_deref(), Some("Work"));
+        assert_eq!(
+            options.browser_local_browser.as_deref(),
+            Some("Google Chrome")
+        );
+        assert!(!options.dynamic_browser_mode_from_store);
     }
 
     #[test]
@@ -1134,11 +1209,14 @@ mod tests {
             Some("codex"),
             None,
             None,
+            None,
+            None,
+            None,
             Vec::new(),
         )
         .unwrap();
         assert_eq!(options.browser_mode.as_deref(), Some("managed-headless"));
-        assert!(options.dynamic_browser_mode_from_store);
+        assert!(!options.dynamic_browser_mode_from_store);
         assert!(options.python_env.is_empty());
     }
 
@@ -1149,6 +1227,9 @@ mod tests {
             "abc123",
             CollaborationModeKind::Plan,
             Some("codex"),
+            None,
+            None,
+            None,
             None,
             None,
             Vec::new(),
@@ -1167,11 +1248,14 @@ mod tests {
             Some("codex"),
             None,
             None,
+            None,
+            None,
+            None,
             Vec::new(),
         )
         .unwrap();
         assert_eq!(options.browser_mode.as_deref(), Some("cloud"));
-        assert!(options.dynamic_browser_mode_from_store);
+        assert!(!options.dynamic_browser_mode_from_store);
         assert!(options.python_env.is_empty());
     }
 
@@ -1182,6 +1266,9 @@ mod tests {
             "abc123",
             CollaborationModeKind::Default,
             Some("codex"),
+            None,
+            None,
+            None,
             Some("bu-test"),
             None,
             Vec::new(),
@@ -1431,6 +1518,9 @@ mod tests {
             None,
             None,
             None,
+            None,
+            None,
+            None,
             Vec::new(),
         )
         .unwrap();
@@ -1449,6 +1539,9 @@ mod tests {
             "abc123",
             CollaborationModeKind::Default,
             Some("codex"),
+            None,
+            None,
+            None,
             None,
             Some("work".to_string()),
             config_overrides,
@@ -1492,6 +1585,9 @@ command = "test-mcp"
             "abc123",
             CollaborationModeKind::Default,
             Some("codex"),
+            None,
+            None,
+            None,
             None,
             None,
             Vec::new(),

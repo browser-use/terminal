@@ -12,7 +12,7 @@ use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStderr, ChildStdout, Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock, Weak};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime};
 
@@ -35,6 +35,13 @@ const BROWSER_CONNECT_LOCAL_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(12
 const BROWSER_CONNECT_ATTACH_DEADLINE: Duration = Duration::from_secs(8);
 const BROWSER_CONNECT_CDP_CALL_TIMEOUT: Duration = Duration::from_secs(2);
 
+mod secrets_runtime;
+pub use secrets_runtime::{
+    clear_script_security, has_email_resolver, has_script_security, has_secret_resolver,
+    set_email_resolver, set_script_security, set_secret_resolver, EmailResolver, ScriptSecret,
+    ScriptSecurity, SecretResolver,
+};
+
 #[derive(Debug)]
 pub struct BrowserCommandOutput {
     pub content: Value,
@@ -44,6 +51,7 @@ pub struct BrowserCommandOutput {
 #[derive(Clone, Debug, Default)]
 pub struct BrowserCommandOptions {
     pub browser_use_api_key: Option<String>,
+    pub browser_use_api_url: Option<String>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
@@ -156,6 +164,16 @@ struct ManagedBrowser {
     child: Child,
     _profile_dir: Option<TempDir>,
     launch: ManagedLaunch,
+    marker_path: PathBuf,
+}
+
+impl Drop for ManagedBrowser {
+    fn drop(&mut self) {
+        unregister_managed_browser_pid(self.child.id());
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+        let _ = fs::remove_file(&self.marker_path);
+    }
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -255,9 +273,19 @@ static BROWSER_SESSIONS: OnceLock<BrowserSessionRegistry> = OnceLock::new();
 static BROWSER_SCRIPT_RUNS: OnceLock<BrowserScriptRunRegistry> = OnceLock::new();
 static BROWSER_SCRIPT_OBSERVING: OnceLock<Mutex<HashMap<String, BrowserScriptObserveMarker>>> =
     OnceLock::new();
+static MANAGED_BROWSER_PIDS: OnceLock<Mutex<HashSet<u32>>> = OnceLock::new();
+static LOCAL_CDP_CONNECTIONS: OnceLock<Mutex<HashMap<String, LocalCdpConnectionEntry>>> =
+    OnceLock::new();
 static BROWSER_SCRIPT_RUN_COUNTER: AtomicU64 = AtomicU64::new(1);
 const BROWSER_SCRIPT_COMPLETED_CACHE_TTL_MS: u128 = 10 * 60 * 1_000;
 const BROWSER_SCRIPT_COMPLETED_CACHE_MAX: usize = 128;
+const MANAGED_BROWSER_PROFILE_PREFIX: &str = "but-managed-browser.";
+const MANAGED_BROWSER_MARKER_FILE: &str = "BrowserUseManagedChrome.json";
+
+struct LocalCdpConnectionEntry {
+    connection: Weak<CdpDispatcher>,
+    connect_lock: Arc<Mutex<()>>,
+}
 
 struct BrowserScriptRun {
     id: String,
@@ -421,7 +449,14 @@ struct BrowserScriptDelta {
 pub struct BrowserSessionRegistry {
     sessions: Arc<Mutex<HashMap<String, BrowserSession>>>,
     checked_out_statuses: Arc<Mutex<HashMap<String, Value>>>,
+    checked_out_capture_snapshots: Arc<Mutex<HashMap<String, CaptureSessionSnapshot>>>,
     captures: Arc<Mutex<HashMap<String, SessionCaptureHandle>>>,
+}
+
+#[derive(Clone)]
+struct CaptureSessionSnapshot {
+    dispatcher: Arc<CdpDispatcher>,
+    target_id: String,
 }
 
 impl std::fmt::Debug for BrowserSessionRegistry {
@@ -431,6 +466,10 @@ impl std::fmt::Debug for BrowserSessionRegistry {
             .field(
                 "checked_out_session_count",
                 &self.checked_out_session_count(),
+            )
+            .field(
+                "checked_out_capture_snapshot_count",
+                &self.checked_out_capture_snapshot_count(),
             )
             .field("active_capture_count", &self.active_capture_count())
             .finish()
@@ -457,6 +496,13 @@ impl BrowserSessionRegistry {
         self.checked_out_statuses
             .lock()
             .expect("browser checked-out session registry poisoned")
+            .len()
+    }
+
+    fn checked_out_capture_snapshot_count(&self) -> usize {
+        self.checked_out_capture_snapshots
+            .lock()
+            .expect("browser checked-out capture snapshot registry poisoned")
             .len()
     }
 
@@ -506,6 +552,12 @@ impl BrowserSessionRegistry {
                 anyhow!("browser is not connected or is busy; run `browser status --json`")
             })?
         };
+        if let Some(snapshot) = capture_session_snapshot(&session) {
+            self.checked_out_capture_snapshots
+                .lock()
+                .expect("browser checked-out capture snapshot registry poisoned")
+                .insert(session_id.to_string(), snapshot);
+        }
         self.checked_out_statuses
             .lock()
             .expect("browser checked-out session registry poisoned")
@@ -525,7 +577,18 @@ impl BrowserSessionRegistry {
             .lock()
             .expect("browser checked-out session registry poisoned")
             .remove(session_id);
+        self.checked_out_capture_snapshots
+            .lock()
+            .expect("browser checked-out capture snapshot registry poisoned")
+            .remove(session_id);
     }
+}
+
+fn capture_session_snapshot(session: &BrowserSession) -> Option<CaptureSessionSnapshot> {
+    Some(CaptureSessionSnapshot {
+        dispatcher: session.connection.clone()?,
+        target_id: session.current_target_id.clone()?,
+    })
 }
 
 fn refresh_checked_out_status_health(status: &mut Value) {
@@ -1010,13 +1073,16 @@ pub fn run_browser_script(
     code: &str,
     timeout_seconds: u64,
 ) -> Result<BrowserScriptOutput> {
-    run_browser_script_with_session_registry(
+    secrets_runtime::finish_with_redaction(
         session_id,
-        cwd,
-        artifact_dir,
-        code,
-        timeout_seconds,
-        browser_sessions(),
+        run_browser_script_with_session_registry(
+            session_id,
+            cwd,
+            artifact_dir,
+            code,
+            timeout_seconds,
+            browser_sessions(),
+        ),
     )
 }
 
@@ -1054,13 +1120,16 @@ pub fn start_browser_script(
     code: &str,
     timeout_seconds: u64,
 ) -> Result<BrowserScriptOutput> {
-    start_browser_script_with_registry(
+    secrets_runtime::finish_with_redaction(
         session_id,
-        cwd,
-        artifact_dir,
-        code,
-        timeout_seconds,
-        browser_script_runs(),
+        start_browser_script_with_registry(
+            session_id,
+            cwd,
+            artifact_dir,
+            code,
+            timeout_seconds,
+            browser_script_runs(),
+        ),
     )
 }
 
@@ -1181,11 +1250,14 @@ pub fn observe_browser_script(
     run_id: &str,
     observe_timeout_ms: u64,
 ) -> Result<BrowserScriptOutput> {
-    observe_browser_script_with_registry(
+    secrets_runtime::finish_with_redaction(
         session_id,
-        run_id,
-        observe_timeout_ms,
-        browser_script_runs(),
+        observe_browser_script_with_registry(
+            session_id,
+            run_id,
+            observe_timeout_ms,
+            browser_script_runs(),
+        ),
     )
 }
 
@@ -1289,7 +1361,10 @@ pub fn observe_browser_script_with_registry(
 }
 
 pub fn cancel_browser_script(session_id: &str, run_id: &str) -> Result<BrowserScriptOutput> {
-    cancel_browser_script_with_registry(session_id, run_id, browser_script_runs())
+    secrets_runtime::finish_with_redaction(
+        session_id,
+        cancel_browser_script_with_registry(session_id, run_id, browser_script_runs()),
+    )
 }
 
 pub fn cancel_browser_script_with_registry(
@@ -1355,6 +1430,8 @@ fn spawn_browser_script_with_session_registry(
         .as_ref()
         .join(format!(".{run_id}.events.ndjson"));
     let frames_dir = artifact_dir.as_ref().join(format!(".{run_id}.frames"));
+    let security = secrets_runtime::script_security_for(session_id);
+    let security_blob = security.stdin_blob();
     let prelude = browser_script_prelude(
         bridge_addr.port(),
         cwd.as_ref(),
@@ -1380,11 +1457,20 @@ fn spawn_browser_script_with_session_registry(
         .arg("-c")
         .arg(prelude)
         .current_dir(cwd.as_ref())
-        .stdin(Stdio::null())
+        .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
         .context("spawn browser_script python")?;
+    // Hand the secrets + nav policy to the child over stdin (one JSON line) so
+    // secret values never appear in the `-c` argv (process listings) or on disk.
+    // The Rust-side nav guard is authoritative regardless, so a write failure
+    // here only means the child runs without secrets — never without the guard.
+    if let Some(mut child_stdin) = child.stdin.take() {
+        let _ = child_stdin.write_all(security_blob.as_bytes());
+        let _ = child_stdin.write_all(b"\n");
+        // Dropping the handle closes stdin -> EOF for the child's readline.
+    }
     let stdout_reader = child.stdout.take().map(read_browser_script_stdout);
     let stderr_reader = child.stderr.take().map(read_browser_script_stderr);
     Ok(BrowserScriptRun {
@@ -3237,7 +3323,10 @@ impl BrowserSession {
     }
 
     fn effective_live_url(&self) -> Option<String> {
-        self.live_url.clone().or_else(|| self.local_live_url())
+        if self.mode == BrowserMode::RemoteCloud {
+            return self.live_url.clone();
+        }
+        self.local_live_url()
     }
 
     fn local_live_url(&self) -> Option<String> {
@@ -3522,7 +3611,7 @@ impl BrowserSession {
                 headless,
                 extra_args: extra_args.clone(),
             };
-            match launch_managed_browser(launch.clone()) {
+            match launch_managed_browser(launch.clone(), self.session_id.clone()) {
                 Ok((managed, http_url)) => {
                     launched = Some((launch, managed, http_url));
                     break;
@@ -3545,7 +3634,7 @@ impl BrowserSession {
         };
         let ws_url = resolve_ws_from_http(&http_url)?;
         self.managed = Some(managed);
-        self.connect_endpoint(
+        if let Err(error) = self.connect_endpoint(
             Endpoint {
                 kind: "cdp-url".to_string(),
                 http_url: Some(http_url),
@@ -3554,7 +3643,10 @@ impl BrowserSession {
             },
             BrowserMode::Managed,
             BrowserOwner::Rust,
-        )?;
+        ) {
+            self.stop_owned_managed();
+            return Err(error);
+        }
         self.browser_name = Some("Managed Chromium".to_string());
         self.profile = Some(match &launch.profile {
             ManagedProfile::Temp => "temp".to_string(),
@@ -3684,6 +3776,9 @@ impl BrowserSession {
         self.connection = Some(connection);
         self.mode = mode;
         self.owner = owner;
+        if self.mode != BrowserMode::RemoteCloud {
+            self.live_url = None;
+        }
         self.connection_generation += 1;
         self.last_error = None;
         self.last_error_kind = None;
@@ -3700,20 +3795,32 @@ impl BrowserSession {
         owner: BrowserOwner,
         attach_deadline: Instant,
     ) -> Result<()> {
-        let ws_url = endpoint.ws_url.clone();
-        let connection =
-            CdpDispatcher::connect_with_timeout(&ws_url, BROWSER_CONNECT_LOCAL_HANDSHAKE_TIMEOUT)?;
+        let shared_local = mode == BrowserMode::Local && owner == BrowserOwner::External;
+        let connection = if shared_local {
+            shared_local_cdp_connection(&endpoint, BROWSER_CONNECT_LOCAL_HANDSHAKE_TIMEOUT)?
+        } else {
+            let ws_url = endpoint.ws_url.clone();
+            CdpDispatcher::connect_with_timeout(&ws_url, BROWSER_CONNECT_LOCAL_HANDSHAKE_TIMEOUT)?
+        };
         self.reset_browser_profile_runtime();
         self.endpoint = Some(endpoint);
-        self.connection = Some(connection);
+        self.connection = Some(connection.clone());
         self.mode = mode;
         self.owner = owner;
+        if self.mode != BrowserMode::RemoteCloud {
+            self.live_url = None;
+        }
         self.connection_generation += 1;
         self.last_error = None;
         self.last_error_kind = None;
         self.last_target_id = None;
         self.last_session_id = None;
         if let Err(error) = self.attach_first_page_with_deadline(attach_deadline) {
+            if shared_local {
+                if let Some(endpoint) = self.endpoint.as_ref() {
+                    remove_shared_local_cdp_connection(endpoint, &connection);
+                }
+            }
             self.clear_failed_connection_state();
             return Err(error);
         }
@@ -3752,7 +3859,13 @@ impl BrowserSession {
             }
         }
         self.reset_browser_profile_runtime();
-        self.connection = Some(CdpDispatcher::connect(&endpoint.ws_url)?);
+        self.connection = Some(
+            if self.mode == BrowserMode::Local && self.owner == BrowserOwner::External {
+                shared_local_cdp_connection(&endpoint, BROWSER_CONNECT_LOCAL_HANDSHAKE_TIMEOUT)?
+            } else {
+                CdpDispatcher::connect(&endpoint.ws_url)?
+            },
+        );
         self.connection_generation += 1;
         if self.current_target_id.is_some() {
             let _ = self.reattach_same_target();
@@ -5782,12 +5895,231 @@ fn resolve_ws_from_http(http_url: &str) -> Result<String> {
         .ok_or_else(|| anyhow!("{url} missing webSocketDebuggerUrl"))
 }
 
-fn launch_managed_browser(launch: ManagedLaunch) -> Result<(ManagedBrowser, String)> {
-    let port = free_port()?;
+fn shared_local_cdp_connection(
+    endpoint: &Endpoint,
+    timeout: Duration,
+) -> Result<Arc<CdpDispatcher>> {
+    let key = shared_local_cdp_connection_key(endpoint);
+    let registry = LOCAL_CDP_CONNECTIONS.get_or_init(|| Mutex::new(HashMap::new()));
+    let connect_lock = {
+        let mut registry = registry
+            .lock()
+            .expect("local CDP connection registry poisoned");
+        let entry = registry
+            .entry(key.clone())
+            .or_insert_with(LocalCdpConnectionEntry::empty);
+        if let Some(existing) = entry.connection.upgrade() {
+            return Ok(existing);
+        }
+        entry.connect_lock.clone()
+    };
+
+    let _connect_guard = connect_lock
+        .lock()
+        .expect("local CDP endpoint connect lock poisoned");
+
+    {
+        let registry = registry
+            .lock()
+            .expect("local CDP connection registry poisoned");
+        if let Some(existing) = registry
+            .get(&key)
+            .and_then(|entry| entry.connection.upgrade())
+        {
+            return Ok(existing);
+        }
+    }
+
+    let connection = CdpDispatcher::connect_with_timeout(&endpoint.ws_url, timeout)?;
+
+    let mut registry = registry
+        .lock()
+        .expect("local CDP connection registry poisoned");
+    let entry = registry
+        .entry(key)
+        .or_insert_with(LocalCdpConnectionEntry::empty);
+    if let Some(existing) = entry.connection.upgrade() {
+        return Ok(existing);
+    }
+    entry.connection = Arc::downgrade(&connection);
+    Ok(connection)
+}
+
+fn remove_shared_local_cdp_connection(endpoint: &Endpoint, connection: &Arc<CdpDispatcher>) {
+    let key = shared_local_cdp_connection_key(endpoint);
+    let Some(registry) = LOCAL_CDP_CONNECTIONS.get() else {
+        return;
+    };
+    let mut registry = registry
+        .lock()
+        .expect("local CDP connection registry poisoned");
+    if let Some(entry) = registry.get_mut(&key) {
+        let remove = entry
+            .connection
+            .upgrade()
+            .is_some_and(|cached| Arc::ptr_eq(&cached, connection));
+        if remove {
+            entry.connection = Weak::new();
+        }
+    }
+}
+
+impl LocalCdpConnectionEntry {
+    fn empty() -> Self {
+        Self {
+            connection: Weak::new(),
+            connect_lock: Arc::new(Mutex::new(())),
+        }
+    }
+}
+
+fn shared_local_cdp_connection_key(endpoint: &Endpoint) -> String {
+    endpoint
+        .http_url
+        .as_deref()
+        .unwrap_or(endpoint.ws_url.as_str())
+        .trim_end_matches('/')
+        .to_string()
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+struct ManagedBrowserMarker {
+    pid: u32,
+    port: u16,
+    executable: String,
+    profile_path: PathBuf,
+    owner_session_id: Option<String>,
+    started_at_ms: u128,
+}
+
+fn managed_browser_pid_registry() -> &'static Mutex<HashSet<u32>> {
+    MANAGED_BROWSER_PIDS.get_or_init(|| Mutex::new(HashSet::new()))
+}
+
+fn register_managed_browser_pid(pid: u32) {
+    managed_browser_pid_registry()
+        .lock()
+        .expect("managed browser pid registry poisoned")
+        .insert(pid);
+}
+
+fn unregister_managed_browser_pid(pid: u32) {
+    managed_browser_pid_registry()
+        .lock()
+        .expect("managed browser pid registry poisoned")
+        .remove(&pid);
+}
+
+fn managed_browser_pid_active_in_process(pid: u32) -> bool {
+    managed_browser_pid_registry()
+        .lock()
+        .expect("managed browser pid registry poisoned")
+        .contains(&pid)
+}
+
+fn reap_stale_managed_browser_temp_profiles(owner_session_id: Option<&str>) {
+    let Ok(entries) = fs::read_dir(std::env::temp_dir()) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let file_name = entry.file_name();
+        let Some(file_name) = file_name.to_str() else {
+            continue;
+        };
+        if file_name.starts_with(MANAGED_BROWSER_PROFILE_PREFIX) {
+            reap_stale_managed_browser_profile(&entry.path(), owner_session_id);
+        }
+    }
+}
+
+fn reap_stale_managed_browser_profile(profile_path: &Path, owner_session_id: Option<&str>) {
+    let marker_path = profile_path.join(MANAGED_BROWSER_MARKER_FILE);
+    let Ok(raw) = fs::read_to_string(&marker_path) else {
+        return;
+    };
+    let Ok(marker) = serde_json::from_str::<ManagedBrowserMarker>(&raw) else {
+        let _ = fs::remove_file(marker_path);
+        return;
+    };
+    if managed_browser_pid_active_in_process(marker.pid) {
+        return;
+    }
+    if marker.owner_session_id.as_deref() != owner_session_id {
+        return;
+    }
+    if process_command_matches_managed_marker(marker.pid, &marker.profile_path) {
+        terminate_process(marker.pid);
+    }
+    let _ = fs::remove_file(marker_path);
+    let active_path = profile_path.join("DevToolsActivePort");
+    let _ = fs::remove_file(active_path);
+}
+
+#[cfg(unix)]
+fn process_command_matches_managed_marker(pid: u32, profile_path: &Path) -> bool {
+    let Ok(output) = Command::new("ps")
+        .args(["-ww", "-p", &pid.to_string(), "-o", "command="])
+        .output()
+    else {
+        return false;
+    };
+    if !output.status.success() {
+        return false;
+    }
+    let command = String::from_utf8_lossy(&output.stdout);
+    let profile_path = profile_path.display().to_string();
+    command.contains("--remote-debugging-port=")
+        && (command.contains(&format!("--user-data-dir={profile_path}"))
+            || command.contains(&profile_path))
+}
+
+#[cfg(not(unix))]
+fn process_command_matches_managed_marker(_pid: u32, _profile_path: &Path) -> bool {
+    false
+}
+
+#[cfg(unix)]
+fn terminate_process(pid: u32) {
+    let pid = pid.to_string();
+    let _ = Command::new("kill").args(["-TERM", &pid]).status();
+    thread::sleep(Duration::from_millis(200));
+    let _ = Command::new("kill").args(["-KILL", &pid]).status();
+}
+
+#[cfg(not(unix))]
+fn terminate_process(_pid: u32) {}
+
+fn write_managed_browser_marker(
+    profile_path: &Path,
+    launch: &ManagedLaunch,
+    child: &Child,
+    port: u16,
+    owner_session_id: Option<String>,
+) -> Result<PathBuf> {
+    let marker_path = profile_path.join(MANAGED_BROWSER_MARKER_FILE);
+    let marker = ManagedBrowserMarker {
+        pid: child.id(),
+        port,
+        executable: launch.executable.clone(),
+        profile_path: profile_path.to_path_buf(),
+        owner_session_id,
+        started_at_ms: unix_time_ms(),
+    };
+    let raw = serde_json::to_vec_pretty(&marker).context("serialize managed browser marker")?;
+    fs::write(&marker_path, raw)
+        .with_context(|| format!("write managed browser marker {}", marker_path.display()))?;
+    Ok(marker_path)
+}
+
+fn launch_managed_browser(
+    launch: ManagedLaunch,
+    owner_session_id: Option<String>,
+) -> Result<(ManagedBrowser, String)> {
     let (profile_path, temp_dir) = match &launch.profile {
         ManagedProfile::Temp => {
+            reap_stale_managed_browser_temp_profiles(owner_session_id.as_deref());
             let temp = tempfile::Builder::new()
-                .prefix("but-managed-browser.")
+                .prefix(MANAGED_BROWSER_PROFILE_PREFIX)
                 .tempdir()
                 .context("create managed browser temp profile")?;
             (temp.path().to_path_buf(), Some(temp))
@@ -5795,9 +6127,11 @@ fn launch_managed_browser(launch: ManagedLaunch) -> Result<(ManagedBrowser, Stri
         ManagedProfile::Path(path) => {
             fs::create_dir_all(path)
                 .with_context(|| format!("create managed browser profile {}", path.display()))?;
+            reap_stale_managed_browser_profile(path, owner_session_id.as_deref());
             (path.clone(), None)
         }
     };
+    let port = free_port()?;
     let mut args = vec![
         "--remote-debugging-address=127.0.0.1".to_string(),
         format!("--remote-debugging-port={port}"),
@@ -5826,6 +6160,22 @@ fn launch_managed_browser(launch: ManagedLaunch) -> Result<(ManagedBrowser, Stri
         .stderr(Stdio::null())
         .spawn()
         .with_context(|| format!("launch managed browser {}", launch.executable))?;
+    register_managed_browser_pid(child.id());
+    let marker_path = match write_managed_browser_marker(
+        &profile_path,
+        &launch,
+        &child,
+        port,
+        owner_session_id.clone(),
+    ) {
+        Ok(marker_path) => marker_path,
+        Err(error) => {
+            unregister_managed_browser_pid(child.id());
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(error);
+        }
+    };
     let http_url = format!("http://127.0.0.1:{port}");
     let deadline = Instant::now() + Duration::from_secs(20);
     let mut last_error = None;
@@ -5840,6 +6190,7 @@ fn launch_managed_browser(launch: ManagedLaunch) -> Result<(ManagedBrowser, Stri
                         child,
                         _profile_dir: temp_dir,
                         launch,
+                        marker_path,
                     },
                     http_url,
                 ));
@@ -5850,8 +6201,10 @@ fn launch_managed_browser(launch: ManagedLaunch) -> Result<(ManagedBrowser, Stri
             }
         }
     }
+    unregister_managed_browser_pid(child.id());
     let _ = child.kill();
     let _ = child.wait();
+    let _ = fs::remove_file(marker_path);
     bail!(
         "managed browser DevTools did not become available: {}",
         last_error.unwrap_or_else(|| "unknown error".to_string())
@@ -6624,7 +6977,7 @@ fn local_profile_cookies(profile: &LocalBrowserProfile) -> Result<Vec<Value>> {
         headless: true,
         extra_args: vec!["--no-startup-window".to_string()],
     };
-    let (mut managed, http_url) = launch_managed_browser(launch)?;
+    let (mut managed, http_url) = launch_managed_browser(launch, None)?;
     let result = (|| -> Result<Vec<Value>> {
         let ws_url = resolve_ws_from_http(&http_url)?;
         let mut connection = CdpConnection::connect(&ws_url)?;
@@ -7266,7 +7619,8 @@ fn browser_use_api_with_options(
 ) -> Result<Value> {
     let key = browser_use_api_key(options).ok_or_else(|| anyhow!("BROWSER_USE_API_KEY missing"))?;
     let client = Client::new();
-    let url = format!("{BU_API}{path}");
+    let api_url = browser_use_api_url(options);
+    let url = format!("{api_url}{path}");
     let request = match method {
         "GET" => client.get(&url),
         "POST" => client.post(&url),
@@ -7287,6 +7641,27 @@ fn browser_use_api_with_options(
         .error_for_status()
         .with_context(|| format!("{method} {url} returned error"))?;
     Ok(response.json().unwrap_or_else(|_| json!({})))
+}
+
+fn browser_use_api_url(options: &BrowserCommandOptions) -> String {
+    let raw = options
+        .browser_use_api_url
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+        .map(ToOwned::to_owned);
+    let Some(raw) = raw else {
+        return BU_API.to_string();
+    };
+    normalize_browser_use_api_url(&raw)
+}
+
+fn normalize_browser_use_api_url(raw: &str) -> String {
+    let trimmed = raw.trim().trim_end_matches('/');
+    if trimmed.ends_with("/api/v3") {
+        trimmed.to_string()
+    } else {
+        format!("{trimmed}/api/v3")
+    }
 }
 
 fn stop_cloud_browser(browser_id: &str) -> Result<Value> {
@@ -7728,6 +8103,17 @@ fn bridge_request_with_session(session: &mut BrowserSession, request: &Value) ->
                     }
                 }
             }
+            // Navigation guard (Cloud `allowed_domains`): every CDP call funnels here.
+            if method == "Page.navigate" {
+                if let Some(url) = params.get("url").and_then(Value::as_str) {
+                    if let Some(script_session) = session.session_id.as_deref() {
+                        let security = secrets_runtime::script_security_for(script_session);
+                        if let Some(reason) = secrets_runtime::nav_denied_reason(url, &security) {
+                            bail!("{reason}");
+                        }
+                    }
+                }
+            }
             let session_id = request.get("session_id").and_then(Value::as_str);
             let use_browser_session = session_id.is_none() && !method.starts_with("Target.");
             let current_session = session.current_session_id.clone();
@@ -7773,10 +8159,38 @@ fn bridge_request_with_session(session: &mut BrowserSession, request: &Value) ->
             }
         }
         "status" => Ok(session.status_json_with_page_probe()),
+        // Lazy, on-demand secret fetch. The script asks for a value only when it
+        // is about to fill a field, so the encrypted store is read exactly then —
+        // not eagerly at spawn — and at most once per secret.
+        "secret" => {
+            let domain = request.get("domain").and_then(Value::as_str).unwrap_or("");
+            let name = request.get("name").and_then(Value::as_str).unwrap_or("");
+            let session_id = session.session_id.clone().unwrap_or_default();
+            let value = secrets_runtime::fetch_secret_for_session(&session_id, domain, name)?;
+            Ok(json!({ "value": value }))
+        }
+        // Email inbox access. `op` is "address" (the agent's inbox address),
+        // "inbox" (list recent messages; `limit` optional), or "message" (read
+        // one message's full body; requires `message_id`). For "inbox"/"message"
+        // the value is a JSON string the helper parses. `value: null` when no
+        // inbox is configured.
+        "email" => {
+            let op = request.get("op").and_then(Value::as_str).unwrap_or("");
+            let arg = match op {
+                "message" => request.get("message_id").and_then(Value::as_str),
+                "inbox" => request.get("limit").and_then(Value::as_str),
+                _ => None,
+            };
+            match secrets_runtime::email_for_session(op, arg) {
+                Ok(value) => Ok(json!({ "value": value })),
+                Err(error) => Ok(json!({ "value": null, "error": error })),
+            }
+        }
         other => bail!("unknown browser_script bridge request: {other}"),
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn browser_script_prelude(
     bridge_port: u16,
     cwd: &Path,
@@ -7813,6 +8227,21 @@ FRAMES_MANIFEST = FRAMES_DIR / "frames.ndjson"
 OUTPUTS_DIR = pathlib.Path(os.environ.get("BH_OUTPUTS_DIR") or {cwd:?}).expanduser().resolve()
 OUTPUTS_DIR.mkdir(parents=True, exist_ok=True)
 __USER_CODE = base64.b64decode({encoded_code:?}).decode()
+# Secret METADATA + navigation policy are handed over on stdin (one JSON line).
+# Only metadata is sent — which placeholders exist per domain and whether each is
+# a TOTP — NEVER values. The actual value is fetched on demand via the `secret`
+# bridge request when secret()/totp() is called, so the OS keychain is read only
+# when the agent is on the page and filling a field. Shape:
+# {{meta:{{domain:{{name:{{totp:bool}}}}}}, nav_allow:[...], nav_deny:[...]}}.
+try:
+    _security = json.loads(sys.stdin.readline() or "{{}}")
+except Exception:
+    _security = {{}}
+_SECRET_META = _security.get("meta") or {{}}
+# Enforced in Rust on Page.navigate; also checked here after load to catch redirects.
+_NAV_ALLOW = _security.get("nav_allow") or []
+_NAV_DENY = _security.get("nav_deny") or []
+_EMAIL_AVAILABLE = bool(_security.get("email_available"))
 
 # 2fps screen capture (observability prototype). Polls Page.captureScreenshot on
 # a fixed cadence so frames land even when the page is visually static. Frames
@@ -8927,7 +9356,7 @@ fn session_capture_fps() -> f64 {
     std::env::var("LLM_BROWSER_CAPTURE_FPS")
         .ok()
         .and_then(|v| v.trim().parse::<f64>().ok())
-        .unwrap_or(0.0)
+        .unwrap_or(2.0)
 }
 fn session_capture_quality() -> i64 {
     std::env::var("LLM_BROWSER_CAPTURE_QUALITY")
@@ -8937,6 +9366,9 @@ fn session_capture_quality() -> i64 {
 }
 
 fn local_capture_preview_live_url(artifact_dir: &Path) -> Option<String> {
+    if session_capture_fps() <= 0.0 {
+        return None;
+    }
     let frames_dir = artifact_dir.join(".capture.frames");
     ensure_capture_preview_files(&frames_dir).ok()?;
     Some(file_url_for_path(&frames_dir.join("live.html")))
@@ -9106,11 +9538,18 @@ fn session_capture_dispatcher(
     session_id: &str,
     session_registry: &BrowserSessionRegistry,
 ) -> Option<(Arc<CdpDispatcher>, String)> {
-    let sessions = session_registry.sessions.lock().ok()?;
-    let session = sessions.get(session_id)?;
-    let dispatcher = session.connection.clone()?;
-    let target = session.current_target_id.clone()?;
-    Some((dispatcher, target))
+    if let Ok(sessions) = session_registry.sessions.lock() {
+        if let Some(session) = sessions.get(session_id) {
+            if let Some(dispatcher) = session.connection.clone() {
+                if let Some(target) = session.current_target_id.clone() {
+                    return Some((dispatcher, target));
+                }
+            }
+        }
+    }
+    let snapshots = session_registry.checked_out_capture_snapshots.lock().ok()?;
+    let snapshot = snapshots.get(session_id)?;
+    Some((snapshot.dispatcher.clone(), snapshot.target_id.clone()))
 }
 
 fn write_capture_manifest(path: &Path, records: &[Value]) {
@@ -9558,6 +9997,15 @@ mod tests {
     use std::sync::MutexGuard;
 
     static ENV_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+
+    fn test_cdp_dispatcher() -> Arc<CdpDispatcher> {
+        let (tx, _rx) = std::sync::mpsc::channel::<CdpDispatchCmd>();
+        Arc::new(CdpDispatcher {
+            tx: Mutex::new(tx),
+            next_id: AtomicU64::new(1),
+            reader: Mutex::new(None),
+        })
+    }
 
     #[test]
     #[ignore = "manual measurement; needs STITCH_TEST_FRAMES_DIR"]
@@ -10191,6 +10639,21 @@ mod tests {
     }
 
     #[test]
+    fn shared_local_cdp_connection_key_prefers_stable_http_endpoint() {
+        let endpoint = Endpoint {
+            kind: "devtools-active-port".to_string(),
+            http_url: Some("http://127.0.0.1:9222/".to_string()),
+            ws_url: "ws://127.0.0.1:9222/devtools/browser/changing-id".to_string(),
+            candidate_id: Some("local-1".to_string()),
+        };
+
+        assert_eq!(
+            shared_local_cdp_connection_key(&endpoint),
+            "http://127.0.0.1:9222"
+        );
+    }
+
+    #[test]
     fn cdp_protocol_errors_are_command_errors_not_websocket_drops() {
         let invalid_params = r#"CDP failed: {"code":-32602,"message":"Invalid parameters"}"#;
         assert_eq!(classify_browser_error(invalid_params), "cdp-command-error");
@@ -10285,14 +10748,25 @@ mod tests {
         });
 
         let first = session.browser_events();
-        assert_eq!(first.len(), 2);
+        assert_eq!(first.len(), 1);
         assert_eq!(first[0]["type"], "browser.disconnected");
-        assert_eq!(first[1]["type"], "browser.live_url");
+        assert_eq!(first[0]["payload"]["live_url"], Value::Null);
+        assert!(session.browser_events().is_empty());
+
+        session.mode = BrowserMode::RemoteCloud;
+        session.connection_generation += 1;
+        let cloud = session.browser_events();
+        assert_eq!(cloud.len(), 2);
+        assert_eq!(cloud[0]["type"], "browser.disconnected");
         assert_eq!(
-            first[1]["payload"]["live_url"],
+            cloud[0]["payload"]["live_url"],
             "https://live.browser-use.com/watch"
         );
-        assert!(session.browser_events().is_empty());
+        assert_eq!(cloud[1]["type"], "browser.live_url");
+        assert_eq!(
+            cloud[1]["payload"]["live_url"],
+            "https://live.browser-use.com/watch"
+        );
 
         let connected = json!({
             "status": "connected",
@@ -10326,6 +10800,7 @@ mod tests {
     #[test]
     fn managed_status_exposes_local_capture_preview_live_url() {
         let temp = tempfile::tempdir().unwrap();
+        let _env = EnvRestore::unset(&["LLM_BROWSER_CAPTURE_FPS"]);
         let session = BrowserSession {
             mode: BrowserMode::Managed,
             owner: BrowserOwner::Rust,
@@ -10341,6 +10816,23 @@ mod tests {
             Some(file_url_for_path(&preview).as_str())
         );
         assert!(preview.exists());
+    }
+
+    #[test]
+    fn managed_status_omits_local_preview_when_capture_is_disabled() {
+        let temp = tempfile::tempdir().unwrap();
+        let _env = EnvRestore::set(&[("LLM_BROWSER_CAPTURE_FPS", "0")]);
+        let session = BrowserSession {
+            mode: BrowserMode::Managed,
+            owner: BrowserOwner::Rust,
+            artifact_dir: Some(temp.path().to_path_buf()),
+            current_target_id: Some("target-1".to_string()),
+            current_session_id: Some("session-1".to_string()),
+            ..Default::default()
+        };
+
+        assert!(session.status_json()["live_url"].is_null());
+        assert!(!temp.path().join(".capture.frames/live.html").exists());
     }
 
     #[test]
@@ -10448,6 +10940,44 @@ mod tests {
         registry.return_session(session_id, session);
         assert_eq!(registry.checked_out_session_count(), 0);
         assert_eq!(registry.active_session_count(), 1);
+    }
+
+    #[test]
+    fn capture_dispatcher_uses_checked_out_session_snapshot() {
+        let registry = BrowserSessionRegistry::new();
+        let session_id = "checked-out-capture";
+        let dispatcher = test_cdp_dispatcher();
+        registry
+            .sessions
+            .lock()
+            .expect("browser session registry poisoned")
+            .insert(
+                session_id.to_string(),
+                BrowserSession {
+                    session_id: Some(session_id.to_string()),
+                    mode: BrowserMode::Managed,
+                    owner: BrowserOwner::Rust,
+                    connection: Some(dispatcher.clone()),
+                    current_target_id: Some("target-1".to_string()),
+                    current_session_id: Some("session-1".to_string()),
+                    ..Default::default()
+                },
+            );
+
+        let session = registry
+            .checkout_session(session_id)
+            .expect("checkout browser session");
+        assert_eq!(registry.active_session_count(), 0);
+        assert_eq!(registry.checked_out_session_count(), 1);
+        assert_eq!(registry.checked_out_capture_snapshot_count(), 1);
+
+        let (snapshot_dispatcher, target_id) =
+            session_capture_dispatcher(session_id, &registry).expect("capture snapshot");
+        assert!(Arc::ptr_eq(&snapshot_dispatcher, &dispatcher));
+        assert_eq!(target_id, "target-1");
+
+        registry.return_session(session_id, session);
+        assert_eq!(registry.checked_out_capture_snapshot_count(), 0);
     }
 
     #[test]
@@ -12009,6 +12539,81 @@ print("fill_input cdp/browser-harness events ok")
     }
 
     #[test]
+    fn browser_script_fill_input_waits_briefly_by_default() {
+        let temp = tempfile::tempdir().unwrap();
+        let output = run_browser_script(
+            "script-fill-input-default-wait",
+            temp.path(),
+            temp.path().join("artifacts"),
+            r##"
+events = []
+query_count = 0
+
+def cdp(method, **params):
+    global query_count
+    events.append((method, params))
+    if method == "DOM.getDocument":
+        return {"root": {"nodeId": 1}}
+    if method == "DOM.querySelector":
+        query_count += 1
+        assert params["selector"] == "#late", params
+        return {"nodeId": 0 if query_count < 3 else 2}
+    if method == "DOM.getBoxModel":
+        return {"model": {"border": [0, 0, 20, 0, 20, 20, 0, 20]}}
+    return {}
+
+fill_input("#late", "ok")
+assert query_count == 3, query_count
+assert ("Input.insertText", {"text": "ok"}) in events, events
+print("fill_input default wait ok")
+"##,
+            10,
+        )
+        .unwrap();
+
+        assert!(output.ok, "{:?}\n{}", output.error, output.text);
+        assert!(output.text.contains("fill_input default wait ok"));
+    }
+
+    #[test]
+    fn browser_script_email_inbox_filters_after_timestamp() {
+        let temp = tempfile::tempdir().unwrap();
+        let output = run_browser_script(
+            "script-email-inbox-sent-after",
+            temp.path(),
+            temp.path().join("artifacts"),
+            r##"
+_EMAIL_AVAILABLE = True
+messages = [
+    {"message_id": "new", "timestamp": "2026-06-07T12:00:01.000Z", "preview": "code 222222"},
+    {"message_id": "old", "timestamp": "2026-06-07T11:59:59.000Z", "preview": "code 111111"},
+]
+
+def _bridge(message):
+    assert message["kind"] == "email", message
+    assert message["op"] == "inbox", message
+    return {"value": json.dumps(messages)}
+
+now = current_datetime()
+assert now["utc"].endswith("Z"), now
+assert isinstance(now["unix"], float), now
+
+recent = email_inbox(sent_after="2026-06-07T12:00:00.000Z")
+assert [m["message_id"] for m in recent] == ["new"], recent
+
+recent_from_unix_ms = email_inbox(sent_after="1780833600000")
+assert [m["message_id"] for m in recent_from_unix_ms] == ["new"], recent_from_unix_ms
+print("email_inbox sent_after ok")
+"##,
+            10,
+        )
+        .unwrap();
+
+        assert!(output.ok, "{:?}\n{}", output.error, output.text);
+        assert!(output.text.contains("email_inbox sent_after ok"));
+    }
+
+    #[test]
     fn browser_script_type_text_maps_to_insert_text_and_fill_input_missing_selector_errors() {
         let temp = tempfile::tempdir().unwrap();
         let output = run_browser_script(
@@ -12029,7 +12634,7 @@ def js(expression, *args, **kwargs):
     return False
 
 try:
-    fill_input("#missing", "hello")
+    fill_input("#missing", "hello", timeout=0)
 except RuntimeError as exc:
     assert "element not found" in str(exc), exc
 else:
@@ -12428,14 +13033,14 @@ print("bridge retry ok")
     }
 
     #[test]
-    fn session_capture_is_opt_in_for_eval_speed() {
+    fn session_capture_defaults_to_live_preview_fps() {
         {
             let _env = EnvRestore::unset(&["LLM_BROWSER_CAPTURE_FPS"]);
-            assert_eq!(session_capture_fps(), 0.0);
+            assert_eq!(session_capture_fps(), 2.0);
         }
         {
-            let _env = EnvRestore::set(&[("LLM_BROWSER_CAPTURE_FPS", "2")]);
-            assert_eq!(session_capture_fps(), 2.0);
+            let _env = EnvRestore::set(&[("LLM_BROWSER_CAPTURE_FPS", "0")]);
+            assert_eq!(session_capture_fps(), 0.0);
         }
     }
 
@@ -12629,6 +13234,7 @@ print("bridge retry ok")
         let temp = tempfile::tempdir().unwrap();
         let session_id = "script-private-registry";
         let registry = BrowserScriptRunRegistry::new();
+        let _env = EnvRestore::set(&[("BU_BROWSER_SCRIPT_INITIAL_WAIT_MS", "250")]);
         let started = start_browser_script_with_registry(
             session_id,
             temp.path(),
@@ -12702,6 +13308,7 @@ print("bridge retry ok")
     fn browser_script_observe_returns_images_before_final_result() {
         let temp = tempfile::tempdir().unwrap();
         let session_id = "script-observe-image";
+        let _env = EnvRestore::set(&[("BU_BROWSER_SCRIPT_INITIAL_WAIT_MS", "250")]);
         let code = r#"
 import pathlib, time
 path = pathlib.Path(outputs_dir()) / "before_failure.png"
@@ -12737,6 +13344,7 @@ print("finished")
     fn browser_script_observe_returns_summary_before_final_result() {
         let temp = tempfile::tempdir().unwrap();
         let session_id = "script-observe-summary";
+        let _env = EnvRestore::set(&[("BU_BROWSER_SCRIPT_INITIAL_WAIT_MS", "250")]);
         let code = r#"
 # browser_summary:
 # {
@@ -12864,6 +13472,7 @@ print("finished")
     fn browser_status_marks_completed_background_scripts_for_observe() {
         let temp = tempfile::tempdir().unwrap();
         let session_id = "script-status-completed-runs";
+        let _env = EnvRestore::set(&[("BU_BROWSER_SCRIPT_INITIAL_WAIT_MS", "250")]);
         let started = start_browser_script(
             session_id,
             temp.path(),
@@ -13021,12 +13630,37 @@ print("large response ok", len(data["blob"]))
             "browser profile sync --all-cookies",
             BrowserCommandOptions {
                 browser_use_api_key: Some("test-key".to_string()),
+                ..BrowserCommandOptions::default()
             },
         )
         .unwrap();
         assert_eq!(output.content["status"], "needs-user-action");
         assert_eq!(output.content["action"], "select-local-profile");
         assert!(std::env::var("BROWSER_USE_API_KEY").is_err());
+    }
+
+    #[test]
+    fn browser_use_api_url_is_supplied_explicitly_by_caller() {
+        let _env = EnvRestore::set(&[("BROWSER_USE_CLOUD_API_URL", "http://ignored.local:8000")]);
+
+        assert_eq!(
+            browser_use_api_url(&BrowserCommandOptions::default()),
+            "https://api.browser-use.com/api/v3"
+        );
+        assert_eq!(
+            browser_use_api_url(&BrowserCommandOptions {
+                browser_use_api_url: Some("http://localhost:8000".to_string()),
+                ..BrowserCommandOptions::default()
+            }),
+            "http://localhost:8000/api/v3"
+        );
+        assert_eq!(
+            browser_use_api_url(&BrowserCommandOptions {
+                browser_use_api_url: Some("http://localhost:8000/api/v3/".to_string()),
+                ..BrowserCommandOptions::default()
+            }),
+            "http://localhost:8000/api/v3"
+        );
     }
 
     #[test]
@@ -13250,6 +13884,78 @@ print("large response ok", len(data["blob"]))
     }
 
     #[test]
+    fn active_managed_browser_marker_is_not_reaped() {
+        let temp = tempfile::tempdir().unwrap();
+        let marker_path = temp.path().join(MANAGED_BROWSER_MARKER_FILE);
+        let pid = std::process::id();
+        register_managed_browser_pid(pid);
+        let marker = ManagedBrowserMarker {
+            pid,
+            port: 9,
+            executable: "chrome".to_string(),
+            profile_path: temp.path().to_path_buf(),
+            owner_session_id: Some("owner-session".to_string()),
+            started_at_ms: 1,
+        };
+        fs::write(&marker_path, serde_json::to_vec(&marker).unwrap()).unwrap();
+        fs::write(
+            temp.path().join("DevToolsActivePort"),
+            "9\n/devtools/browser/stale\n",
+        )
+        .unwrap();
+
+        reap_stale_managed_browser_profile(temp.path(), Some("owner-session"));
+
+        unregister_managed_browser_pid(pid);
+        assert!(marker_path.exists());
+        assert!(temp.path().join("DevToolsActivePort").exists());
+    }
+
+    #[test]
+    fn stale_managed_browser_marker_removes_stale_port_file() {
+        let temp = tempfile::tempdir().unwrap();
+        let marker_path = temp.path().join(MANAGED_BROWSER_MARKER_FILE);
+        let marker = ManagedBrowserMarker {
+            pid: 999_999,
+            port: 9,
+            executable: "chrome".to_string(),
+            profile_path: temp.path().to_path_buf(),
+            owner_session_id: Some("owner-session".to_string()),
+            started_at_ms: 1,
+        };
+        fs::write(&marker_path, serde_json::to_vec(&marker).unwrap()).unwrap();
+        let active_path = temp.path().join("DevToolsActivePort");
+        fs::write(&active_path, "9\n/devtools/browser/stale\n").unwrap();
+
+        reap_stale_managed_browser_profile(temp.path(), Some("owner-session"));
+
+        assert!(!marker_path.exists());
+        assert!(!active_path.exists());
+    }
+
+    #[test]
+    fn managed_browser_marker_reaper_respects_owner_session() {
+        let temp = tempfile::tempdir().unwrap();
+        let marker_path = temp.path().join(MANAGED_BROWSER_MARKER_FILE);
+        let marker = ManagedBrowserMarker {
+            pid: 999_999,
+            port: 9,
+            executable: "chrome".to_string(),
+            profile_path: temp.path().to_path_buf(),
+            owner_session_id: Some("owner-a".to_string()),
+            started_at_ms: 1,
+        };
+        fs::write(&marker_path, serde_json::to_vec(&marker).unwrap()).unwrap();
+        let active_path = temp.path().join("DevToolsActivePort");
+        fs::write(&active_path, "9\n/devtools/browser/stale\n").unwrap();
+
+        reap_stale_managed_browser_profile(temp.path(), Some("owner-b"));
+
+        assert!(marker_path.exists());
+        assert!(active_path.exists());
+    }
+
+    #[test]
     fn remote_debugging_flag_reads_chrome_local_state() {
         let value = json!({
             "devtools": {
@@ -13429,6 +14135,15 @@ print("large response ok", len(data["blob"]))
         )
         .unwrap();
         assert_eq!(connect.content["status"], "connected");
+        assert!(
+            connect
+                .events
+                .iter()
+                .find_map(|event| event["payload"]["live_url"].as_str())
+                .is_some_and(|url| url.ends_with("/.capture.frames/live.html")),
+            "{:?}",
+            connect.events
+        );
 
         let script = run_browser_script(
             session_id,
@@ -13494,6 +14209,20 @@ screenshot("managed_smoke")
         assert!(
             !script.images.is_empty(),
             "expected screenshot image artifact"
+        );
+        let latest = artifacts.join(".capture.frames/latest.jpg");
+        let saw_live_frame = (0..20).any(|_| {
+            if latest.metadata().is_ok_and(|metadata| metadata.len() > 0) {
+                true
+            } else {
+                thread::sleep(Duration::from_millis(250));
+                false
+            }
+        });
+        assert!(
+            saw_live_frame,
+            "expected live preview frame at {}",
+            latest.display()
         );
 
         cleanup_session(session_id);

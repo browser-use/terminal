@@ -1,0 +1,149 @@
+name: browser-use-core publish
+
+on:
+  workflow_dispatch:
+    inputs:
+      publish:
+        description: "Publish browser-use-core wheels to PyPI"
+        required: true
+        default: false
+        type: boolean
+  push:
+    tags:
+      - "browser-use-core-v*"
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: build ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-14
+            target: aarch64-apple-darwin
+          - os: macos-15-intel
+            target: x86_64-apple-darwin
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-musl
+          - os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-musl
+          - os: windows-2025
+            target: x86_64-pc-windows-msvc
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - name: Install Linux musl tools
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
+      - name: Install Python build frontend
+        run: python -m pip install build
+      - name: Build wheel
+        shell: bash
+        run: TARGET_TRIPLE=${{ matrix.target }} OUT_DIR=dist scripts/build-browser-use-core-wheel.sh
+      - name: Smoke installed wheel
+        shell: bash
+        run: |
+          set -euo pipefail
+          wheel="$(ls dist/browser_use_core-*.whl)"
+          python -m venv .browser-use-core-smoke
+          if [[ "$RUNNER_OS" == "Windows" ]]; then
+            smoke_python=".browser-use-core-smoke/Scripts/python.exe"
+            smoke_bin=".browser-use-core-smoke/Scripts"
+            terminal_script="$smoke_bin/browser-use-terminal.exe"
+            tui_script="$smoke_bin/but.exe"
+          else
+            smoke_python=".browser-use-core-smoke/bin/python"
+            smoke_bin=".browser-use-core-smoke/bin"
+            terminal_script="$smoke_bin/browser-use-terminal"
+            tui_script="$smoke_bin/but"
+          fi
+          "$smoke_python" -m pip install "$wheel"
+          "$terminal_script" --version
+          "$tui_script" --version
+          "$smoke_python" - <<'PY'
+          import json
+          import os
+          import subprocess
+          import sys
+
+          import browser_use_core
+
+          binary = browser_use_core.binary_path("browser-use-terminal")
+          assert os.path.exists(binary), binary
+          subprocess.run([binary, "--version"], check=True)
+          proc = subprocess.run(
+              [binary, "sdk-server", "--transport", "stdio"],
+              input='{"jsonrpc":"2.0","id":1,"method":"runtime.ping","params":{}}\n',
+              text=True,
+              capture_output=True,
+              timeout=10,
+              check=True,
+          )
+          response = json.loads(proc.stdout.strip())
+          assert response["result"]["ok"] is True, response
+          env = os.environ.copy()
+          env["BROWSER_USE_PYTHON"] = sys.executable
+          proc = subprocess.run(
+              [binary, "sdk-server", "--transport", "stdio"],
+              input='{"jsonrpc":"2.0","id":2,"method":"runtime.python_worker_ping","params":{}}\n',
+              text=True,
+              capture_output=True,
+              timeout=20,
+              check=True,
+              env=env,
+          )
+          response = json.loads(proc.stdout.strip())
+          assert response["result"]["ok"] is True, response
+          assert "browser-use-python-worker-ok" in response["result"]["text"], response
+          PY
+      - uses: actions/upload-artifact@v4
+        with:
+          name: browser-use-core-${{ matrix.target }}
+          path: dist/browser_use_core-*.whl
+
+  publish:
+    name: publish to PyPI
+    needs: build
+    runs-on: ubuntu-latest
+    if: github.event_name == 'push' || inputs.publish
+    environment: pypi
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Verify wheel set
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+
+          wheels = sorted(Path("dist").glob("browser_use_core-*.whl"))
+          expected_platforms = {
+              "macosx_11_0_arm64",
+              "macosx_10_13_x86_64",
+              "manylinux_2_17_x86_64",
+              "manylinux_2_17_aarch64",
+              "win_amd64",
+          }
+          actual_platforms = {wheel.name.rsplit("-", 1)[1].removesuffix(".whl") for wheel in wheels}
+          if actual_platforms != expected_platforms:
+              raise SystemExit(f"Unexpected wheel set: {sorted(wheel.name for wheel in wheels)}")
+          for wheel in wheels:
+              print(wheel)
+          PY
+      - name: Publish wheels
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          packages-dir: dist

@@ -27,8 +27,14 @@ pub mod openrouter;
 
 const X_CODEX_TURN_STATE_HEADER: &str = "x-codex-turn-state";
 const CODEX_OAUTH_CLIENT_ID: &str = "app_EMoamEEZ73f0CkXaXp7hrann";
+const CODEX_AUTHORIZE_URL: &str = "https://auth.openai.com/oauth/authorize";
 const CODEX_REFRESH_TOKEN_URL: &str = "https://auth.openai.com/oauth/token";
 const CODEX_REFRESH_TOKEN_URL_OVERRIDE_ENV_VAR: &str = "CODEX_REFRESH_TOKEN_URL_OVERRIDE";
+pub const CODEX_CALLBACK_HOST: &str = "localhost";
+pub const CODEX_CALLBACK_PORT: u16 = 1455;
+pub const CODEX_CALLBACK_PATH: &str = "/auth/callback";
+pub const CODEX_REDIRECT_URI: &str = "http://localhost:1455/auth/callback";
+const CODEX_OAUTH_SCOPES: &str = "openid profile email offline_access";
 const PROVIDER_MAX_IMAGE_DIMENSION: u32 = 2000;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -2572,6 +2578,40 @@ pub fn claude_code_oauth_pkce() -> (String, String) {
     (verifier, challenge)
 }
 
+pub fn codex_oauth_pkce() -> (String, String) {
+    let chars = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-._~";
+    let mut rng = rand::rng();
+    let verifier = (0..43)
+        .map(|_| chars[rng.random_range(0..chars.len())] as char)
+        .collect::<String>();
+    let challenge = URL_SAFE_NO_PAD.encode(Sha256::digest(verifier.as_bytes()));
+    (verifier, challenge)
+}
+
+pub fn codex_oauth_state() -> String {
+    let mut bytes = [0_u8; 32];
+    rand::rng().fill(&mut bytes);
+    URL_SAFE_NO_PAD.encode(bytes)
+}
+
+pub fn codex_oauth_authorize_url(challenge: &str, state: &str) -> String {
+    form_url(
+        CODEX_AUTHORIZE_URL,
+        &[
+            ("response_type", "code"),
+            ("client_id", CODEX_OAUTH_CLIENT_ID),
+            ("redirect_uri", CODEX_REDIRECT_URI),
+            ("scope", CODEX_OAUTH_SCOPES),
+            ("code_challenge", challenge),
+            ("code_challenge_method", "S256"),
+            ("id_token_add_organizations", "true"),
+            ("codex_cli_simplified_flow", "true"),
+            ("state", state),
+            ("originator", "browser-use-terminal"),
+        ],
+    )
+}
+
 pub fn claude_code_oauth_authorize_url(verifier: &str, challenge: &str) -> String {
     form_url(
         CLAUDE_CODE_AUTHORIZE_URL,
@@ -2586,6 +2626,211 @@ pub fn claude_code_oauth_authorize_url(verifier: &str, challenge: &str) -> Strin
             ("state", verifier),
         ],
     )
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct CodexAuthorization {
+    pub code: Option<String>,
+    pub state: Option<String>,
+    pub error: Option<String>,
+    pub error_description: Option<String>,
+}
+
+pub fn parse_codex_authorization_input(value: &str) -> CodexAuthorization {
+    let mut stripped = value.trim();
+    if stripped.is_empty() {
+        return CodexAuthorization::default();
+    }
+    if let Some((_, query)) = stripped.split_once('?') {
+        stripped = query.split('#').next().unwrap_or(query);
+    }
+    let mut authorization = CodexAuthorization::default();
+    for (key, value) in parse_form_pairs(stripped) {
+        match key.as_str() {
+            "code" => authorization.code = Some(value),
+            "state" => authorization.state = Some(value),
+            "error" => authorization.error = Some(value),
+            "error_description" => authorization.error_description = Some(value),
+            _ => {}
+        }
+    }
+    authorization
+}
+
+pub fn codex_callback_status(
+    path: &str,
+    expected_state: &str,
+    authorization: &CodexAuthorization,
+) -> u16 {
+    if !path.starts_with(CODEX_CALLBACK_PATH) {
+        404
+    } else if authorization.error.is_some() {
+        400
+    } else if authorization.code.is_none() || authorization.state.as_deref() != Some(expected_state)
+    {
+        400
+    } else {
+        200
+    }
+}
+
+pub struct CodexCallbackPage {
+    pub status_text: &'static str,
+    pub body: String,
+    pub message: String,
+}
+
+pub fn codex_callback_page(status: u16, authorization: &CodexAuthorization) -> CodexCallbackPage {
+    let error_message = authorization
+        .error_description
+        .as_deref()
+        .or(authorization.error.as_deref())
+        .unwrap_or("Codex authentication failed: missing code or state mismatch.");
+    let (title, message) = match status {
+        200 => (
+            "Authorization Successful",
+            "You can close this window and return to Terminal.",
+        ),
+        400 => ("Authorization Failed", error_message),
+        _ => (
+            "Callback Not Found",
+            "This browser tab reached Browser Use, but the callback path was not recognized.",
+        ),
+    };
+
+    CodexCallbackPage {
+        status_text: http_status_text(status),
+        body: codex_callback_html(status, title, message),
+        message: message.to_string(),
+    }
+}
+
+fn http_status_text(status: u16) -> &'static str {
+    match status {
+        200 => "OK",
+        400 => "Bad Request",
+        404 => "Not Found",
+        _ => "Error",
+    }
+}
+
+fn codex_callback_html(status: u16, title: &str, message: &str) -> String {
+    let success = status == 200;
+    let title = escape_html(title);
+    let message = escape_html(message);
+    let body_copy = if success {
+        message.as_str()
+    } else {
+        "Return to the terminal and try signing in again."
+    };
+    let detail = if success {
+        String::new()
+    } else {
+        format!(r#"<div class="error">{message}</div>"#)
+    };
+    let script = if success {
+        r#"<script>setTimeout(() => window.close(), 2000);</script>"#
+    } else {
+        ""
+    };
+
+    format!(
+        r#"<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{title}</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Geist:wght@400;500;650&family=Geist+Mono:wght@400;500&display=swap" rel="stylesheet">
+  <style>
+    :root {{
+      color-scheme: light dark;
+      --bg: #ffffff;
+      --text: #111111;
+      --muted: #666666;
+      --detail-bg: #f5f5f5;
+      --detail-text: #444444;
+    }}
+    @media (prefers-color-scheme: dark) {{
+      :root {{
+        --bg: #000000;
+        --text: #eeeeee;
+        --muted: #9ca3af;
+        --detail-bg: #111111;
+        --detail-text: #b8b8b8;
+      }}
+    }}
+    html, body {{
+      width: 100%;
+      height: 100%;
+      overflow: hidden;
+    }}
+    body {{
+      margin: 0;
+      background: var(--bg);
+      color: var(--text);
+      font: 14px/1.5 "Geist", ui-sans-serif, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    }}
+    main {{
+      position: fixed;
+      top: 50%;
+      left: 50%;
+      width: min(460px, 100vw);
+      padding: 32px;
+      text-align: center;
+      transform: translate(-50%, -50%);
+    }}
+    h1 {{
+      margin: 0 0 8px;
+      color: var(--text);
+      font-size: 24px;
+      font-weight: 650;
+      line-height: 1.2;
+      letter-spacing: 0;
+    }}
+    p {{
+      margin: 0;
+      color: var(--muted);
+      font-size: 14px;
+    }}
+    .error {{
+      margin-top: 16px;
+      padding: 12px 14px;
+      border-radius: 8px;
+      background: var(--detail-bg);
+      color: var(--detail-text);
+      font: 12px/1.45 "Geist Mono", ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      overflow-wrap: anywhere;
+    }}
+  </style>
+</head>
+<body>
+  <main>
+    <h1>{title}</h1>
+    <p>{body_copy}</p>
+    {detail}
+  </main>
+  {script}
+</body>
+</html>"#
+    )
+}
+
+fn escape_html(value: &str) -> String {
+    let mut escaped = String::with_capacity(value.len());
+    for c in value.chars() {
+        match c {
+            '&' => escaped.push_str("&amp;"),
+            '<' => escaped.push_str("&lt;"),
+            '>' => escaped.push_str("&gt;"),
+            '"' => escaped.push_str("&quot;"),
+            '\'' => escaped.push_str("&#39;"),
+            _ => escaped.push(c),
+        }
+    }
+    escaped
 }
 
 pub fn parse_claude_code_authorization_input(value: &str) -> ClaudeCodeAuthorization {
@@ -2617,6 +2862,54 @@ pub fn parse_claude_code_authorization_input(value: &str) -> ClaudeCodeAuthoriza
         code: Some(stripped.to_string()),
         state: None,
     }
+}
+
+pub fn exchange_codex_authorization_code(code: &str, verifier: &str) -> Result<CodexManagedAuth> {
+    let body = form_body(&[
+        ("grant_type", "authorization_code"),
+        ("code", code),
+        ("redirect_uri", CODEX_REDIRECT_URI),
+        ("client_id", CODEX_OAUTH_CLIENT_ID),
+        ("code_verifier", verifier),
+    ]);
+    let response = reqwest::blocking::Client::new()
+        .post(CODEX_REFRESH_TOKEN_URL)
+        .header("Content-Type", "application/x-www-form-urlencoded")
+        .body(body)
+        .send()
+        .context("send Codex OAuth token request")?;
+    let status = response.status();
+    let text = response.text().context("read Codex OAuth token response")?;
+    if !status.is_success() {
+        bail!(
+            "Codex OAuth token request failed ({status}): {}",
+            truncate_error_body(&text)
+        );
+    }
+    let payload: CodexOAuthTokenResponse =
+        serde_json::from_str(&text).context("parse Codex OAuth token response")?;
+    let access_token = payload
+        .access_token
+        .filter(|value| !value.trim().is_empty())
+        .context("Codex OAuth response missing access_token")?;
+    let refresh_token = payload
+        .refresh_token
+        .filter(|value| !value.trim().is_empty())
+        .context("Codex OAuth response missing refresh_token")?;
+    let account_id = payload
+        .id_token
+        .as_deref()
+        .and_then(account_id_from_id_token)
+        .or_else(|| account_id_from_id_token(&access_token))
+        .context("Codex OAuth response missing account id")?;
+    Ok(CodexManagedAuth::new(CodexManagedAuthSnapshot {
+        access_token,
+        account_id,
+        id_token: payload.id_token,
+        refresh_token: Some(refresh_token),
+        source_path: None,
+        last_refresh: Some(Utc::now()),
+    }))
 }
 
 pub fn exchange_claude_code_authorization_code(
@@ -2698,12 +2991,15 @@ fn unix_ms_now() -> i64 {
 }
 
 fn form_url(base: &str, params: &[(&str, &str)]) -> String {
-    let query = params
+    format!("{base}?{}", form_body(params))
+}
+
+fn form_body(params: &[(&str, &str)]) -> String {
+    params
         .iter()
         .map(|(key, value)| format!("{}={}", percent_encode(key), percent_encode(value)))
         .collect::<Vec<_>>()
-        .join("&");
-    format!("{base}?{query}")
+        .join("&")
 }
 
 fn parse_form_pairs(value: &str) -> Vec<(String, String)> {
@@ -4071,12 +4367,12 @@ fn request_codex_token_refresh(
         .unwrap_or_else(|_| CODEX_REFRESH_TOKEN_URL.to_string());
     let response = client
         .post(endpoint)
-        .header("Content-Type", "application/json")
-        .json(&CodexRefreshRequest {
-            client_id: CODEX_OAUTH_CLIENT_ID,
-            grant_type: "refresh_token",
-            refresh_token,
-        })
+        .header("Content-Type", "application/x-www-form-urlencoded")
+        .body(form_body(&[
+            ("grant_type", "refresh_token"),
+            ("refresh_token", refresh_token.as_str()),
+            ("client_id", CODEX_OAUTH_CLIENT_ID),
+        ]))
         .send()
         .context("send Codex OAuth refresh request")?;
     let status = response.status();
@@ -4125,15 +4421,15 @@ fn extract_codex_refresh_error_code(body: &str) -> Option<String> {
         .map(ToOwned::to_owned)
 }
 
-#[derive(Serialize)]
-struct CodexRefreshRequest {
-    client_id: &'static str,
-    grant_type: &'static str,
-    refresh_token: String,
+#[derive(Debug, Deserialize)]
+struct CodexRefreshResponse {
+    id_token: Option<String>,
+    access_token: Option<String>,
+    refresh_token: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
-struct CodexRefreshResponse {
+struct CodexOAuthTokenResponse {
     id_token: Option<String>,
     access_token: Option<String>,
     refresh_token: Option<String>,
@@ -4173,7 +4469,19 @@ fn account_id_from_id_token(id_token: &str) -> Option<String> {
     let value: Value = serde_json::from_slice(&decoded).ok()?;
     value
         .get("chatgpt_account_id")
+        .or_else(|| {
+            value
+                .get("https://api.openai.com/auth")
+                .and_then(|auth| auth.get("chatgpt_account_id"))
+        })
         .or_else(|| value.get("account_id"))
+        .or_else(|| {
+            value
+                .get("organizations")
+                .and_then(Value::as_array)
+                .and_then(|organizations| organizations.first())
+                .and_then(|organization| organization.get("id"))
+        })
         .and_then(Value::as_str)
         .map(ToOwned::to_owned)
 }
@@ -12590,7 +12898,7 @@ mod tests {
             assert!(headers.starts_with("POST /oauth/token"));
             assert!(headers
                 .to_ascii_lowercase()
-                .contains("\r\ncontent-type: application/json"));
+                .contains("\r\ncontent-type: application/x-www-form-urlencoded"));
             let content_length = headers
                 .to_ascii_lowercase()
                 .lines()
@@ -12604,9 +12912,14 @@ mod tests {
                 }
                 request.extend_from_slice(&buf[..read]);
             }
-            let request_body: Value =
-                serde_json::from_slice(&request[header_end..header_end + content_length])
-                    .expect("refresh json request body");
+            let request_text =
+                String::from_utf8_lossy(&request[header_end..header_end + content_length]);
+            let request_body = Value::Object(
+                parse_form_pairs(&request_text)
+                    .into_iter()
+                    .map(|(key, value)| (key, Value::String(value)))
+                    .collect(),
+            );
             tx.send(request_body).expect("send refresh body");
             let response = format!(
                 "HTTP/1.1 {status} OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",

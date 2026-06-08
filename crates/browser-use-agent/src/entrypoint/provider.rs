@@ -1357,6 +1357,8 @@ fn build_tool_dispatcher_with_cwd_and_goal_store(
     )?;
     let browser_tool = BrowserTool::with_backend(browser_backend)
         .with_selected_browser_mode(config.options.browser_mode.clone())
+        .with_selected_browser_profile_id(config.options.browser_profile_id.clone())
+        .with_selected_local_browser(config.options.browser_local_browser.clone())
         .with_default_script_timeout_secs(config.options.python_tool_timeout_seconds);
     let browser_tool = match &user_input {
         Some((store, session_id)) => {

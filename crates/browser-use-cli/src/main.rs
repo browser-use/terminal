@@ -1,6 +1,6 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs;
-use std::io::{self, BufRead, Read, Write};
+use std::io::{self, BufRead, IsTerminal, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::sync::{
@@ -61,11 +61,14 @@ use browser_use_protocol::{
     session_result_from_events, task_from_events,
 };
 use browser_use_providers::{
-    claude_code_oauth_authorize_url, claude_code_oauth_pkce,
-    exchange_claude_code_authorization_code, load_codex_auth, load_codex_auth_file,
-    load_codex_managed_auth, load_codex_managed_auth_file, parse_claude_code_authorization_input,
+    claude_code_oauth_authorize_url, claude_code_oauth_pkce, codex_callback_page,
+    codex_callback_status, codex_oauth_authorize_url, codex_oauth_pkce, codex_oauth_state,
+    exchange_claude_code_authorization_code, exchange_codex_authorization_code, load_codex_auth,
+    load_codex_auth_file, load_codex_managed_auth, load_codex_managed_auth_file,
+    parse_claude_code_authorization_input, parse_codex_authorization_input,
     ClaudeCodeOAuthCredential, CodexAuth, CodexManagedAuth, CLAUDE_CODE_CALLBACK_HOST,
-    CLAUDE_CODE_CALLBACK_PATH, CLAUDE_CODE_CALLBACK_PORT,
+    CLAUDE_CODE_CALLBACK_PATH, CLAUDE_CODE_CALLBACK_PORT, CODEX_CALLBACK_HOST, CODEX_CALLBACK_PATH,
+    CODEX_CALLBACK_PORT,
 };
 use browser_use_python_worker::PythonWorker;
 use browser_use_runtime::{
@@ -73,23 +76,58 @@ use browser_use_runtime::{
     CompleteAgentRequest, CreateRootAgentRequest, Durability as RuntimeDurability,
     FailAgentRequest, LiveThreadPersistence, LocalRuntimeRequest, LocalRuntimeWaitTarget,
     MailboxDeliveryPhase as RuntimeMailboxDeliveryPhase, MailboxItemKind as RuntimeMailboxItemKind,
-    RunAgentRequest, RunId as RuntimeRunId, RuntimeHandle, RuntimeProjectionState, SessionId,
-    SpawnChildRequest, SqliteJournal, StateIndex, SubmitInputRequest,
+    RunAgentRequest, RunId as RuntimeRunId, RuntimeEvent, RuntimeHandle, RuntimeProjectionState,
+    SessionId, SpawnChildRequest, SqliteJournal, StateIndex, SubmitInputRequest,
 };
 #[cfg(test)]
 use browser_use_runtime::{AttachChildAgentRequest, AttachRootAgentRequest};
 use browser_use_store::{now_ms, resolve_state_dir, Store};
 use clap::{Parser, Subcommand, ValueEnum};
+use reqwest::Url;
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
+use serde_json::{json, Value};
 
 const MESSAGE_KIND_FOLLOWUP: &str = "followup";
+const SDK_PROTOCOL_VERSION: u64 = 1;
 const APPROX_CHARS_PER_TOKEN: usize = 4;
 const DATASET_BROWSER_CLEANUP_TIMEOUT: Duration = Duration::from_secs(15);
 const SDK_EVENT_STRING_LIMIT_BYTES: usize = 1_000_000;
 const SDK_JSON_RPC_FRAME_LIMIT_BYTES: usize = 8 * 1024 * 1024;
 const SDK_HISTORY_EVENTS_HEAD_COUNT: usize = 20;
 const SDK_HISTORY_EVENTS_INITIAL_TAIL_COUNT: usize = 400;
+
+fn should_color_stdout() -> bool {
+    io::stdout().is_terminal() && std::env::var_os("NO_COLOR").is_none()
+}
+
+fn ansi(text: impl AsRef<str>, code: &str) -> String {
+    let text = text.as_ref();
+    if should_color_stdout() {
+        format!("\x1b[{code}m{text}\x1b[0m")
+    } else {
+        text.to_string()
+    }
+}
+
+fn cli_heading(text: impl AsRef<str>) -> String {
+    ansi(text, "1;38;5;208")
+}
+
+fn cli_code(text: impl AsRef<str>) -> String {
+    ansi(text, "1;38;5;208")
+}
+
+fn cli_link(text: impl AsRef<str>) -> String {
+    ansi(text, "4;38;5;39")
+}
+
+fn cli_muted(text: impl AsRef<str>) -> String {
+    ansi(text, "2")
+}
+
+fn cli_success(text: impl AsRef<str>) -> String {
+    ansi(text, "1;32")
+}
 
 #[derive(Debug, Parser)]
 #[command(name = "browser-use-terminal", bin_name = "browser-use-terminal")]
@@ -202,11 +240,11 @@ enum Command {
         #[arg(long, default_value = "deepseek-v4-pro")]
         model: String,
     },
-    /// Run a task against the codex (chatgpt.com) backend via the Codex CLI login.
+    /// Run a task against the Codex (chatgpt.com) backend via Codex OAuth.
     ///
-    /// Credentials resolve env-first (`CODEX_ACCESS_TOKEN` + `CODEX_ACCOUNT_ID`),
-    /// then the credential store (`auth login codex` / `auth import-codex`), then
-    /// `~/.codex/auth.json`.
+    /// Credentials resolve env-first (`LLM_BROWSER_CODEX_ACCESS_TOKEN` +
+    /// `LLM_BROWSER_CODEX_ACCOUNT_ID`), then the credential store
+    /// (`auth login codex` / `auth import-codex`).
     RunCodex {
         text: String,
         #[arg(long, default_value = "gpt-5.1-codex")]
@@ -326,6 +364,19 @@ enum Command {
     Auth {
         #[command(subcommand)]
         command: AuthCommand,
+    },
+    /// Manage domain-scoped secrets (passwords + TOTP 2FA) for browser logins.
+    ///
+    /// Values are stored in the OS keychain; only metadata (domain, name, kind)
+    /// is kept in the app database. The agent only ever sees placeholder names.
+    Secrets {
+        #[command(subcommand)]
+        command: SecretsCommand,
+    },
+    /// Manage the navigation allow/deny policy enforced during browser tasks.
+    Domains {
+        #[command(subcommand)]
+        command: DomainsCommand,
     },
     Diagnostics,
     SdkServer {
@@ -569,6 +620,8 @@ enum AuthCommand {
         #[arg(long)]
         code: Option<String>,
         #[arg(long)]
+        device_code: bool,
+        #[arg(long)]
         no_browser: bool,
     },
     ImportCodex {
@@ -577,7 +630,75 @@ enum AuthCommand {
     },
     Logout {
         account: AuthAccount,
+        #[arg(long)]
+        local_only: bool,
     },
+}
+
+#[derive(Debug, Subcommand)]
+enum SecretsCommand {
+    /// Store a secret. Prompts for the value with no echo (or reads --stdin).
+    Set {
+        #[arg(long)]
+        domain: String,
+        #[arg(long)]
+        name: String,
+        /// Treat the value as a base32 TOTP seed (2FA), generating codes at fill time.
+        #[arg(long)]
+        totp: bool,
+        /// Extra domains this secret may also be used on (comma-separated).
+        #[arg(long, value_delimiter = ',')]
+        allow: Vec<String>,
+        /// Read the value from stdin instead of prompting (for scripted use).
+        #[arg(long)]
+        stdin: bool,
+    },
+    /// List configured secrets (metadata only — never values).
+    List,
+    /// Remove a secret.
+    Remove {
+        #[arg(long)]
+        domain: String,
+        #[arg(long)]
+        name: String,
+    },
+    /// Import saved logins (passwords + 2FA) live from 1Password.
+    ///
+    /// Reads Login items via the `op` CLI, which must be installed and signed in
+    /// (`op signin`). Each login becomes username/password/otp secrets.
+    Import,
+    /// Configure email one-time-code (2FA / verification) via AgentMail.
+    Email {
+        #[command(subcommand)]
+        action: EmailCommand,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum EmailCommand {
+    /// Store your AgentMail API token (prompts with no echo, or reads --stdin).
+    SetToken {
+        #[arg(long)]
+        stdin: bool,
+    },
+    /// Show whether email-2FA is configured and the inbox address.
+    Status,
+    /// Provision (if needed) and print the agent's inbox email address.
+    Address,
+    /// Remove the AgentMail token and cached inbox.
+    Clear,
+}
+
+#[derive(Debug, Subcommand)]
+enum DomainsCommand {
+    /// Allow navigation to a domain (and its subdomains). Supports `*.example.com`.
+    Allow { domain: String },
+    /// Block navigation to a domain (checked before the allow-list).
+    Deny { domain: String },
+    /// Show the current allow/deny lists.
+    List,
+    /// Clear both allow and deny lists.
+    Clear,
 }
 
 #[derive(Debug, Subcommand)]
@@ -883,6 +1004,8 @@ fn main() -> Result<()> {
             &config_overrides,
         ),
         Command::Auth { command } => auth(&store, command),
+        Command::Secrets { command } => secrets(&store, command),
+        Command::Domains { command } => domains(&store, command),
         Command::Diagnostics => diagnostics(&store),
         Command::SdkServer { .. } => unreachable!("sdk-server is handled before Store bootstrap"),
         Command::Trace { task_id, output } => trace(&store, &task_id, output),
@@ -1137,6 +1260,8 @@ fn command_name(command: &Command) -> &'static str {
         Command::Import { .. } => "import",
         Command::Config { .. } => "config",
         Command::Auth { .. } => "auth",
+        Command::Secrets { .. } => "secrets",
+        Command::Domains { .. } => "domains",
         Command::Diagnostics => "diagnostics",
         Command::SdkServer { .. } => "sdk_server",
         Command::Trace { .. } => "trace",
@@ -3019,6 +3144,7 @@ fn run_cookie_sync_browser_command(store: &Store, args: &[String]) -> Result<Val
     let artifact_root = cli_browser_artifact_root(store)?;
     let options = browser_use_browser::BrowserCommandOptions {
         browser_use_api_key,
+        browser_use_api_url: Some(browser_use_cloud_api_base_url()),
     };
     Ok(browser_use_browser::run_browser_command_with_options(
         "cli-browser",
@@ -3311,7 +3437,194 @@ fn is_secret_setting(key: &str) -> bool {
 }
 
 const BROWSER_USE_CLOUD_API_KEY_SETTING: &str = "auth.browser_use_cloud.api_key";
+const BROWSER_USE_CLOUD_API_KEY_ID_SETTING: &str = "auth.browser_use_cloud.api_key_id";
+const BROWSER_USE_CLOUD_API_KEY_SOURCE_SETTING: &str = "auth.browser_use_cloud.api_key_source";
+const BROWSER_USE_CLOUD_API_KEY_PROJECT_SETTING: &str = "auth.browser_use_cloud.project_id";
+const BROWSER_USE_CLOUD_API_KEY_EXPIRES_SETTING: &str = "auth.browser_use_cloud.expires_at";
+const BROWSER_USE_CLOUD_API_KEY_SCOPES_SETTING: &str = "auth.browser_use_cloud.scopes";
 const BROWSER_USE_CLOUD_API_KEY_ENV: &str = "BROWSER_USE_API_KEY";
+const BROWSER_USE_CLOUD_API_URL_ENV: &str = "BROWSER_USE_CLOUD_API_URL";
+const BROWSER_USE_CLOUD_DEFAULT_API_URL: &str = "https://api.browser-use.com";
+const BROWSER_USE_CLOUD_LOCAL_API_URL: &str = "http://localhost:8000";
+const BROWSER_USE_CLOUD_LOCAL_APP_URL: &str = "http://localhost:3000";
+const BROWSER_USE_CLOUD_DEVICE_GRANT_TYPE: &str = "urn:ietf:params:oauth:grant-type:device_code";
+const BROWSER_USE_CLOUD_AUTHORIZATION_CODE_GRANT_TYPE: &str = "authorization_code";
+const BROWSER_USE_CLOUD_CLIENT_ID: &str = "browser-use-terminal";
+const BROWSER_USE_CLOUD_CALLBACK_PATH: &str = "/browser-use-cloud/callback";
+
+fn secrets(store: &Store, command: SecretsCommand) -> Result<()> {
+    use browser_use_agent::tools::handlers::secrets_admin as sa;
+    match command {
+        SecretsCommand::Set {
+            domain,
+            name,
+            totp,
+            allow,
+            stdin,
+        } => {
+            let kind = if totp {
+                sa::Kind::Totp
+            } else {
+                sa::Kind::Password
+            };
+            let value = if stdin {
+                let mut buf = String::new();
+                std::io::Read::read_to_string(&mut std::io::stdin(), &mut buf)?;
+                buf.trim_end_matches(['\n', '\r']).to_string()
+            } else {
+                let prompt = if totp {
+                    format!("Base32 TOTP seed for {name} @ {domain} (hidden): ")
+                } else {
+                    format!("Value for {name} @ {domain} (hidden): ")
+                };
+                rpassword::prompt_password(prompt)?
+            };
+            let meta = sa::set_secret_active(store, &domain, &name, kind, allow, &value)?;
+            println!(
+                "Stored {} secret {:?} for {} (encrypted file).",
+                meta.kind.as_str(),
+                meta.placeholder,
+                meta.domain
+            );
+            Ok(())
+        }
+        SecretsCommand::List => {
+            let metas = sa::list_secrets(store)?;
+            if metas.is_empty() {
+                println!(
+                    "No secrets configured. Add one with `secrets set --domain <d> --name <n>`."
+                );
+                return Ok(());
+            }
+            println!("{:<28} {:<18} {}", "DOMAIN", "NAME", "KIND");
+            for meta in metas {
+                let extra = if meta.allowed_domains.is_empty() {
+                    String::new()
+                } else {
+                    format!("  (+{})", meta.allowed_domains.join(", "))
+                };
+                println!(
+                    "{:<28} {:<18} {}{}",
+                    meta.domain,
+                    meta.placeholder,
+                    meta.kind.as_str(),
+                    extra
+                );
+            }
+            Ok(())
+        }
+        SecretsCommand::Remove { domain, name } => {
+            if sa::remove_secret_active(store, &domain, &name)? {
+                println!("Removed secret {name:?} for {domain}.");
+            } else {
+                println!("No secret {name:?} found for {domain}.");
+            }
+            Ok(())
+        }
+        SecretsCommand::Import => {
+            use browser_use_agent::tools::handlers::secrets_import as si;
+            let stats = si::import_1password(store)?;
+            if stats.changed_logins() == 0 {
+                println!(
+                    "Already up to date — {} login(s) from 1Password, nothing new.",
+                    stats.unchanged_logins
+                );
+            } else {
+                println!(
+                    "Synced 1Password: {} new, {} updated ({} unchanged).",
+                    stats.new_logins, stats.updated_logins, stats.unchanged_logins
+                );
+            }
+            Ok(())
+        }
+        SecretsCommand::Email { action } => secrets_email(store, action),
+    }
+}
+
+fn secrets_email(store: &Store, command: EmailCommand) -> Result<()> {
+    use browser_use_agent::tools::handlers::secrets_admin as sa;
+    match command {
+        EmailCommand::SetToken { stdin } => {
+            let token = if stdin {
+                let mut buf = String::new();
+                std::io::Read::read_to_string(&mut std::io::stdin(), &mut buf)?;
+                buf.trim().to_string()
+            } else {
+                rpassword::prompt_password("AgentMail API token (hidden): ")?
+            };
+            sa::set_agentmail_token(store, &token)?;
+            println!("Saved AgentMail token. Run `secrets email address` to provision the inbox.");
+            Ok(())
+        }
+        EmailCommand::Status => {
+            if sa::email_2fa_configured(store) {
+                match store.get_setting(sa::AGENTMAIL_INBOX_KEY)? {
+                    Some(inbox) if !inbox.is_empty() => {
+                        println!("Email 2FA: configured (AgentMail). Inbox: {inbox}")
+                    }
+                    _ => println!(
+                        "Email 2FA: configured (AgentMail). Inbox not provisioned yet — run `secrets email address`."
+                    ),
+                }
+            } else {
+                println!("Email 2FA: not configured. Set a token with `secrets email set-token`.");
+            }
+            Ok(())
+        }
+        EmailCommand::Address => {
+            let inbox = sa::agentmail_inbox_address(store)?;
+            println!("{inbox}");
+            Ok(())
+        }
+        EmailCommand::Clear => {
+            sa::clear_agentmail_token(store)?;
+            println!("Removed AgentMail token and cached inbox.");
+            Ok(())
+        }
+    }
+}
+
+fn domains(store: &Store, command: DomainsCommand) -> Result<()> {
+    use browser_use_agent::tools::handlers::secrets_admin as sa;
+    match command {
+        DomainsCommand::Allow { domain } => {
+            let list = sa::add_domain(store, &domain, true)?;
+            println!("Allowed domains: {}", list.join(", "));
+            Ok(())
+        }
+        DomainsCommand::Deny { domain } => {
+            let list = sa::add_domain(store, &domain, false)?;
+            println!("Denied domains: {}", list.join(", "));
+            Ok(())
+        }
+        DomainsCommand::List => {
+            let (allow, deny) = sa::list_domains(store)?;
+            println!(
+                "Allowed: {}",
+                if allow.is_empty() {
+                    "(none — navigation is unrestricted until you allow or deny a domain)"
+                        .to_string()
+                } else {
+                    allow.join(", ")
+                }
+            );
+            println!(
+                "Denied:  {}",
+                if deny.is_empty() {
+                    "(none)".to_string()
+                } else {
+                    deny.join(", ")
+                }
+            );
+            Ok(())
+        }
+        DomainsCommand::Clear => {
+            sa::clear_domains(store)?;
+            println!("Cleared the navigation allow/deny lists.");
+            Ok(())
+        }
+    }
+}
 
 fn auth(store: &Store, command: AuthCommand) -> Result<()> {
     match command {
@@ -3356,6 +3669,7 @@ fn auth(store: &Store, command: AuthCommand) -> Result<()> {
             access_token,
             account_id,
             code,
+            device_code,
             no_browser,
         } => auth_login(
             store,
@@ -3364,6 +3678,7 @@ fn auth(store: &Store, command: AuthCommand) -> Result<()> {
             access_token,
             account_id,
             code,
+            device_code,
             no_browser,
         ),
         AuthCommand::ImportCodex { input } => {
@@ -3390,8 +3705,11 @@ fn auth(store: &Store, command: AuthCommand) -> Result<()> {
             println!("Codex login: imported account {}", auth.account_id);
             Ok(())
         }
-        AuthCommand::Logout { account } => {
-            auth_logout(store, account)?;
+        AuthCommand::Logout {
+            account,
+            local_only,
+        } => {
+            auth_logout(store, account, local_only)?;
             println!("{}: logged out", auth_account_label(account));
             Ok(())
         }
@@ -3413,6 +3731,68 @@ fn print_auth_line(label: &str, connected: bool) {
     println!("{label}: {status}");
 }
 
+#[derive(Debug, Deserialize)]
+struct BrowserUseCloudDeviceStartResponse {
+    device_code: String,
+    user_code: String,
+    verification_uri: String,
+    expires_in: u64,
+    interval: u64,
+}
+
+#[derive(Debug, Serialize)]
+struct BrowserUseCloudDeviceStartRequest {
+    device_name: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct BrowserUseCloudDeviceTokenRequest<'a> {
+    grant_type: &'a str,
+    device_code: &'a str,
+}
+
+#[derive(Debug, Serialize)]
+struct BrowserUseCloudBrowserStartRequest<'a> {
+    client_id: &'a str,
+    response_type: &'a str,
+    redirect_uri: &'a str,
+    code_challenge: &'a str,
+    code_challenge_method: &'a str,
+    state: &'a str,
+    device_name: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct BrowserUseCloudBrowserStartResponse {
+    authorization_uri: String,
+    expires_in: u64,
+}
+
+#[derive(Debug, Serialize)]
+struct BrowserUseCloudAuthorizationCodeTokenRequest<'a> {
+    grant_type: &'a str,
+    code: &'a str,
+    redirect_uri: &'a str,
+    code_verifier: &'a str,
+    client_id: &'a str,
+}
+
+#[derive(Debug, Deserialize)]
+struct BrowserUseCloudTokenResponse {
+    api_key: String,
+    api_key_id: String,
+    project_id: String,
+    expires_at: Option<String>,
+    scopes: Vec<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct BrowserUseCloudTokenError {
+    error: String,
+    error_description: Option<String>,
+    interval: Option<u64>,
+}
+
 fn auth_login(
     store: &Store,
     account: AuthAccount,
@@ -3420,16 +3800,43 @@ fn auth_login(
     access_token: Option<String>,
     account_id: Option<String>,
     code: Option<String>,
+    device_code: bool,
     no_browser: bool,
 ) -> Result<()> {
     match account {
         AuthAccount::BrowserUseCloud => {
-            let api_key =
-                read_required_secret(api_key, &format!("{} API key", auth_account_label(account)))?;
-            let key = api_key_setting(account).context("account does not use an API key")?;
-            store.set_setting(key, api_key.trim())?;
+            if let Some(api_key) = api_key {
+                let api_key = read_required_secret(
+                    Some(api_key),
+                    &format!("{} API key", auth_account_label(account)),
+                )?;
+                store_browser_use_cloud_api_key(store, api_key.trim(), None)?;
+                println!(
+                    "{}: connected (stored API key)",
+                    auth_account_label(account)
+                );
+                return Ok(());
+            }
+            if code.is_some() {
+                bail!(
+                    "auth login browser-use-cloud uses --device-code for manual sign-in; --code is for Claude Code OAuth"
+                );
+            }
+            let credential = if device_code {
+                browser_use_cloud_device_login(!no_browser)?
+            } else {
+                browser_use_cloud_browser_login(!no_browser)?
+            };
+            store_browser_use_cloud_api_key(store, &credential.api_key, Some(&credential))?;
             store.set_setting("browser", "Browser Use Cloud")?;
-            println!("{}: connected (stored)", auth_account_label(account));
+            println!(
+                "{} {}",
+                cli_success(format!(
+                    "{}: connected to project",
+                    auth_account_label(account)
+                )),
+                credential.project_id
+            );
             Ok(())
         }
         AuthAccount::Openai
@@ -3446,27 +3853,23 @@ fn auth_login(
         }
         AuthAccount::Codex => {
             let auth = if access_token.is_some() || account_id.is_some() {
-                CodexAuth {
-                    access_token: access_token
+                CodexManagedAuth::from_stored_parts(
+                    access_token
                         .context("auth login codex requires --access-token with --account-id")?,
-                    account_id: account_id
+                    account_id
                         .context("auth login codex requires --account-id with --access-token")?,
-                }
+                    None,
+                    None,
+                    None,
+                    None,
+                )
             } else {
-                match load_codex_managed_auth() {
-                    Ok(managed_auth) => {
-                        let auth = managed_auth.current_auth()?;
-                        store_codex_managed_auth(store, &managed_auth)?;
-                        store.set_setting("account", "Codex login")?;
-                        println!("Codex login: connected account {}", auth.account_id);
-                        return Ok(());
-                    }
-                    Err(_) => load_codex_auth().context("load external Codex auth for login")?,
-                }
+                codex_login(code, !no_browser)?
             };
-            store_codex_auth(store, &auth)?;
+            let current = auth.current_auth()?;
+            store_codex_managed_auth(store, &auth)?;
             store.set_setting("account", "Codex login")?;
-            println!("Codex login: connected account {}", auth.account_id);
+            println!("Codex login: connected account {}", current.account_id);
             Ok(())
         }
         AuthAccount::ClaudeCode => {
@@ -3479,7 +3882,338 @@ fn auth_login(
     }
 }
 
-fn auth_logout(store: &Store, account: AuthAccount) -> Result<()> {
+fn browser_use_cloud_api_base_url() -> String {
+    if let Some(url) = std::env::var(BROWSER_USE_CLOUD_API_URL_ENV)
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+    {
+        return normalize_browser_use_cloud_url(&url);
+    }
+
+    if browser_use_cloud_local_dev_available() {
+        return BROWSER_USE_CLOUD_LOCAL_API_URL.to_string();
+    }
+
+    BROWSER_USE_CLOUD_DEFAULT_API_URL.to_string()
+}
+
+fn normalize_browser_use_cloud_url(url: &str) -> String {
+    url.trim().trim_end_matches('/').to_string()
+}
+
+fn browser_use_cloud_local_dev_available() -> bool {
+    let Ok(client) = reqwest::blocking::Client::builder()
+        .timeout(Duration::from_millis(700))
+        .build()
+    else {
+        return false;
+    };
+
+    browser_use_cloud_local_backend_available(&client)
+        && browser_use_cloud_local_frontend_available(&client)
+}
+
+fn browser_use_cloud_local_backend_available(client: &reqwest::blocking::Client) -> bool {
+    let version_ok = client
+        .get(format!(
+            "{BROWSER_USE_CLOUD_LOCAL_API_URL}/browser-use-version"
+        ))
+        .send()
+        .is_ok_and(|response| response.status().is_success());
+    if !version_ok {
+        return false;
+    }
+
+    client
+        .get(format!(
+            "{BROWSER_USE_CLOUD_LOCAL_API_URL}/cloud/cli-auth/device/0000-0000"
+        ))
+        .send()
+        .is_ok_and(|response| response.status() == reqwest::StatusCode::UNAUTHORIZED)
+}
+
+fn browser_use_cloud_local_frontend_available(client: &reqwest::blocking::Client) -> bool {
+    client
+        .head(format!("{BROWSER_USE_CLOUD_LOCAL_APP_URL}/device"))
+        .send()
+        .is_ok_and(|response| response.status().is_success())
+}
+
+fn browser_use_cloud_device_name() -> Option<String> {
+    std::env::var("HOSTNAME")
+        .or_else(|_| std::env::var("COMPUTERNAME"))
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
+fn browser_use_cloud_browser_login(open_browser: bool) -> Result<BrowserUseCloudTokenResponse> {
+    let base_url = browser_use_cloud_api_base_url();
+    let client = reqwest::blocking::Client::builder()
+        .timeout(Duration::from_secs(15))
+        .build()
+        .context("build Browser Use Cloud auth client")?;
+    let (code_verifier, code_challenge) = claude_code_oauth_pkce();
+    let (state, _) = claude_code_oauth_pkce();
+    let (tx, rx) = mpsc::channel();
+    let (_callback, redirect_uri) = start_browser_use_cloud_callback_server(state.clone(), tx)?;
+
+    let start = client
+        .post(format!("{base_url}/cloud/cli-auth/browser"))
+        .json(&BrowserUseCloudBrowserStartRequest {
+            client_id: BROWSER_USE_CLOUD_CLIENT_ID,
+            response_type: "code",
+            redirect_uri: &redirect_uri,
+            code_challenge: &code_challenge,
+            code_challenge_method: "S256",
+            state: &state,
+            device_name: browser_use_cloud_device_name(),
+        })
+        .send()
+        .context("start Browser Use Cloud browser authorization")?
+        .error_for_status()
+        .context("start Browser Use Cloud browser authorization")?
+        .json::<BrowserUseCloudBrowserStartResponse>()
+        .context("parse Browser Use Cloud browser authorization")?;
+
+    println!("{}", cli_heading("Browser Use Cloud sign-in"));
+    println!();
+    println!(
+        "{} {}",
+        cli_muted("Open:"),
+        cli_link(&start.authorization_uri)
+    );
+    println!(
+        "{}",
+        cli_muted(format!(
+            "Waiting for browser approval on {redirect_uri} ..."
+        ))
+    );
+    println!();
+    println!(
+        "{}",
+        cli_muted("If the browser does not open, open the URL above.")
+    );
+    if open_browser {
+        if let Err(error) = open::that(&start.authorization_uri) {
+            eprintln!("Could not open browser automatically: {error}");
+        }
+    }
+
+    let authorization = rx
+        .recv_timeout(Duration::from_secs(start.expires_in.max(1)))
+        .context("timed out waiting for Browser Use Cloud browser approval")??;
+    if authorization.state.as_deref() != Some(&state) {
+        bail!("Browser Use Cloud OAuth state mismatch");
+    }
+    if let Some(error) = authorization.error {
+        let description = authorization
+            .error_description
+            .unwrap_or_else(|| "Browser Use Cloud sign-in was denied".to_string());
+        bail!("{description} ({error})");
+    }
+    let code = authorization
+        .code
+        .context("Browser Use Cloud authorization code was missing")?;
+
+    let response = client
+        .post(format!("{base_url}/cloud/cli-auth/token"))
+        .json(&BrowserUseCloudAuthorizationCodeTokenRequest {
+            grant_type: BROWSER_USE_CLOUD_AUTHORIZATION_CODE_GRANT_TYPE,
+            code: &code,
+            redirect_uri: &redirect_uri,
+            code_verifier: &code_verifier,
+            client_id: BROWSER_USE_CLOUD_CLIENT_ID,
+        })
+        .send()
+        .context("exchange Browser Use Cloud authorization code")?;
+    if response.status().is_success() {
+        return response
+            .json::<BrowserUseCloudTokenResponse>()
+            .context("parse Browser Use Cloud browser token");
+    }
+    let status = response.status();
+    let text = response.text().unwrap_or_default();
+    let error = serde_json::from_str::<BrowserUseCloudTokenError>(&text).unwrap_or(
+        BrowserUseCloudTokenError {
+            error: "server_error".to_string(),
+            error_description: Some(format!(
+                "Browser Use Cloud returned {status} during authorization code exchange"
+            )),
+            interval: None,
+        },
+    );
+    bail!(
+        "{}",
+        error
+            .error_description
+            .unwrap_or_else(|| format!("Browser Use Cloud sign-in failed: {}", error.error))
+    )
+}
+
+fn browser_use_cloud_device_login(open_browser: bool) -> Result<BrowserUseCloudTokenResponse> {
+    let base_url = browser_use_cloud_api_base_url();
+    let client = reqwest::blocking::Client::builder()
+        .timeout(Duration::from_secs(15))
+        .build()
+        .context("build Browser Use Cloud auth client")?;
+    let start = client
+        .post(format!("{base_url}/cloud/cli-auth/device"))
+        .json(&BrowserUseCloudDeviceStartRequest {
+            device_name: browser_use_cloud_device_name(),
+        })
+        .send()
+        .context("start Browser Use Cloud device authorization")?
+        .error_for_status()
+        .context("start Browser Use Cloud device authorization")?
+        .json::<BrowserUseCloudDeviceStartResponse>()
+        .context("parse Browser Use Cloud device authorization")?;
+
+    println!("{}", cli_heading("Browser Use Cloud sign-in"));
+    println!();
+    println!(
+        "{} {}",
+        cli_muted("Open:"),
+        cli_link(&start.verification_uri)
+    );
+    println!("{} {}", cli_muted("Code:"), cli_code(&start.user_code));
+    println!();
+    println!(
+        "{}",
+        cli_muted(format!(
+            "If the browser does not open, go to {} and enter the code.",
+            start.verification_uri
+        ))
+    );
+    if open_browser {
+        if let Err(error) = open::that(&start.verification_uri) {
+            eprintln!("Could not open browser automatically: {error}");
+        }
+    }
+
+    let deadline = Instant::now() + Duration::from_secs(start.expires_in);
+    let mut interval = Duration::from_secs(start.interval.max(1));
+    while Instant::now() < deadline {
+        thread::sleep(interval);
+        let response = match client
+            .post(format!("{base_url}/cloud/cli-auth/token"))
+            .json(&BrowserUseCloudDeviceTokenRequest {
+                grant_type: BROWSER_USE_CLOUD_DEVICE_GRANT_TYPE,
+                device_code: &start.device_code,
+            })
+            .send()
+        {
+            Ok(response) => response,
+            Err(_) => continue,
+        };
+        if response.status().is_success() {
+            return response
+                .json::<BrowserUseCloudTokenResponse>()
+                .context("parse Browser Use Cloud device token");
+        }
+
+        let status = response.status();
+        let text = response.text().unwrap_or_default();
+        let error = serde_json::from_str::<BrowserUseCloudTokenError>(&text).unwrap_or(
+            BrowserUseCloudTokenError {
+                error: "server_error".to_string(),
+                error_description: Some(format!(
+                    "Browser Use Cloud returned {status} during device authorization"
+                )),
+                interval: None,
+            },
+        );
+        match error.error.as_str() {
+            "authorization_pending" => {}
+            "slow_down" => {
+                interval = Duration::from_secs(error.interval.unwrap_or(10).max(1));
+            }
+            "access_denied" => bail!(
+                "{}",
+                error
+                    .error_description
+                    .unwrap_or_else(|| "Browser Use Cloud sign-in was denied".to_string())
+            ),
+            "expired_token" => bail!(
+                "{}",
+                error
+                    .error_description
+                    .unwrap_or_else(|| "Browser Use Cloud sign-in expired".to_string())
+            ),
+            _ => bail!(
+                "{}",
+                error.error_description.unwrap_or_else(|| format!(
+                    "Browser Use Cloud sign-in failed: {}",
+                    error.error
+                ))
+            ),
+        }
+    }
+    bail!("Browser Use Cloud sign-in expired")
+}
+
+fn store_browser_use_cloud_api_key(
+    store: &Store,
+    api_key: &str,
+    credential: Option<&BrowserUseCloudTokenResponse>,
+) -> Result<()> {
+    store.set_setting(BROWSER_USE_CLOUD_API_KEY_SETTING, api_key.trim())?;
+    store.set_setting("browser", "Browser Use Cloud")?;
+    if let Some(credential) = credential {
+        store.set_setting(BROWSER_USE_CLOUD_API_KEY_SOURCE_SETTING, "cli_login")?;
+        store.set_setting(BROWSER_USE_CLOUD_API_KEY_ID_SETTING, &credential.api_key_id)?;
+        store.set_setting(
+            BROWSER_USE_CLOUD_API_KEY_PROJECT_SETTING,
+            &credential.project_id,
+        )?;
+        if let Some(expires_at) = credential.expires_at.as_deref() {
+            store.set_setting(BROWSER_USE_CLOUD_API_KEY_EXPIRES_SETTING, expires_at)?;
+        } else {
+            store.delete_setting(BROWSER_USE_CLOUD_API_KEY_EXPIRES_SETTING)?;
+        }
+        store.set_setting(
+            BROWSER_USE_CLOUD_API_KEY_SCOPES_SETTING,
+            &serde_json::to_string(&credential.scopes)?,
+        )?;
+    } else {
+        store.set_setting(BROWSER_USE_CLOUD_API_KEY_SOURCE_SETTING, "manual")?;
+        store.delete_setting(BROWSER_USE_CLOUD_API_KEY_ID_SETTING)?;
+        store.delete_setting(BROWSER_USE_CLOUD_API_KEY_PROJECT_SETTING)?;
+        store.delete_setting(BROWSER_USE_CLOUD_API_KEY_EXPIRES_SETTING)?;
+        store.delete_setting(BROWSER_USE_CLOUD_API_KEY_SCOPES_SETTING)?;
+    }
+    Ok(())
+}
+
+fn revoke_browser_use_cloud_api_key(api_key: &str) -> Result<()> {
+    let base_url = browser_use_cloud_api_base_url();
+    let response = reqwest::blocking::Client::builder()
+        .timeout(Duration::from_secs(15))
+        .build()
+        .context("build Browser Use Cloud auth client")?
+        .delete(format!("{base_url}/cloud/cli-auth/current-key"))
+        .header("X-Browser-Use-API-Key", api_key.trim())
+        .send()
+        .context("revoke Browser Use Cloud API key")?;
+    if response.status().is_success() {
+        return Ok(());
+    }
+    let status = response.status();
+    let body = response.text().unwrap_or_default();
+    bail!("Browser Use Cloud key revocation failed with {status}: {body}")
+}
+
+fn clear_browser_use_cloud_api_key(store: &Store) -> Result<()> {
+    store.delete_setting(BROWSER_USE_CLOUD_API_KEY_SETTING)?;
+    store.delete_setting(BROWSER_USE_CLOUD_API_KEY_ID_SETTING)?;
+    store.delete_setting(BROWSER_USE_CLOUD_API_KEY_SOURCE_SETTING)?;
+    store.delete_setting(BROWSER_USE_CLOUD_API_KEY_PROJECT_SETTING)?;
+    store.delete_setting(BROWSER_USE_CLOUD_API_KEY_EXPIRES_SETTING)?;
+    store.delete_setting(BROWSER_USE_CLOUD_API_KEY_SCOPES_SETTING)?;
+    Ok(())
+}
+
+fn auth_logout(store: &Store, account: AuthAccount, local_only: bool) -> Result<()> {
     match account {
         AuthAccount::Codex => {
             store.delete_setting("auth.codex.access_token")?;
@@ -3498,7 +4232,16 @@ fn auth_logout(store: &Store, account: AuthAccount) -> Result<()> {
             }
         }
         AuthAccount::BrowserUseCloud => {
-            store.delete_setting(BROWSER_USE_CLOUD_API_KEY_SETTING)?;
+            let source = store.get_setting(BROWSER_USE_CLOUD_API_KEY_SOURCE_SETTING)?;
+            let api_key = store.get_setting(BROWSER_USE_CLOUD_API_KEY_SETTING)?;
+            if !local_only && source.as_deref() == Some("cli_login") {
+                if let Some(api_key) = api_key.as_deref().filter(|value| !value.trim().is_empty()) {
+                    revoke_browser_use_cloud_api_key(api_key).with_context(|| {
+                        "remote revocation failed; rerun with --local-only to remove only the local credential"
+                    })?;
+                }
+            }
+            clear_browser_use_cloud_api_key(store)?;
         }
         AuthAccount::ClaudeCode => {
             store.delete_setting("auth.claude_code.access_token")?;
@@ -3527,6 +4270,35 @@ fn read_required_secret(value: Option<String>, prompt: &str) -> Result<String> {
         bail!("{prompt} cannot be empty");
     }
     Ok(trimmed)
+}
+
+fn codex_login(code: Option<String>, open_browser: bool) -> Result<CodexManagedAuth> {
+    if code.is_some() {
+        bail!("Codex OAuth --code is not supported because PKCE requires the verifier from the generated login URL");
+    }
+
+    let (verifier, challenge) = codex_oauth_pkce();
+    let state = codex_oauth_state();
+    let (tx, rx) = mpsc::channel();
+    let _callback = start_codex_callback_server(state.clone(), tx)?;
+    let url = codex_oauth_authorize_url(&challenge, &state);
+    println!("Open this URL to login with Codex OAuth:\n");
+    println!("{url}");
+    println!(
+        "\nWaiting for browser callback on http://localhost:{CODEX_CALLBACK_PORT}{CODEX_CALLBACK_PATH} ..."
+    );
+    if open_browser {
+        if let Err(error) = open::that(&url) {
+            eprintln!("Could not open browser automatically: {error}");
+        }
+    }
+    let parsed = rx
+        .recv_timeout(Duration::from_secs(300))
+        .context("timed out waiting for Codex browser callback")??;
+    let auth_code = parsed
+        .code
+        .context("Codex authorization code was missing")?;
+    exchange_codex_authorization_code(&auth_code, &verifier)
 }
 
 fn claude_code_login(
@@ -3591,6 +4363,205 @@ impl Drop for CallbackServerHandle {
         if let Some(thread) = self.thread.take() {
             let _ = thread.join();
         }
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct BrowserUseCloudAuthorization {
+    code: Option<String>,
+    state: Option<String>,
+    error: Option<String>,
+    error_description: Option<String>,
+}
+
+fn start_browser_use_cloud_callback_server(
+    expected_state: String,
+    sender: mpsc::Sender<Result<BrowserUseCloudAuthorization>>,
+) -> Result<(CallbackServerHandle, String)> {
+    let listener = TcpListener::bind(("127.0.0.1", 0))
+        .context("bind Browser Use Cloud OAuth callback on 127.0.0.1")?;
+    let redirect_uri = format!(
+        "http://127.0.0.1:{}{}",
+        listener
+            .local_addr()
+            .context("read Browser Use Cloud OAuth callback address")?
+            .port(),
+        BROWSER_USE_CLOUD_CALLBACK_PATH
+    );
+    listener
+        .set_nonblocking(true)
+        .context("configure Browser Use Cloud OAuth callback listener")?;
+    let (stop_tx, stop_rx) = mpsc::channel::<()>();
+    let thread = std::thread::spawn(move || {
+        let deadline = Instant::now() + Duration::from_secs(900);
+        loop {
+            if stop_rx.try_recv().is_ok() || Instant::now() >= deadline {
+                break;
+            }
+            match listener.accept() {
+                Ok((mut stream, _)) => {
+                    let result = handle_browser_use_cloud_callback(&mut stream, &expected_state);
+                    let _ = sender.send(result);
+                    break;
+                }
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                    std::thread::sleep(Duration::from_millis(50));
+                }
+                Err(error) => {
+                    let _ =
+                        sender.send(Err(error).context("accept Browser Use Cloud OAuth callback"));
+                    break;
+                }
+            }
+        }
+    });
+    Ok((
+        CallbackServerHandle {
+            stop: stop_tx,
+            thread: Some(thread),
+        },
+        redirect_uri,
+    ))
+}
+
+fn handle_browser_use_cloud_callback(
+    stream: &mut TcpStream,
+    expected_state: &str,
+) -> Result<BrowserUseCloudAuthorization> {
+    let mut request = [0_u8; 4096];
+    let read = stream
+        .read(&mut request)
+        .context("read Browser Use Cloud OAuth callback")?;
+    let request = String::from_utf8_lossy(&request[..read]);
+    let path = request
+        .lines()
+        .next()
+        .and_then(|line| line.split_whitespace().nth(1))
+        .context("parse Browser Use Cloud OAuth callback request")?;
+    let parsed = parse_browser_use_cloud_authorization_path(path)?;
+    let callback_path = Url::parse(&format!("http://127.0.0.1{path}"))
+        .ok()
+        .map(|url| url.path().to_string())
+        .unwrap_or_default();
+    let status = if callback_path != BROWSER_USE_CLOUD_CALLBACK_PATH {
+        404
+    } else if parsed.state.as_deref() != Some(expected_state) {
+        400
+    } else if parsed.code.is_none() && parsed.error.is_none() {
+        400
+    } else {
+        200
+    };
+    let text = match status {
+        200 if parsed.error.is_some() => {
+            "Browser Use Cloud authorization was cancelled. You can close this window."
+        }
+        200 => "Browser Use Cloud authentication completed. You can close this window.",
+        400 => "Browser Use Cloud authentication failed: missing code or state mismatch.",
+        _ => "Browser Use Cloud callback route not found.",
+    };
+    let body = format!("<html><body><p>{text}</p></body></html>");
+    let reason = match status {
+        200 => "OK",
+        400 => "Bad Request",
+        _ => "Not Found",
+    };
+    let response = format!(
+        "HTTP/1.1 {status} {reason}\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        body.len()
+    );
+    stream.write_all(response.as_bytes()).ok();
+    if status == 200 {
+        Ok(parsed)
+    } else {
+        bail!("{text}")
+    }
+}
+
+fn parse_browser_use_cloud_authorization_path(path: &str) -> Result<BrowserUseCloudAuthorization> {
+    let url = Url::parse(&format!("http://127.0.0.1{path}"))
+        .context("parse Browser Use Cloud OAuth callback URL")?;
+    let mut authorization = BrowserUseCloudAuthorization::default();
+    for (key, value) in url.query_pairs() {
+        match key.as_ref() {
+            "code" => authorization.code = Some(value.into_owned()),
+            "state" => authorization.state = Some(value.into_owned()),
+            "error" => authorization.error = Some(value.into_owned()),
+            "error_description" => authorization.error_description = Some(value.into_owned()),
+            _ => {}
+        }
+    }
+    Ok(authorization)
+}
+
+fn start_codex_callback_server(
+    expected_state: String,
+    sender: mpsc::Sender<Result<browser_use_providers::CodexAuthorization>>,
+) -> Result<CallbackServerHandle> {
+    let listener =
+        TcpListener::bind((CODEX_CALLBACK_HOST, CODEX_CALLBACK_PORT)).with_context(|| {
+            format!("bind Codex OAuth callback on {CODEX_CALLBACK_HOST}:{CODEX_CALLBACK_PORT}")
+        })?;
+    listener
+        .set_nonblocking(true)
+        .context("configure Codex OAuth callback listener")?;
+    let (stop_tx, stop_rx) = mpsc::channel::<()>();
+    let thread = std::thread::spawn(move || {
+        let deadline = Instant::now() + Duration::from_secs(300);
+        loop {
+            if stop_rx.try_recv().is_ok() || Instant::now() >= deadline {
+                break;
+            }
+            match listener.accept() {
+                Ok((mut stream, _)) => {
+                    let result = handle_codex_callback(&mut stream, &expected_state);
+                    let _ = sender.send(result);
+                    break;
+                }
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                    std::thread::sleep(Duration::from_millis(50));
+                }
+                Err(error) => {
+                    let _ = sender.send(Err(error).context("accept Codex OAuth callback"));
+                    break;
+                }
+            }
+        }
+    });
+    Ok(CallbackServerHandle {
+        stop: stop_tx,
+        thread: Some(thread),
+    })
+}
+
+fn handle_codex_callback(
+    stream: &mut TcpStream,
+    expected_state: &str,
+) -> Result<browser_use_providers::CodexAuthorization> {
+    let mut request = [0_u8; 4096];
+    let read = stream
+        .read(&mut request)
+        .context("read Codex OAuth callback")?;
+    let request = String::from_utf8_lossy(&request[..read]);
+    let path = request
+        .lines()
+        .next()
+        .and_then(|line| line.split_whitespace().nth(1))
+        .context("parse Codex OAuth callback request")?;
+    let parsed = parse_codex_authorization_input(path);
+    let status = codex_callback_status(path, expected_state, &parsed);
+    let page = codex_callback_page(status, &parsed);
+    let response = format!(
+        "HTTP/1.1 {status} {}\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+        page.status_text,
+        page.body.len(),
+        page.body
+    );
+    stream.write_all(response.as_bytes()).ok();
+    if status == 200 {
+        Ok(parsed)
+    } else {
+        bail!("{}", page.message)
     }
 }
 
@@ -3989,6 +4960,580 @@ fn sdk_server(transport: SdkTransportArg) -> Result<()> {
     }
 }
 
+#[derive(Default)]
+struct BrowserUseSdkPresentationProjection {
+    sessions: HashMap<String, BrowserUseSdkPresentationSession>,
+}
+
+#[derive(Default)]
+struct BrowserUseSdkPresentationSession {
+    current_step: usize,
+    active_step_started_ms: Option<i64>,
+    active_actions: HashMap<String, BrowserUseSdkAction>,
+    assistant_text: String,
+}
+
+struct BrowserUseSdkAction {
+    name: String,
+    started_ms: i64,
+}
+
+#[derive(Default)]
+struct BrowserUseSdkTerminalFrameRenderer {
+    current_step: Option<usize>,
+    action_count: usize,
+    pending_model_text: Option<String>,
+    final_text: Option<String>,
+}
+
+#[derive(Default)]
+struct BrowserUseSdkTerminalFrameProjection {
+    sessions: HashMap<String, BrowserUseSdkTerminalFrameRenderer>,
+}
+
+impl BrowserUseSdkPresentationProjection {
+    fn apply(&mut self, event: &RuntimeEvent) -> Vec<Value> {
+        let Some(session_id) = event.session_id.as_ref().map(|id| id.as_str().to_string()) else {
+            return Vec::new();
+        };
+        let session = self.sessions.entry(session_id.clone()).or_default();
+        let (event_type, payload) = sdk_presentation_event_parts(event);
+        let mut out = Vec::new();
+
+        match event_type {
+            "model.turn.request" => {
+                if let Some(completed) = session.complete_step(event.ts_ms) {
+                    out.push(completed);
+                }
+                session.current_step = session.current_step.saturating_add(1);
+                session.active_step_started_ms = Some(event.ts_ms);
+                session.assistant_text.clear();
+                out.push(json!({
+                    "type": "step.started",
+                    "step": session.current_step,
+                    "ts_ms": event.ts_ms,
+                }));
+            }
+            "model.stream_delta" => {
+                if let Some(text) = payload
+                    .get("text")
+                    .or_else(|| payload.get("delta"))
+                    .and_then(Value::as_str)
+                {
+                    session.assistant_text.push_str(text);
+                }
+            }
+            "tool.started" => {
+                let action = sdk_presentation_action_name(payload).unwrap_or("tool");
+                let key = sdk_presentation_tool_key(event, payload, action);
+                session.active_actions.insert(
+                    key.clone(),
+                    BrowserUseSdkAction {
+                        name: action.to_string(),
+                        started_ms: event.ts_ms,
+                    },
+                );
+                out.push(json!({
+                    "type": "action.started",
+                    "step": session.current_step.max(1),
+                    "id": key,
+                    "name": action,
+                    "params_preview": sdk_presentation_params_preview(payload),
+                    "action": {
+                        "id": key,
+                        "name": action,
+                        "params_preview": sdk_presentation_params_preview(payload),
+                    },
+                    "ts_ms": event.ts_ms,
+                }));
+            }
+            "tool.output" | "tool.completed" | "tool.failed" | "tool.aborted" => {
+                let action = sdk_presentation_action_name(payload).unwrap_or("tool");
+                let key = sdk_presentation_tool_key(event, payload, action);
+                let active = session.active_actions.remove(&key);
+                let name = active
+                    .as_ref()
+                    .map(|action| action.name.as_str())
+                    .unwrap_or(action);
+                let started_ms = active.as_ref().map(|action| action.started_ms);
+                out.push(json!({
+                    "type": "action.completed",
+                    "step": session.current_step.max(1),
+                    "id": key,
+                    "name": name,
+                    "success": !matches!(event_type, "tool.failed" | "tool.aborted"),
+                    "output_preview": sdk_presentation_output_preview(payload),
+                    "action": {
+                        "id": key,
+                        "name": name,
+                        "success": !matches!(event_type, "tool.failed" | "tool.aborted"),
+                        "output_preview": sdk_presentation_output_preview(payload),
+                    },
+                    "duration_ms": started_ms.map(|started| event.ts_ms.saturating_sub(started)),
+                    "ts_ms": event.ts_ms,
+                }));
+            }
+            "session.done" => {
+                if let Some(message) = session.drain_assistant_message(event.ts_ms) {
+                    out.push(message);
+                }
+                out.push(json!({
+                    "type": "final_result",
+                    "step": session.current_step.max(1),
+                    "success": true,
+                    "text": payload
+                        .get("result")
+                        .or_else(|| payload.get("text"))
+                        .and_then(Value::as_str),
+                    "result_file": payload.get("result_file").and_then(Value::as_str),
+                    "ts_ms": event.ts_ms,
+                }));
+            }
+            "session.failed" => {
+                if let Some(message) = session.drain_assistant_message(event.ts_ms) {
+                    out.push(message);
+                }
+                out.push(json!({
+                    "type": "final_result",
+                    "step": session.current_step.max(1),
+                    "success": false,
+                    "text": payload
+                        .get("error")
+                        .or_else(|| payload.get("message"))
+                        .and_then(Value::as_str),
+                    "ts_ms": event.ts_ms,
+                }));
+            }
+            "agent.completed" => {
+                if let Some(completed) = session.complete_step(event.ts_ms) {
+                    out.push(completed);
+                }
+                out.push(json!({
+                    "type": "agent.completed",
+                    "success": true,
+                    "result": payload.get("result").and_then(Value::as_str),
+                    "ts_ms": event.ts_ms,
+                }));
+            }
+            "agent.failed" => {
+                if let Some(completed) = session.complete_step(event.ts_ms) {
+                    out.push(completed);
+                }
+                out.push(json!({
+                    "type": "agent.completed",
+                    "success": false,
+                    "error": payload
+                        .get("error")
+                        .or_else(|| payload.get("message"))
+                        .and_then(Value::as_str),
+                    "ts_ms": event.ts_ms,
+                }));
+            }
+            "agent.turn.completed" | "agent.turn.aborted" => {
+                if let Some(completed) = session.complete_step(event.ts_ms) {
+                    out.push(completed);
+                }
+            }
+            _ => {}
+        }
+
+        out
+    }
+}
+
+impl BrowserUseSdkTerminalFrameRenderer {
+    fn apply(&mut self, event: &Value) -> Option<String> {
+        let event_type = event.get("type").and_then(Value::as_str)?;
+        match event_type {
+            "step.started" => {
+                self.flush_pending_model_text();
+                self.current_step = event
+                    .get("step")
+                    .and_then(Value::as_u64)
+                    .and_then(|step| usize::try_from(step).ok());
+                self.action_count = 0;
+                self.final_text = None;
+                let step = self.current_step.unwrap_or(0);
+                Some(format!("\x1b[36m┌─ Step {}\x1b[0m", step.max(1)))
+            }
+            "action.started" => {
+                self.flush_pending_model_text();
+                self.action_count = self.action_count.saturating_add(1);
+                let name = event
+                    .get("name")
+                    .and_then(Value::as_str)
+                    .unwrap_or("action");
+                let detail = event
+                    .get("params_preview")
+                    .and_then(Value::as_str)
+                    .map(|preview| sdk_terminal_format_action_detail(name, preview))
+                    .unwrap_or_default();
+                Some(sdk_terminal_row("▶", name, &detail, "\x1b[34m"))
+            }
+            "action.completed" => {
+                if event.get("success").and_then(Value::as_bool) == Some(false) {
+                    let name = event
+                        .get("name")
+                        .and_then(Value::as_str)
+                        .unwrap_or("action");
+                    let detail = event
+                        .get("output_preview")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default();
+                    return Some(sdk_terminal_row("✖", name, detail, "\x1b[31m"));
+                }
+                None
+            }
+            "model.message" => {
+                if let Some(text) = event.get("text").and_then(Value::as_str) {
+                    self.pending_model_text = Some(text.to_string());
+                }
+                None
+            }
+            "final_result" => {
+                let text = event
+                    .get("text")
+                    .or_else(|| event.get("result"))
+                    .and_then(Value::as_str)?;
+                let mut lines = Vec::new();
+                if let Some(pending) = self.pending_model_text.take() {
+                    if sdk_terminal_normalize(&pending) != sdk_terminal_normalize(text) {
+                        lines.push(sdk_terminal_text_block("💬 Response", &pending, "\x1b[35m"));
+                    }
+                }
+                self.final_text = Some(text.to_string());
+                let success = event.get("success").and_then(Value::as_bool) != Some(false);
+                let title = if success {
+                    "📄 Final Result"
+                } else {
+                    "📄 Final Result (failed)"
+                };
+                let color = if success { "\x1b[32m" } else { "\x1b[31m" };
+                lines.push(sdk_terminal_text_block(title, text, color));
+                Some(lines.join("\n"))
+            }
+            "step.completed" => {
+                if let Some(preview) = event.get("assistant_preview").and_then(Value::as_str) {
+                    if sdk_terminal_normalize(preview)
+                        != sdk_terminal_normalize(self.final_text.as_deref().unwrap_or_default())
+                    {
+                        self.pending_model_text = Some(preview.to_string());
+                    }
+                }
+                let mut lines = Vec::new();
+                if let Some(pending) = self.flush_pending_model_text() {
+                    lines.push(pending);
+                }
+                let duration = event
+                    .get("duration_ms")
+                    .and_then(Value::as_i64)
+                    .map(|ms| format!("{:.2}s", (ms as f64) / 1000.0))
+                    .unwrap_or_else(|| "complete".to_string());
+                let summary = if self.action_count > 0 {
+                    format!(
+                        "{} action{} · {}",
+                        self.action_count,
+                        if self.action_count == 1 { "" } else { "s" },
+                        duration
+                    )
+                } else {
+                    duration
+                };
+                lines.push(format!("\x1b[36m└─ {}\x1b[0m", summary));
+                Some(lines.join("\n"))
+            }
+            "agent.completed" => {
+                if event.get("success").and_then(Value::as_bool) == Some(false) {
+                    let error = event
+                        .get("error")
+                        .and_then(Value::as_str)
+                        .unwrap_or("Task failed");
+                    return Some(sdk_terminal_text_block("Task failed", error, "\x1b[31m"));
+                }
+                None
+            }
+            _ => None,
+        }
+    }
+
+    fn flush_pending_model_text(&mut self) -> Option<String> {
+        let pending = self.pending_model_text.take()?;
+        if sdk_terminal_normalize(&pending)
+            == sdk_terminal_normalize(self.final_text.as_deref().unwrap_or_default())
+        {
+            return None;
+        }
+        Some(sdk_terminal_text_block("💬 Response", &pending, "\x1b[35m"))
+    }
+}
+
+impl BrowserUseSdkTerminalFrameProjection {
+    fn apply(&mut self, session_id: Option<&str>, event: &Value) -> Option<String> {
+        let key = session_id.unwrap_or("<unknown>").to_string();
+        let renderer = self.sessions.entry(key.clone()).or_default();
+        let frame = renderer.apply(event);
+        if matches!(
+            event.get("type").and_then(Value::as_str),
+            Some("agent.completed")
+        ) {
+            self.sessions.remove(&key);
+        }
+        frame
+    }
+}
+
+fn sdk_terminal_row(icon: &str, label: &str, detail: &str, color: &str) -> String {
+    let reset = "\x1b[0m";
+    let label = format!("{icon} {label}");
+    if detail.trim().is_empty() {
+        return format!("│  {color}{label}{reset}");
+    }
+    let line = format!("│  {color}{label:<18}{reset} {}", detail.trim());
+    sdk_terminal_wrap(&line, 96, "│                      ")
+}
+
+fn sdk_terminal_text_block(title: &str, text: &str, color: &str) -> String {
+    let reset = "\x1b[0m";
+    let mut lines = vec![format!("│  {color}{title}{reset}")];
+    for paragraph in text.lines() {
+        let wrapped = sdk_terminal_wrap_plain(paragraph, 92);
+        if wrapped.is_empty() {
+            lines.push("│".to_string());
+        } else {
+            for line in wrapped {
+                lines.push(format!("│     {line}"));
+            }
+        }
+    }
+    if text.is_empty() {
+        lines.push("│".to_string());
+    }
+    lines.join("\n")
+}
+
+fn sdk_terminal_format_action_detail(_name: &str, preview: &str) -> String {
+    let Ok(value) = serde_json::from_str::<Value>(preview) else {
+        return sdk_terminal_compact_preview(preview, 180);
+    };
+    let Some(object) = value.as_object() else {
+        return sdk_terminal_compact_preview(preview, 180);
+    };
+    if let Some(command) = object.get("command").or_else(|| object.get("cmd")) {
+        if let Some(command) = command.as_str() {
+            return format!("command: {}", sdk_terminal_compact_preview(command, 180));
+        }
+        if let Some(parts) = command.as_array() {
+            let text = parts
+                .iter()
+                .filter_map(Value::as_str)
+                .map(sdk_terminal_shell_quote)
+                .collect::<Vec<_>>()
+                .join(" ");
+            if !text.is_empty() {
+                return format!("command: {}", sdk_terminal_compact_preview(&text, 180));
+            }
+        }
+    }
+    if let Some(url) = object.get("url").and_then(Value::as_str) {
+        return format!("url: {url}");
+    }
+    if let Some(code) = object.get("code").and_then(Value::as_str) {
+        return format!("code: {}", sdk_terminal_compact_preview(code, 180));
+    }
+    let mut parts = Vec::new();
+    for (key, value) in object {
+        if value.is_null() {
+            continue;
+        }
+        let text = value
+            .as_str()
+            .map(ToOwned::to_owned)
+            .unwrap_or_else(|| serde_json::to_string(value).unwrap_or_default());
+        if text.trim().is_empty() || text == "[]" || text == "{}" {
+            continue;
+        }
+        parts.push(format!(
+            "{key}: {}",
+            sdk_terminal_compact_preview(&text, 80)
+        ));
+        if parts.len() >= 3 {
+            break;
+        }
+    }
+    if parts.is_empty() {
+        sdk_terminal_compact_preview(preview, 180)
+    } else {
+        parts.join(" · ")
+    }
+}
+
+fn sdk_terminal_compact_preview(text: &str, limit: usize) -> String {
+    let text = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    if text.len() <= limit {
+        return text;
+    }
+    let end = sdk_floor_char_boundary(&text, limit.saturating_sub(16));
+    format!(
+        "{} ... +{} chars",
+        &text[..end],
+        text.len().saturating_sub(end)
+    )
+}
+
+fn sdk_terminal_shell_quote(text: &str) -> String {
+    if text.chars().all(|ch| {
+        ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.' | '/' | ':' | '=' | ',')
+    }) {
+        return text.to_string();
+    }
+    format!("'{}'", text.replace('\'', "'\\''"))
+}
+
+fn sdk_terminal_wrap(text: &str, width: usize, subsequent_indent: &str) -> String {
+    let mut lines = Vec::new();
+    for (index, line) in sdk_terminal_wrap_plain(text, width).into_iter().enumerate() {
+        if index == 0 {
+            lines.push(line);
+        } else {
+            lines.push(format!("{subsequent_indent}{}", line.trim_start()));
+        }
+    }
+    lines.join("\n")
+}
+
+fn sdk_terminal_wrap_plain(text: &str, width: usize) -> Vec<String> {
+    let mut lines = Vec::new();
+    let mut current = String::new();
+    for word in text.split_whitespace() {
+        let separator = if current.is_empty() { 0 } else { 1 };
+        if !current.is_empty() && current.len() + separator + word.len() > width {
+            lines.push(std::mem::take(&mut current));
+        }
+        if !current.is_empty() {
+            current.push(' ');
+        }
+        current.push_str(word);
+    }
+    if !current.is_empty() {
+        lines.push(current);
+    }
+    lines
+}
+
+fn sdk_terminal_normalize(text: &str) -> String {
+    text.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+impl BrowserUseSdkPresentationSession {
+    fn drain_assistant_message(&mut self, ts_ms: i64) -> Option<Value> {
+        let assistant_text = self.assistant_text.trim();
+        if assistant_text.is_empty() {
+            return None;
+        }
+        let text = assistant_text.to_string();
+        self.assistant_text.clear();
+        Some(json!({
+            "type": "model.message",
+            "step": self.current_step.max(1),
+            "text": sdk_presentation_preview(&Value::String(text)),
+            "ts_ms": ts_ms,
+        }))
+    }
+
+    fn complete_step(&mut self, ts_ms: i64) -> Option<Value> {
+        let started_ms = self.active_step_started_ms.take()?;
+        self.active_actions.clear();
+        let assistant_preview = self.drain_assistant_message(ts_ms).and_then(|event| {
+            event
+                .get("text")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+        });
+        Some(json!({
+            "type": "step.completed",
+            "step": self.current_step.max(1),
+            "duration_ms": ts_ms.saturating_sub(started_ms),
+            "assistant_preview": assistant_preview,
+            "ts_ms": ts_ms,
+        }))
+    }
+}
+
+fn sdk_presentation_event_parts(event: &RuntimeEvent) -> (&str, &Value) {
+    let wrapped_type = event.payload.get("event_type").and_then(Value::as_str);
+    let wrapped_payload = event.payload.get("payload");
+    match (wrapped_type, wrapped_payload) {
+        (Some(event_type), Some(payload)) => (event_type, payload),
+        _ => (event.event_type(), &event.payload),
+    }
+}
+
+fn sdk_presentation_action_name(payload: &Value) -> Option<&str> {
+    payload
+        .get("name")
+        .or_else(|| payload.get("tool_name"))
+        .or_else(|| payload.get("tool"))
+        .and_then(Value::as_str)
+}
+
+fn sdk_presentation_tool_key(event: &RuntimeEvent, payload: &Value, fallback_name: &str) -> String {
+    payload
+        .get("tool_call_id")
+        .or_else(|| payload.get("id"))
+        .and_then(Value::as_str)
+        .or_else(|| event.tool_call_id.as_ref().map(|id| id.as_str()))
+        .map(ToOwned::to_owned)
+        .unwrap_or_else(|| fallback_name.to_string())
+}
+
+fn sdk_presentation_params_preview(payload: &Value) -> Option<String> {
+    for key in [
+        "arguments",
+        "args",
+        "input",
+        "command",
+        "cmd",
+        "code",
+        "url",
+    ] {
+        if let Some(value) = payload.get(key) {
+            return sdk_presentation_preview(value);
+        }
+    }
+    None
+}
+
+fn sdk_presentation_output_preview(payload: &Value) -> Option<String> {
+    for key in ["result", "text", "output", "error", "message", "content"] {
+        if let Some(value) = payload.get(key) {
+            return sdk_presentation_preview(value);
+        }
+    }
+    None
+}
+
+fn sdk_presentation_preview(value: &Value) -> Option<String> {
+    let text = match value {
+        Value::Null => return None,
+        Value::String(text) => text.clone(),
+        other => serde_json::to_string(other).ok()?,
+    };
+    let text = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    if text.is_empty() {
+        return None;
+    }
+    const LIMIT: usize = 180;
+    if text.len() <= LIMIT {
+        return Some(text);
+    }
+    let end = sdk_floor_char_boundary(&text, LIMIT);
+    Some(format!(
+        "{}...[{} more chars]",
+        &text[..end],
+        text.len() - end
+    ))
+}
+
 fn sdk_server_stdio() -> Result<()> {
     let context = SdkServerContext::memory()?;
     let (response_tx, response_rx) = mpsc::channel::<Value>();
@@ -4020,6 +5565,8 @@ fn sdk_server_stdio() -> Result<()> {
                     .build()
                     .context("build sdk event runtime")?;
                 rt.block_on(async move {
+                    let mut sdk_projection = BrowserUseSdkPresentationProjection::default();
+                    let mut terminal_renderer = BrowserUseSdkTerminalFrameProjection::default();
                     while !stop.load(Ordering::Relaxed) {
                         match tokio::time::timeout(Duration::from_millis(100), rx.recv()).await {
                             Ok(Ok(event)) => {
@@ -4072,6 +5619,38 @@ fn sdk_server_stdio() -> Result<()> {
                                 });
                                 if response_tx.send(notification).is_err() {
                                     break;
+                                }
+                                for sdk_event in sdk_projection.apply(&event) {
+                                    let notification = serde_json::json!({
+                                        "jsonrpc": "2.0",
+                                        "method": "agent.step",
+                                        "params": {
+                                            "run_id": run_id.clone(),
+                                            "session_id": session_id.clone(),
+                                            "agent_id": agent_id.clone(),
+                                            "event": sdk_transport_value(&sdk_event),
+                                        },
+                                    });
+                                    if response_tx.send(notification).is_err() {
+                                        break;
+                                    }
+                                    if let Some(text) =
+                                        terminal_renderer.apply(session_id.as_deref(), &sdk_event)
+                                    {
+                                        let notification = serde_json::json!({
+                                            "jsonrpc": "2.0",
+                                            "method": "agent.terminal_frame",
+                                            "params": {
+                                                "run_id": run_id.clone(),
+                                                "session_id": session_id.clone(),
+                                                "agent_id": agent_id.clone(),
+                                                "text": text,
+                                            },
+                                        });
+                                        if response_tx.send(notification).is_err() {
+                                            break;
+                                        }
+                                    }
                                 }
                             }
                             Ok(Err(tokio::sync::broadcast::error::RecvError::Lagged(_))) => {
@@ -4144,7 +5723,8 @@ fn handle_sdk_json_rpc_request(context: &SdkServerContext, request: JsonRpcReque
     }
     let id = request.id;
     let result = match request.method.as_str() {
-        "runtime.ping" => Ok(serde_json::json!({ "ok": true })),
+        "runtime.ping" => Ok(sdk_runtime_ping()),
+        "runtime.python_worker_ping" => sdk_runtime_python_worker_ping(context),
         "runtime.snapshot" => sdk_runtime_snapshot(&context.runtime),
         "browser.create" => sdk_browser_create(&context.runtime, &request.params),
         "browser.stop" | "browser.close" => sdk_browser_close(&context.runtime, &request.params),
@@ -4167,6 +5747,43 @@ fn handle_sdk_json_rpc_request(context: &SdkServerContext, request: JsonRpcReque
         }
         Err(error) => json_rpc_error(id, -32000, error.to_string()),
     }
+}
+
+fn sdk_runtime_ping() -> Value {
+    serde_json::json!({
+        "ok": true,
+        "sdk_protocol_version": SDK_PROTOCOL_VERSION,
+        "terminal_version": env!("CARGO_PKG_VERSION"),
+        "capabilities": [
+            "browser.create",
+            "agent.run_task",
+            "agent.run",
+            "agent.stop",
+            "runtime.python_worker_ping",
+        ],
+    })
+}
+
+fn sdk_runtime_python_worker_ping(context: &SdkServerContext) -> Result<Value> {
+    let artifact_dir = context
+        ._ephemeral_state_dir
+        .path()
+        .join("python-worker-ping");
+    fs::create_dir_all(&artifact_dir)?;
+    let cwd = std::env::current_dir()?;
+    let mut worker =
+        PythonWorker::start_with_browser_mode_and_env(None, std::iter::empty::<(&str, &str)>())?;
+    let response = worker.run(
+        "sdk-python-worker-ping",
+        cwd,
+        artifact_dir,
+        "print('browser-use-python-worker-ok')",
+    )?;
+    Ok(serde_json::json!({
+        "ok": response.ok,
+        "text": response.text,
+        "error": response.error,
+    }))
 }
 
 fn sdk_runtime_snapshot(runtime: &RuntimeHandle) -> Result<Value> {
@@ -4342,6 +5959,7 @@ fn sdk_agent_run(context: &SdkServerContext, params: &Value) -> Result<Value> {
     let browser_snapshot = browser_id
         .as_ref()
         .and_then(|browser_id| context.runtime.browsers().snapshot(browser_id).ok());
+    sdk_require_cloud_browser_credentials(context, params, browser_snapshot.as_ref())?;
     let config = sdk_provider_run_config(params, Some(&task), browser_snapshot.as_ref())?;
     let browser_id_value = browser_id
         .as_ref()
@@ -4742,6 +6360,7 @@ fn sdk_floor_char_boundary(text: &str, mut index: usize) -> usize {
 }
 
 fn sdk_agent_run_task(context: &SdkServerContext, params: &Value) -> Result<Value> {
+    sdk_require_cloud_browser_credentials(context, params, None)?;
     let mut run_params = params.clone();
     if let Value::Object(map) = &mut run_params {
         if !map.contains_key("browser_id") {
@@ -5076,6 +6695,25 @@ fn sdk_provider_run_config(
         config = config.with_fake_result(fake_agent_result_text(task.unwrap_or("task"), None));
     }
     Ok(config)
+}
+
+fn sdk_require_cloud_browser_credentials(
+    context: &SdkServerContext,
+    params: &Value,
+    browser_snapshot: Option<&browser_use_runtime::BrowserSnapshot>,
+) -> Result<()> {
+    let browser = params.get("browser").unwrap_or(&Value::Null);
+    let browser_mode = sdk_browser_mode_from_params(params, browser, browser_snapshot);
+    if browser_mode != "cloud" {
+        return Ok(());
+    }
+    let store = context.store.lock().expect("sdk store mutex poisoned");
+    if browser_use_api_key_from_store_or_env(&store)?.is_some() {
+        return Ok(());
+    }
+    bail!(
+        "cloud browser mode requires BROWSER_USE_API_KEY or `browser-use-terminal auth login browser-use-cloud`"
+    )
 }
 
 fn sdk_config_overrides_from_params(params: &Value) -> Result<ConfigOverrides> {
@@ -6503,6 +8141,9 @@ fn run_dataset_case_with_provider<R: DatasetRunner>(
         max_context_chars: AgentRunOptions::default().max_context_chars,
         browser_mode: Some(config.browser_mode.clone()),
         dynamic_browser_mode_from_store: AgentRunOptions::default().dynamic_browser_mode_from_store,
+        browser_profile_id: AgentRunOptions::default().browser_profile_id,
+        browser_profile_label: AgentRunOptions::default().browser_profile_label,
+        browser_local_browser: AgentRunOptions::default().browser_local_browser,
         collaboration_mode: AgentRunOptions::default().collaboration_mode,
         include_environment_context: true,
         include_permissions_instructions: true,
@@ -7870,6 +9511,11 @@ command = "test-mcp"
             r#"{"jsonrpc":"2.0","id":1,"method":"runtime.ping","params":{}}"#,
         );
         assert_eq!(ping["result"]["ok"], true);
+        assert_eq!(ping["result"]["sdk_protocol_version"], SDK_PROTOCOL_VERSION);
+        assert_eq!(
+            ping["result"]["terminal_version"],
+            env!("CARGO_PKG_VERSION")
+        );
         let snapshot = handle_sdk_json_rpc_line(
             &context,
             r#"{"jsonrpc":"2.0","id":10,"method":"runtime.snapshot","params":{}}"#,
@@ -7954,6 +9600,35 @@ command = "test-mcp"
             r#"{"jsonrpc":"2.0","id":4,"method":"missing.method","params":{}}"#,
         );
         assert_eq!(missing["error"]["code"], -32601);
+        Ok(())
+    }
+
+    #[test]
+    fn sdk_json_rpc_cloud_browser_requires_cloud_credentials_before_run() -> Result<()> {
+        let previous = std::env::var(BROWSER_USE_CLOUD_API_KEY_ENV).ok();
+        std::env::remove_var(BROWSER_USE_CLOUD_API_KEY_ENV);
+        let context = SdkServerContext::memory()?;
+        let request = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 31,
+            "method": "agent.run_task",
+            "params": {
+                "task": "inspect",
+                "llm": {"provider": "fake", "model": "fake"},
+                "browser_mode": "cloud"
+            }
+        });
+
+        let response = handle_sdk_json_rpc_line(&context, &serde_json::to_string(&request)?);
+
+        if let Some(value) = previous {
+            std::env::set_var(BROWSER_USE_CLOUD_API_KEY_ENV, value);
+        }
+        assert_eq!(response["error"]["code"], -32000);
+        assert!(response["error"]["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("cloud browser mode requires")));
+        assert!(context.runtime.snapshot().agents.is_empty());
         Ok(())
     }
 
@@ -8132,6 +9807,24 @@ command = "test-mcp"
             .python_env
             .iter()
             .any(|(key, value)| key == "CUSTOM_ENV" && value == "custom-value"));
+        Ok(())
+    }
+
+    #[test]
+    fn sdk_provider_run_config_accepts_browser_use_gateway_provider() -> Result<()> {
+        let params = serde_json::json!({
+            "task": "inspect",
+            "llm": {"provider": "browser-use", "model": "bu-3-max"}
+        });
+
+        let config = sdk_provider_run_config(&params, Some("inspect"), None)?;
+
+        assert_eq!(config.backend, ProviderBackend::BrowserUse);
+        assert_eq!(config.model, "bu-3-max");
+        assert_eq!(
+            config.options.model_provider_id.as_deref(),
+            Some("browser-use")
+        );
         Ok(())
     }
 
@@ -8383,6 +10076,179 @@ command = "test-mcp"
         }));
         assert_eq!(result["result"]["history"]["usage"]["total_tokens"], 6);
         Ok(())
+    }
+
+    #[test]
+    fn sdk_browser_use_projection_maps_runtime_events_to_step_events() -> Result<()> {
+        fn observed(
+            session_id: &SessionId,
+            event_type: &str,
+            payload: Value,
+            ts_ms: i64,
+        ) -> RuntimeEvent {
+            let mut event = RuntimeEvent::new(
+                browser_use_runtime::RuntimeEventKind::StoreEventAppended,
+                RuntimeDurability::Barrier,
+            )
+            .with_session_id(session_id.clone())
+            .with_payload(json!({
+                "event_type": event_type,
+                "payload": payload,
+            }));
+            event.ts_ms = ts_ms;
+            event
+        }
+
+        let session_id = SessionId::from_string("session-1".to_string())?;
+        let mut projection = BrowserUseSdkPresentationProjection::default();
+
+        let first = projection.apply(&observed(
+            &session_id,
+            "model.turn.request",
+            json!({"model": "fake"}),
+            100,
+        ));
+        assert_eq!(first.len(), 1);
+        assert_eq!(first[0]["type"], "step.started");
+        assert_eq!(first[0]["step"], 1);
+
+        let started = projection.apply(&observed(
+            &session_id,
+            "tool.started",
+            json!({
+                "name": "browser",
+                "tool_call_id": "call-1",
+                "arguments": {"command": "browser connect managed --headed"}
+            }),
+            125,
+        ));
+        assert_eq!(started.len(), 1);
+        assert_eq!(started[0]["type"], "action.started");
+        assert_eq!(started[0]["action"]["name"], "browser");
+        assert!(started[0]["action"]["params_preview"]
+            .as_str()
+            .is_some_and(|preview| preview.contains("managed")));
+
+        let completed = projection.apply(&observed(
+            &session_id,
+            "tool.output",
+            json!({
+                "name": "browser",
+                "tool_call_id": "call-1",
+                "text": "{\"status\":\"connected\"}"
+            }),
+            175,
+        ));
+        assert_eq!(completed.len(), 1);
+        assert_eq!(completed[0]["type"], "action.completed");
+        assert_eq!(completed[0]["action"]["success"], true);
+        assert_eq!(completed[0]["duration_ms"], 50);
+
+        let second = projection.apply(&observed(
+            &session_id,
+            "model.turn.request",
+            json!({"model": "fake"}),
+            200,
+        ));
+        assert_eq!(second.len(), 2);
+        assert_eq!(second[0]["type"], "step.completed");
+        assert_eq!(second[0]["step"], 1);
+        assert_eq!(second[1]["type"], "step.started");
+        assert_eq!(second[1]["step"], 2);
+
+        let stream = projection.apply(&observed(
+            &session_id,
+            "model.stream_delta",
+            json!({"text": "final answer"}),
+            225,
+        ));
+        assert!(stream.is_empty());
+
+        let done = projection.apply(&observed(
+            &session_id,
+            "session.done",
+            json!({"result": "final answer"}),
+            250,
+        ));
+        assert_eq!(done.len(), 2);
+        assert_eq!(done[0]["type"], "model.message");
+        assert_eq!(done[0]["text"], "final answer");
+        assert_eq!(done[1]["type"], "final_result");
+        assert_eq!(done[1]["text"], "final answer");
+
+        let mut agent_completed = RuntimeEvent::new(
+            browser_use_runtime::RuntimeEventKind::AgentCompleted,
+            RuntimeDurability::Barrier,
+        )
+        .with_session_id(session_id)
+        .with_payload(json!({"result": "final answer"}));
+        agent_completed.ts_ms = 300;
+        let completed = projection.apply(&agent_completed);
+        assert_eq!(completed.len(), 2);
+        assert_eq!(completed[0]["type"], "step.completed");
+        assert_eq!(completed[0]["step"], 2);
+        assert_eq!(completed[1]["type"], "agent.completed");
+        assert_eq!(completed[1]["success"], true);
+
+        Ok(())
+    }
+
+    #[test]
+    fn sdk_terminal_frames_keep_interleaved_sessions_isolated() {
+        let mut frames = BrowserUseSdkTerminalFrameProjection::default();
+
+        assert!(frames
+            .apply(
+                Some("session-a"),
+                &json!({"type": "step.started", "step": 1})
+            )
+            .unwrap()
+            .contains("Step 1"));
+        let browser_params = json!({"url": "https://example.com"}).to_string();
+        assert!(frames
+            .apply(
+                Some("session-a"),
+                &json!({
+                    "type": "action.started",
+                    "name": "browser",
+                    "params_preview": browser_params
+                })
+            )
+            .unwrap()
+            .contains("browser"));
+
+        assert!(frames
+            .apply(
+                Some("session-b"),
+                &json!({"type": "step.started", "step": 1})
+            )
+            .unwrap()
+            .contains("Step 1"));
+        assert!(frames
+            .apply(
+                Some("session-b"),
+                &json!({"type": "final_result", "text": "session b final", "success": true})
+            )
+            .unwrap()
+            .contains("session b final"));
+        assert!(frames
+            .apply(
+                Some("session-b"),
+                &json!({"type": "step.completed", "step": 1, "duration_ms": 500})
+            )
+            .unwrap()
+            .contains("0.50s"));
+
+        let session_a_completion = frames
+            .apply(
+                Some("session-a"),
+                &json!({"type": "step.completed", "step": 1, "duration_ms": 1200}),
+            )
+            .unwrap();
+        assert!(
+            session_a_completion.contains("1 action · 1.20s"),
+            "session A action count must not be reset by session B: {session_a_completion}"
+        );
     }
 
     #[test]

@@ -793,7 +793,57 @@ fn dispatch_browser_preference_command_for_mode(
                 selected_browser_mode,
             )?))
         }
+        "secrets" | "secret" => Ok(Some(dispatch_secrets_command(store, &args)?)),
+        "domains" | "domain" => Ok(Some(dispatch_domains_command(store, &args)?)),
         _ => Ok(None),
+    }
+}
+
+/// Model-facing `browser secrets …`. Read-only: the agent can discover which
+/// placeholders exist (so it can call `secret("name")`), but setting/removing a
+/// secret carries a value and must be done by the human via the CLI/TUI so the
+/// value never enters the model context.
+fn dispatch_secrets_command(store: &Store, args: &[String]) -> anyhow::Result<Value> {
+    use super::secrets_admin as sa;
+    match args.get(1).map(String::as_str) {
+        None | Some("list") | Some("--json") | Some("show") => {
+            let secrets = sa::list_secrets(store)?
+                .into_iter()
+                .map(|meta| {
+                    json!({
+                        "domain": meta.domain,
+                        "name": meta.placeholder,
+                        "kind": meta.kind.as_str(),
+                        "allowed_domains": meta.allowed_domains,
+                    })
+                })
+                .collect::<Vec<_>>();
+            Ok(json!({ "status": "ok", "secrets": secrets }))
+        }
+        Some("set" | "add" | "remove" | "rm" | "delete") => bail!(
+            "Secrets must be set or removed by the user so the value never enters the agent's \
+             context. Ask the user to run `browser-use-terminal secrets set --domain <domain> \
+             --name <name>` (add `--totp` for 2FA), or `secrets remove --domain <domain> \
+             --name <name>`."
+        ),
+        Some(other) => bail!("unknown browser secrets command: {other}"),
+    }
+}
+
+/// Model-facing `browser domains …`. Read-only for the same reason the
+/// navigation guard exists: the agent must not be able to widen its own policy.
+fn dispatch_domains_command(store: &Store, args: &[String]) -> anyhow::Result<Value> {
+    use super::secrets_admin as sa;
+    match args.get(1).map(String::as_str) {
+        None | Some("list") | Some("--json") | Some("show") => {
+            let (allowed, denied) = sa::list_domains(store)?;
+            Ok(json!({ "status": "ok", "allowed": allowed, "denied": denied }))
+        }
+        Some("allow" | "deny" | "clear") => bail!(
+            "The navigation allow/deny policy must be changed by the user. Ask them to run \
+             `browser-use-terminal domains allow <domain>` or `domains deny <domain>`."
+        ),
+        Some(other) => bail!("unknown browser domains command: {other}"),
     }
 }
 
@@ -1012,12 +1062,24 @@ fn resolve_browser_command_for_selected_mode(
     store: Option<&Store>,
     cmd: &str,
     selected_browser_mode: Option<&str>,
+    selected_profile_id: Option<&str>,
 ) -> anyhow::Result<String> {
     let argv = browser_command_words(cmd)?;
     let args = strip_browser_prefix(&argv);
     if args.len() == 1 && args.first().is_some_and(|arg| arg == "connect") {
         let effective_mode = effective_browser_mode(store, selected_browser_mode)?;
-        let profile_id = if effective_mode == "cloud" || selected_browser_mode.is_none() {
+        let profile_id = if effective_mode == "cloud" {
+            match selected_profile_id
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+            {
+                Some(profile_id) => Some(profile_id.to_string()),
+                None => store
+                    .map(|store| stored_profile_for_mode(store, effective_mode))
+                    .transpose()?
+                    .flatten(),
+            }
+        } else if selected_browser_mode.is_none() {
             store
                 .map(|store| stored_profile_for_mode(store, effective_mode))
                 .transpose()?
@@ -2518,6 +2580,8 @@ pub struct BrowserTool {
     real_backend_mode: Option<Arc<Mutex<Option<String>>>>,
     selected_browser_mode: Option<String>,
     dynamic_browser_mode_from_store: bool,
+    selected_browser_profile_id: Option<String>,
+    selected_local_browser: Option<String>,
     default_script_timeout_secs: u64,
     session_id_fallback: Option<String>,
     persistence: Option<BrowserPersistence>,
@@ -2550,6 +2614,8 @@ impl BrowserTool {
             real_backend_mode: None,
             selected_browser_mode: None,
             dynamic_browser_mode_from_store: false,
+            selected_browser_profile_id: None,
+            selected_local_browser: None,
             default_script_timeout_secs: DEFAULT_BROWSER_SCRIPT_TIMEOUT_SECS,
             session_id_fallback: None,
             persistence: None,
@@ -2566,6 +2632,8 @@ impl BrowserTool {
             real_backend_mode: Some(real_backend_mode),
             selected_browser_mode: browser_mode,
             dynamic_browser_mode_from_store: false,
+            selected_browser_profile_id: None,
+            selected_local_browser: None,
             default_script_timeout_secs: DEFAULT_BROWSER_SCRIPT_TIMEOUT_SECS,
             session_id_fallback: None,
             persistence: None,
@@ -2579,6 +2647,8 @@ impl BrowserTool {
             real_backend_mode: None,
             selected_browser_mode: None,
             dynamic_browser_mode_from_store: false,
+            selected_browser_profile_id: None,
+            selected_local_browser: None,
             default_script_timeout_secs: DEFAULT_BROWSER_SCRIPT_TIMEOUT_SECS,
             session_id_fallback: None,
             persistence: None,
@@ -2600,6 +2670,20 @@ impl BrowserTool {
         if dynamic {
             self.selected_browser_mode = None;
         }
+        self
+    }
+
+    pub fn with_selected_browser_profile_id(mut self, profile_id: Option<String>) -> Self {
+        self.selected_browser_profile_id = profile_id
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty());
+        self
+    }
+
+    pub fn with_selected_local_browser(mut self, browser: Option<String>) -> Self {
+        self.selected_local_browser = browser
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty());
         self
     }
 
@@ -2768,6 +2852,8 @@ impl ToolRuntime<BrowserRequest, ExecOutput> for BrowserTool {
         } else {
             selected_browser_mode
         };
+        let selected_browser_profile_id = self.selected_browser_profile_id.clone();
+        let selected_local_browser = self.selected_local_browser.clone();
         let backend = Arc::clone(&self.backend);
         let session_id = effective_session_id.to_string();
         let cwd = req.cwd.clone().unwrap_or_else(|| ctx.cwd.clone());
@@ -2821,18 +2907,33 @@ impl ToolRuntime<BrowserRequest, ExecOutput> for BrowserTool {
                                 Some(&store),
                                 &command,
                                 selected_browser_mode,
+                                selected_browser_profile_id.as_deref(),
                             )
                             .map_err(|error| ToolError::Rejected(format!("{error:#}")))?;
-                            let preferred_browser = store
-                                .get_setting(BROWSER_PREF_BROWSER)
-                                .map_err(|error| ToolError::Rejected(format!("{error:#}")))?
-                                .filter(|browser| !browser.trim().is_empty());
+                            let preferred_browser = selected_local_browser.clone().or_else(|| {
+                                store
+                                    .get_setting(BROWSER_PREF_BROWSER)
+                                    .ok()
+                                    .flatten()
+                                    .filter(|browser| !browser.trim().is_empty())
+                            });
                             let effective_mode =
                                 effective_browser_mode(Some(&store), selected_browser_mode)
                                     .map_err(|error| ToolError::Rejected(format!("{error:#}")))?;
-                            let default_profile_id =
+                            let store_profile_id = if matches!(effective_mode, "local" | "cloud") {
                                 stored_profile_for_mode(&store, effective_mode)
-                                    .map_err(|error| ToolError::Rejected(format!("{error:#}")))?;
+                                    .map_err(|error| ToolError::Rejected(format!("{error:#}")))?
+                            } else {
+                                None
+                            };
+                            let default_profile_id =
+                                selected_browser_profile_id.clone().or(store_profile_id);
+                            let default_profile_id = if matches!(effective_mode, "local" | "cloud")
+                            {
+                                default_profile_id
+                            } else {
+                                None
+                            };
                             let has_default_profile = default_profile_id.is_some();
                             drop(store);
                             if let Some(preflight) = local_connect_default_profile_preflight(
@@ -2887,6 +2988,7 @@ impl ToolRuntime<BrowserRequest, ExecOutput> for BrowserTool {
                             None,
                             &command,
                             selected_browser_mode,
+                            selected_browser_profile_id.as_deref(),
                         )
                         .map_err(|error| ToolError::Rejected(format!("{error:#}")))?;
                         let output = backend
@@ -2920,16 +3022,23 @@ impl ToolRuntime<BrowserRequest, ExecOutput> for BrowserTool {
                             effective_browser_mode(Some(&store), selected_browser_mode.as_deref())
                                 .map_err(|error| ToolError::Rejected(format!("{error:#}")))?;
                         let default_profile_id = if mode == "local" {
-                            stored_profile_for_mode(&store, "local")
-                                .map_err(|error| ToolError::Rejected(format!("{error:#}")))?
+                            selected_browser_profile_id.clone().or_else(|| {
+                                stored_profile_for_mode(&store, "local")
+                                    .ok()
+                                    .flatten()
+                                    .filter(|profile| !profile.trim().is_empty())
+                            })
                         } else {
                             None
                         };
                         let preferred_browser = if mode == "local" {
-                            store
-                                .get_setting(BROWSER_PREF_BROWSER)
-                                .map_err(|error| ToolError::Rejected(format!("{error:#}")))?
-                                .filter(|browser| !browser.trim().is_empty())
+                            selected_local_browser.clone().or_else(|| {
+                                store
+                                    .get_setting(BROWSER_PREF_BROWSER)
+                                    .ok()
+                                    .flatten()
+                                    .filter(|browser| !browser.trim().is_empty())
+                            })
                         } else {
                             None
                         };
@@ -2958,6 +3067,20 @@ impl ToolRuntime<BrowserRequest, ExecOutput> for BrowserTool {
                             default_profile_id.as_deref(),
                         )
                         .map_err(ToolError::Other)?;
+                    }
+                    // Re-resolve the secrets + nav policy on every run (fail closed)
+                    // so secret/domain changes take effect mid-session. Cheap now
+                    // that values live in an encrypted file, not the OS keychain.
+                    if let Some(persistence) = &persistence {
+                        let store = persistence.store.lock().map_err(|_| {
+                            ToolError::Other(anyhow::anyhow!("store mutex poisoned"))
+                        })?;
+                        super::secrets_admin::install_script_security(&store, &session_id)
+                            .map_err(|error| {
+                                ToolError::Other(anyhow::anyhow!(
+                                    "failed to apply browser security policy: {error:#}"
+                                ))
+                            })?;
                     }
                     let out = backend
                         .start_script(&session_id, &cwd, &artifact_dir, &script, timeout_secs)

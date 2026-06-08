@@ -2941,7 +2941,18 @@ async fn run_session_once_with_config_with_cancel(
     cancel: CancellationToken,
     runtime_handle: RuntimeHandle,
 ) -> anyhow::Result<()> {
-    let ctx = turn_ctx(&session_id, &config);
+    let mut ctx = turn_ctx(&session_id, &config);
+
+    // Tell the model which saved credentials exist (names only) and that it can
+    // use them securely, so it logs in via `<secret>` placeholders instead of
+    // refusing. Built once per session; secret values are never included.
+    if let Ok(store_guard) = store.lock() {
+        if let Some(block) =
+            crate::tools::handlers::secrets_admin::secrets_prompt_context(&store_guard)
+        {
+            ctx.base_instructions.push_str(&block);
+        }
+    }
 
     // The single in-run conversation buffer, shared (by `Arc`) between the fused
     // driver's `FusionRecorder` (which records the assistant message + dispatched

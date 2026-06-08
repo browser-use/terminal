@@ -138,6 +138,20 @@ fn prompts_avoid_screenshots_for_text_heavy_extraction() {
 }
 
 #[test]
+fn browser_script_prompt_guides_model_controlled_email_and_stable_selectors() {
+    let script = browser_script_tool_description();
+
+    assert!(script.contains("fill_input(selector, text, clear=True, timeout=3)"));
+    assert!(script.contains("current_datetime()"));
+    assert!(script.contains("email_inbox(limit=20, sent_after=None)"));
+    assert!(script.contains("email_inbox(sent_after=...)"));
+    assert!(script.contains("avoid brittle positional selectors"));
+    assert!(script.contains("input:nth-of-type(2)"));
+    assert!(script.contains("compare `timestamp`/`message_id` yourself"));
+    assert!(script.contains("verify the message `timestamp`"));
+}
+
+#[test]
 fn dataset_prompt_enforces_timeboxed_finalization() {
     let prompt = include_str!("../../../../prompts/dataset-case-user.md");
 
