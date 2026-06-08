@@ -95,20 +95,6 @@ impl Protocol for OpenAiResponsesProtocol {
             }
         }
 
-        if let Some(schema) = &request.response_format {
-            body.insert(
-                "text".to_string(),
-                json!({
-                    "format": {
-                        "type": "json_schema",
-                        "name": "final_output",
-                        "strict": true,
-                        "schema": schema,
-                    }
-                }),
-            );
-        }
-
         Ok(Value::Object(body))
     }
 
@@ -1279,29 +1265,6 @@ mod tests {
         assert_eq!(namespace_tools[0]["strict"], json!(false));
         assert!(namespace_tools[0].get("output_schema").is_none());
         assert_eq!(namespace_tools[1]["name"], json!("wait_agent"));
-    }
-
-    #[test]
-    fn response_format_lowers_to_text_json_schema() {
-        let mut request = LlmRequest::new("gpt-5.1", "openai");
-        request.messages.push(Message::user_text("answer"));
-        request.response_format = Some(json!({
-            "type": "object",
-            "properties": { "answer": { "type": "string" } },
-            "required": ["answer"],
-            "additionalProperties": false
-        }));
-
-        let body = OpenAiResponsesProtocol::new()
-            .build_body(&request)
-            .expect("build_body");
-
-        assert_eq!(body["text"]["format"]["type"], json!("json_schema"));
-        assert_eq!(
-            body["text"]["format"]["schema"],
-            request.response_format.unwrap()
-        );
-        assert_eq!(body["text"]["format"]["strict"], json!(true));
     }
 
     #[test]

@@ -53,7 +53,6 @@ pub struct TurnCtx {
     pub provider: String,
     pub base_instructions: String,
     pub browser_mode_instruction: Option<String>,
-    pub response_format: Option<serde_json::Value>,
     pub turn_idx: usize,
     pub attempt: usize,
 }

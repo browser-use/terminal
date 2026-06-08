@@ -102,20 +102,6 @@ impl Protocol for OpenAiChatProtocol {
 
         apply_generation(&mut body, &req.generation);
 
-        if let Some(schema) = &req.response_format {
-            body.insert(
-                "response_format".to_string(),
-                json!({
-                    "type": "json_schema",
-                    "json_schema": {
-                        "name": "final_output",
-                        "strict": true,
-                        "schema": schema,
-                    }
-                }),
-            );
-        }
-
         if let Some(Value::Object(provider_options)) = &req.provider_options {
             for (key, value) in provider_options {
                 body.entry(key.clone()).or_insert_with(|| value.clone());
@@ -731,7 +717,7 @@ fn parse_usage(usage: &Value) -> Usage {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::schema::{LlmRequest, Message, SystemPart, ToolDefinition};
+    use crate::schema::{LlmRequest, SystemPart, ToolDefinition};
 
     fn frame(data: &str) -> SseFrame {
         SseFrame {
@@ -841,30 +827,6 @@ mod tests {
 
         assert_eq!(body["request_type"], "rust_agent");
         assert_eq!(body["model"], "gpt-4o");
-    }
-
-    #[test]
-    fn build_body_lowers_response_format_to_json_schema() {
-        let mut req = LlmRequest::new("gpt-4o", "openai");
-        req.messages.push(Message::user_text("answer"));
-        req.response_format = Some(json!({
-            "type": "object",
-            "properties": { "answer": { "type": "string" } },
-            "required": ["answer"],
-            "additionalProperties": false
-        }));
-
-        let body = OpenAiChatProtocol::new().build_body(&req).unwrap();
-
-        assert_eq!(body["response_format"]["type"], json!("json_schema"));
-        assert_eq!(
-            body["response_format"]["json_schema"]["schema"],
-            req.response_format.unwrap()
-        );
-        assert_eq!(
-            body["response_format"]["json_schema"]["strict"],
-            json!(true)
-        );
     }
 
     #[test]

@@ -1074,7 +1074,6 @@ fn build_request(ctx: &TurnCtx, input: Vec<Message>) -> LlmRequest {
     base_system.cache = Some(CacheHint::Ephemeral);
     req.system.push(base_system);
     req.messages = input;
-    req.response_format = ctx.response_format.clone();
     if let Some(instruction) = ctx.browser_mode_instruction.as_deref() {
         req.messages.insert(
             0,
