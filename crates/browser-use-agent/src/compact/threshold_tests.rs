@@ -255,6 +255,7 @@ fn ctx() -> TurnCtx {
         provider: "openai".to_string(),
         base_instructions: crate::prompts::browser_agent_system_prompt(),
         browser_mode_instruction: None,
+        response_format: None,
         turn_idx: 0,
         attempt: 0,
     }

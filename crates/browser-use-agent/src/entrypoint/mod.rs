@@ -2485,6 +2485,7 @@ fn turn_ctx(session_id: &SessionId, config: &ProviderRunConfig) -> TurnCtx {
             .browser_mode
             .as_deref()
             .map(crate::prompts::browser_mode_instruction),
+        response_format: config.options.final_output_json_schema.clone(),
         turn_idx: 0,
         attempt: 0,
     }
@@ -3259,6 +3260,23 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn turn_ctx_carries_final_output_schema_as_response_format() {
+        let schema = serde_json::json!({
+            "type": "object",
+            "properties": { "answer": { "type": "string" } },
+            "required": ["answer"]
+        });
+        let config = ProviderRunConfig::new(ProviderBackend::BrowserUse, "bu-3-max").with_options(
+            AgentRunOptions::default().with_final_output_json_schema(schema.clone(), true),
+        );
+
+        let ctx = turn_ctx(&SessionId("sess-schema".to_string()), &config);
+
+        assert_eq!(ctx.provider, "browseruse");
+        assert_eq!(ctx.response_format, Some(schema));
     }
 
     /// A tempdir-backed `SharedStore` with a fresh session row (the `events` table
@@ -5850,6 +5868,7 @@ mod tests {
             provider: "fake".to_string(),
             base_instructions: crate::prompts::browser_agent_system_prompt(),
             browser_mode_instruction: None,
+            response_format: None,
             turn_idx: 0,
             attempt: 0,
         };

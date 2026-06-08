@@ -30,6 +30,7 @@ use browser_use_llm::providers::{
 };
 use browser_use_llm::route::{Auth, ModelClient, Route};
 use browser_use_llm::schema::{ContentPart, LlmRequest, Message, MessageRole, SystemPart};
+use serde_json::{Map, Value};
 
 use crate::events::{EventSink, TurnCtx};
 use crate::turn::sampling::{ModelClientTransport, ModelSamplingDriver};
@@ -263,7 +264,24 @@ pub fn build_transport(
     ModelClientTransport::new(client, route, req)
 }
 
-pub(crate) fn apply_browser_use_provider_options(_provider: &str, _req: &mut LlmRequest) {}
+pub(crate) fn apply_browser_use_provider_options(provider: &str, req: &mut LlmRequest) {
+    let normalized = provider.trim().to_ascii_lowercase().replace('_', "-");
+    if normalized != "browser-use" && normalized != "browseruse" {
+        return;
+    }
+    let Some(output_format) = req.response_format.clone() else {
+        return;
+    };
+
+    let mut options = match req.provider_options.take() {
+        Some(Value::Object(options)) => options,
+        _ => Map::new(),
+    };
+    options
+        .entry("output_format".to_string())
+        .or_insert(output_format);
+    req.provider_options = Some(Value::Object(options));
+}
 
 /// Build the production text-only [`ModelSamplingDriver`] over a live transport.
 ///
@@ -401,6 +419,31 @@ mod tests {
         apply_browser_use_provider_options("browser-use", &mut req);
 
         assert_eq!(req.provider_options, None);
+    }
+
+    #[test]
+    fn browser_use_provider_options_forward_response_format_as_output_format() {
+        let mut req = LlmRequest::new("bu-3-max", "browseruse");
+        req.response_format = Some(serde_json::json!({
+            "type": "object",
+            "properties": { "answer": { "type": "string" } },
+            "required": ["answer"]
+        }));
+
+        apply_browser_use_provider_options("browser-use", &mut req);
+
+        assert_eq!(
+            req.provider_options
+                .as_ref()
+                .and_then(|options| options.get("output_format")),
+            req.response_format.as_ref()
+        );
+        assert_eq!(
+            req.provider_options
+                .as_ref()
+                .and_then(|options| options.get("request_type")),
+            None
+        );
     }
 
     /// Only the `Codex` variant targets chatgpt.com: the env-keyed providers never
