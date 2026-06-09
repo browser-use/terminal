@@ -66,9 +66,12 @@ pub const DEFAULT_BROWSER_SCRIPT_TIMEOUT_SECS: u64 = 300;
 
 /// Default observe poll window (ms) for [`BrowserAction::Observe`].
 ///
-/// Long browser_script runs should be observed in coarse windows so the agent
-/// does not burn many LLM turns polling the same run_id while work is ongoing.
-pub const DEFAULT_OBSERVE_TIMEOUT_MS: u64 = 30_000;
+/// Restored to the pre-regression (88-baseline) 1s default. The 30s default +
+/// 30s clamp-floor ("observe30") blocked each observe for up to 30s, burning the
+/// run-level task timebox on long-running scripts and leaving tasks unfinished
+/// (e.g. real_v8 tasks 1, 4 never emitted session.done). The run-level timebox,
+/// not coarse poll windows, is responsible for bounding total turns.
+pub const DEFAULT_OBSERVE_TIMEOUT_MS: u64 = 1_000;
 pub const MAX_OBSERVE_TIMEOUT_MS: u64 = 120_000;
 
 /// Appended to `browser_script` stdout when the response carries image parts.
@@ -82,7 +85,7 @@ pub const BROWSER_SCRIPT_CONTENT_STDOUT_PREFIX: &str = "\n__browser_script_conte
 /// Full browser-script output is persisted through durable events/artifacts; the
 /// inline model view is deliberately smaller because long eval tasks repeatedly
 /// carry every prior tool result in later prompts.
-pub const MAX_INLINE_BROWSER_SCRIPT_STDOUT_BYTES: usize = 4 * 1024;
+pub const MAX_INLINE_BROWSER_SCRIPT_STDOUT_BYTES: usize = 16 * 1024;
 
 const BROWSER_PREF_MODE: &str = "browser.preference.mode";
 const BROWSER_PREF_BROWSER: &str = "browser.preference.browser";
