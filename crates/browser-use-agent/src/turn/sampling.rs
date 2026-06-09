@@ -721,6 +721,19 @@ fn calls_done_tool(tool_calls: &[ContentPart]) -> bool {
         .any(|p| matches!(p, ContentPart::ToolCall { name, .. } if name == DONE_TOOL_NAME))
 }
 
+fn done_tool_succeeded(tool_calls: &[ContentPart], outputs: &[Message]) -> bool {
+    tool_calls
+        .iter()
+        .zip(outputs.iter())
+        .any(|(call, output)| match call {
+            ContentPart::ToolCall { name, .. } if name == DONE_TOOL_NAME => {
+                let (_, is_error) = tool_result_text_and_status(output);
+                !is_error
+            }
+            _ => false,
+        })
+}
+
 /// The final summary carried by the model's `done` call, if any.
 ///
 /// Reads the `result` field from the first `done` tool call's JSON arguments,
@@ -989,19 +1002,11 @@ impl<T: SamplingTransport + 'static, R: CallRunner + 'static> SamplingDriver
                 match (&self.dispatcher, &self.recorder, tool_calls.is_empty()) {
                     // Fused path with at least one tool call.
                     (Some(dispatcher), Some(recorder), false) => {
-                        // A `done` call declares the turn finished: dispatch it (so the
-                        // summary is recorded) but report NO follow-up, terminating the
-                        // loop. Detect it BEFORE the calls vec is consumed by dispatch.
-                        let is_terminal = calls_done_tool(&tool_calls);
-                        // Surface the `done` summary as the turn result when the model
-                        // declared completion via `done` and streamed no other text, so
-                        // the loop returns the summary (codex keeps the final message).
-                        if is_terminal && last_agent_message.is_none() {
-                            last_agent_message = done_summary(&tool_calls);
-                            if last_agent_message.is_some() {
-                                acc.defers_mailbox_delivery_to_next_turn = true;
-                            }
-                        }
+                        // A successful `done` call declares the turn finished. Detect
+                        // the call before dispatch, but decide terminality only after
+                        // the handler output has been recorded; eval-mode done audit
+                        // can reject weak completions and should get a repair turn.
+                        let has_done_call = calls_done_tool(&tool_calls);
 
                         // 1. Record the assistant message (text + tool calls), so the
                         //    recorded transcript carries the call before its output.
@@ -1025,14 +1030,29 @@ impl<T: SamplingTransport + 'static, R: CallRunner + 'static> SamplingDriver
                             recorder.record(&result.outputs_in_order).await;
                         }
 
-                        // A `done` call is TERMINAL: the model declared completion, so
-                        // the loop must stop even though a tool ran. Otherwise, follow-up
-                        // iff a tool actually ran (codex re-samples after feeding tool
-                        // outputs back into history).
-                        if is_terminal {
+                        let done_succeeded = has_done_call
+                            && done_tool_succeeded(&tool_calls, &result.outputs_in_order);
+
+                        // Surface the successful `done` summary as the turn result
+                        // when the model declared completion and streamed no other
+                        // text, so the loop returns the summary (codex keeps the final
+                        // message). Rejected done calls keep following up.
+                        if done_succeeded && last_agent_message.is_none() {
+                            last_agent_message = done_summary(&tool_calls);
+                            if last_agent_message.is_some() {
+                                acc.defers_mailbox_delivery_to_next_turn = true;
+                            }
+                        }
+
+                        // A successful `done` call is TERMINAL. A rejected `done` call
+                        // needs follow-up so the model can repair the final answer.
+                        if done_succeeded {
                             false
                         } else {
-                            decision::needs_follow_up(result.needs_follow_up, false)
+                            decision::needs_follow_up(
+                                result.needs_follow_up || has_done_call,
+                                false,
+                            )
                         }
                     }
                     // Text-only sampler, OR fusion configured but no tool call: the

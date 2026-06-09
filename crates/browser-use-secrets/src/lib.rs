@@ -497,7 +497,10 @@ mod tests {
         // Inputs without `/` or `\` are emitted unchanged, so keys already
         // persisted on disk stay valid (backward compatibility).
         assert_eq!(account_for("github.com", "password"), "github.com/password");
-        assert_eq!(account_for("\u{1}agentmail", "token"), "\u{1}agentmail/token");
+        assert_eq!(
+            account_for("\u{1}agentmail", "token"),
+            "\u{1}agentmail/token"
+        );
 
         // And the store actually keeps such pairs separate end-to-end.
         let store = InMemorySecretStore::new();

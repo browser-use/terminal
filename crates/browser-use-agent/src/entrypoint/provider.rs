@@ -120,6 +120,8 @@ pub type RealSamplingDriver = ModelSamplingDriver<
     RegistryRunner<NoneSandboxProvider, GuardianApprover>,
 >;
 
+const DISABLE_LOCAL_SEARCH_ENV: &str = "BROWSER_USE_DISABLE_LOCAL_SEARCH";
+
 /// The production tool dispatcher type: a [`RegistryRunner`] whose approver is the
 /// REAL [`GuardianApprover`] (permissive sandbox seam). Named so the builder + the
 /// fused driver agree on the runner's generic arguments.
@@ -1324,8 +1326,11 @@ fn build_tool_dispatcher_with_cwd_and_goal_store(
     );
     // `search`: locally-executed DuckDuckGo (Lite) web search — the client runs
     // the HTTP request and parses the results itself (distinct from the hosted
-    // `web_search` above). Read-only, so parallel_safe = true.
-    reg.register::<_, SearchRequest>("search", definitions::search(), true, SearchTool::new());
+    // `web_search` above). Eval runs can disable it to avoid captcha-heavy
+    // detours while keeping hosted `web_search` available.
+    if local_search_enabled_for_run(config) {
+        reg.register::<_, SearchRequest>("search", definitions::search(), true, SearchTool::new());
+    }
     let browser_backend = browser_backend_for_runtime_or_config(
         config,
         runtime_handle.as_ref(),
@@ -1535,6 +1540,43 @@ fn legacy_subagent_tools_enabled_for_run(config: &ProviderRunConfig) -> bool {
     !config.options.multi_agent_v2.enabled
         && config.options.collab_enabled
         && config.options.child_agent_runner.is_some()
+}
+
+fn local_search_enabled_for_run(config: &ProviderRunConfig) -> bool {
+    if config_override_bool_any(
+        &config.options.config_overrides,
+        &[
+            "disable_local_search",
+            "tools.disable_local_search",
+            "search.disabled",
+        ],
+    ) == Some(true)
+    {
+        return false;
+    }
+    if config_override_bool_any(
+        &config.options.config_overrides,
+        &[
+            "local_search_enabled",
+            "tools.local_search_enabled",
+            "search.enabled",
+        ],
+    ) == Some(false)
+    {
+        return false;
+    }
+    !std::env::var(DISABLE_LOCAL_SEARCH_ENV)
+        .ok()
+        .is_some_and(|value| env_flag_enabled(&value))
+}
+
+fn env_flag_enabled(value: &str) -> bool {
+    let normalized = value.trim().to_ascii_lowercase();
+    !normalized.is_empty()
+        && !matches!(
+            normalized.as_str(),
+            "0" | "false" | "off" | "no" | "disabled"
+        )
 }
 
 fn apply_role_tool_policy<S, A>(
@@ -3287,6 +3329,30 @@ mod tests {
             names.contains(&"search"),
             "the locally-executed `search` tool must be reachable by the live model"
         );
+    }
+
+    #[test]
+    fn disable_local_search_override_hides_duckduckgo_search_only() {
+        let options = crate::config_overrides::AgentRunOptions {
+            config_overrides: vec![(
+                "disable_local_search".to_string(),
+                toml::Value::Boolean(true),
+            )],
+            ..crate::config_overrides::AgentRunOptions::default()
+        };
+        let config =
+            ProviderRunConfig::new(ProviderBackend::Fake, "fake-model").with_options(options);
+        let dispatcher = build_tool_dispatcher(Arc::new(MarkerPythonBackend), &config, None);
+        let names: Vec<&str> = dispatcher
+            .tool_specs()
+            .iter()
+            .map(|s| s.name.as_str())
+            .collect();
+
+        assert!(names.contains(&"web_search"));
+        assert!(!names.contains(&"search"));
+        assert!(names.contains(&"browser_script"));
+        assert!(names.contains(&"done"));
     }
 
     /// A non-empty `mcp_servers` map registers the `mcp` tool. The stdio server

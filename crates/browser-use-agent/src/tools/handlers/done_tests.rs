@@ -5,7 +5,7 @@
 //! analog) — direct `run` calls plus one drive through the orchestrator over the
 //! seam.
 
-use super::done::{DoneRequest, DoneTool, DONE_STDOUT_PREFIX};
+use super::done::{audit_done_request, DoneRequest, DoneTool, DONE_STDOUT_PREFIX};
 use crate::tools::approval::AskForApproval;
 use crate::tools::orchestrator::{ToolOrchestrator, TurnEnv};
 use crate::tools::runtime::{AutoApprover, SandboxAttempt, ToolCtx, ToolRuntime};
@@ -174,4 +174,71 @@ fn done_is_not_parallel_safe() {
         !tool.parallel_safe(&DoneRequest::default()),
         "done must be serial: completion is terminal and must not be reordered"
     );
+}
+
+// ---- (6) eval-mode completion audit catches weak finals before terminal stop ----
+
+#[test]
+fn eval_done_audit_rejects_explicit_partial_completion() {
+    let err = audit_done_request(
+        &DoneRequest::with_result("partial_incomplete: two fields were not checked"),
+        &ctx(),
+    )
+    .expect_err("partial completion should be rejected");
+
+    assert!(err.contains("partial_incomplete"), "got: {err}");
+    assert!(err.contains("Continue working"), "got: {err}");
+}
+
+#[test]
+fn eval_done_audit_rejects_missing_result_file() {
+    let req = DoneRequest {
+        result_file: Some("missing-result.json".to_string()),
+        ..DoneRequest::default()
+    };
+
+    let err = audit_done_request(&req, &ctx()).expect_err("missing result file should reject");
+    assert!(err.contains("result_file"), "got: {err}");
+    assert!(err.contains("not readable"), "got: {err}");
+}
+
+#[test]
+fn eval_done_audit_rejects_placeholder_heavy_json() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("answer.json");
+    std::fs::write(
+        &path,
+        r#"{
+            "items": [
+                {"name": "unknown", "price": "not found", "url": ""},
+                {"name": "missing", "price": "unavailable", "url": "not checked"},
+                {"name": "ok", "price": "12", "url": "https://example.test"}
+            ]
+        }"#,
+    )
+    .unwrap();
+    let req = DoneRequest {
+        result_file: Some(path.to_string_lossy().to_string()),
+        ..DoneRequest::default()
+    };
+
+    let err = audit_done_request(&req, &ctx()).expect_err("placeholder JSON should reject");
+    assert!(err.contains("placeholder"), "got: {err}");
+}
+
+#[test]
+fn eval_done_audit_accepts_non_empty_material_file() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("answer.json");
+    std::fs::write(
+        &path,
+        r#"{"items":[{"name":"A","price":"12","url":"https://example.test/a"},{"name":"B","price":"14","url":"https://example.test/b"}]}"#,
+    )
+    .unwrap();
+    let req = DoneRequest {
+        result_file: Some(path.to_string_lossy().to_string()),
+        ..DoneRequest::default()
+    };
+
+    audit_done_request(&req, &ctx()).expect("material JSON should pass");
 }

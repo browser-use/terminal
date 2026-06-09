@@ -49,6 +49,7 @@
 
 pub mod provider;
 
+use std::any::Any;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -2582,7 +2583,11 @@ impl<Sd: SamplingDriver> RuntimeTurnLoopDriver<Sd> {
         match result {
             Ok(last_agent_message) => {
                 ensure_fallback_capture_recording(&store, session_id.as_str());
-                runtime_handle.cleanup_session_resources(&runtime_session_id)?;
+                cleanup_session_resources_for_terminal(
+                    runtime_handle.clone(),
+                    runtime_session_id.clone(),
+                )
+                .await?;
                 if let Some(text) = last_agent_message.as_deref() {
                     runtime_handle.append_observed_session_event(
                         runtime_session_id,
@@ -2594,10 +2599,49 @@ impl<Sd: SamplingDriver> RuntimeTurnLoopDriver<Sd> {
                 Ok(last_agent_message)
             }
             Err(error) => {
-                let _ = runtime_handle.cleanup_session_resources(&runtime_session_id);
+                let _ = cleanup_session_resources_for_terminal(
+                    runtime_handle.clone(),
+                    runtime_session_id,
+                )
+                .await;
                 Err(error)
             }
         }
+    }
+}
+
+async fn cleanup_session_resources_for_terminal(
+    runtime_handle: RuntimeHandle,
+    runtime_session_id: RuntimeSessionId,
+) -> Result<usize, AgentError> {
+    let session_for_error = runtime_session_id.as_str().to_string();
+    tokio::task::spawn_blocking(move || {
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            runtime_handle.cleanup_session_resources(&runtime_session_id)
+        }))
+    })
+    .await
+    .map_err(|error| {
+        AgentError::Other(anyhow::anyhow!(
+            "terminal cleanup task failed to join for session {session_for_error}: {error}"
+        ))
+    })?
+    .map_err(|panic| {
+        AgentError::Other(anyhow::anyhow!(
+            "terminal cleanup panicked for session {session_for_error}: {}",
+            panic_payload_message(panic)
+        ))
+    })?
+    .map_err(AgentError::Other)
+}
+
+fn panic_payload_message(payload: Box<dyn Any + Send>) -> String {
+    if let Some(message) = payload.downcast_ref::<&str>() {
+        (*message).to_string()
+    } else if let Some(message) = payload.downcast_ref::<String>() {
+        message.clone()
+    } else {
+        "unknown panic payload".to_string()
     }
 }
 
@@ -4426,6 +4470,27 @@ mod tests {
                 },
             )
             .expect("register cleanup marker");
+        let blocking_cleanup_store = Arc::clone(&store);
+        let blocking_cleanup_session_id = session_id.clone();
+        runtime
+            .get_or_insert_session_resource(
+                &runtime_session_id,
+                "test.blocking_cleanup_before_done",
+                || 1usize,
+                move |_resource: Arc<usize>| {
+                    let _client = reqwest::blocking::Client::new();
+                    let store = blocking_cleanup_store.lock().expect("store mutex poisoned");
+                    store
+                        .append_event(
+                            &blocking_cleanup_session_id,
+                            "test.blocking_cleanup",
+                            json!({ "phase": "terminal_barrier" }),
+                        )
+                        .expect("append blocking cleanup marker");
+                    1
+                },
+            )
+            .expect("register blocking cleanup marker");
 
         run_session_with_config_with_cancel_and_runtime(
             Arc::clone(&store),
@@ -4443,6 +4508,11 @@ mod tests {
             .find(|event| event.event_type == "test.cleanup")
             .map(|event| event.seq)
             .expect("cleanup marker");
+        let blocking_cleanup_seq = log
+            .iter()
+            .find(|event| event.event_type == "test.blocking_cleanup")
+            .map(|event| event.seq)
+            .expect("blocking cleanup marker");
         let done_seq = log
             .iter()
             .find(|event| event.event_type == names::SESSION_DONE)
@@ -4451,6 +4521,10 @@ mod tests {
         assert!(
             cleanup_seq < done_seq,
             "terminal cleanup must be durable before session.done: cleanup={cleanup_seq}, done={done_seq}"
+        );
+        assert!(
+            blocking_cleanup_seq < done_seq,
+            "blocking terminal cleanup must be durable before session.done: cleanup={blocking_cleanup_seq}, done={done_seq}"
         );
     }
 

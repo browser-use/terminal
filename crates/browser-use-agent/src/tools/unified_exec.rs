@@ -7,6 +7,8 @@
 
 use std::collections::HashMap;
 use std::io::{Read, Write};
+#[cfg(unix)]
+use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child as StdChild, Command as StdCommand, Stdio};
 use std::sync::Arc;
@@ -618,12 +620,21 @@ struct BlockingReader {
 }
 
 enum ManagedChild {
-    Pipe(StdChild),
+    Pipe {
+        child: StdChild,
+        process_group: Option<ProcessGroup>,
+    },
     Pty(Box<dyn portable_pty::Child + Send + Sync>),
 }
 
 enum ManagedStdin {
     Pty(Box<dyn Write + Send>),
+}
+
+#[derive(Clone, Copy, Debug)]
+struct ProcessGroup {
+    #[cfg(unix)]
+    pgid: libc::pid_t,
 }
 
 async fn spawn_managed_backend(
@@ -652,6 +663,7 @@ async fn spawn_pipe_backend(
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
+    configure_pipe_child_process_group(&mut command);
     for (key, value) in env {
         command.env(key, value);
     }
@@ -659,6 +671,7 @@ async fn spawn_pipe_backend(
     let mut child = command.spawn().map_err(|source| {
         ToolError::Other(anyhow::anyhow!("failed to spawn `{program}`: {source}"))
     })?;
+    let process_group = process_group_for_child(&child);
     let stdout = child.stdout.take();
     let stderr = child.stderr.take();
     let mut blocking_readers = Vec::new();
@@ -675,12 +688,44 @@ async fn spawn_pipe_backend(
         });
     }
     Ok(SpawnedProcess {
-        child: ManagedChild::Pipe(child),
+        child: ManagedChild::Pipe {
+            child,
+            process_group,
+        },
         stdin: None,
         pty_master: None,
         reader_count: blocking_readers.len(),
         blocking_readers,
     })
+}
+
+fn configure_pipe_child_process_group(command: &mut StdCommand) {
+    #[cfg(unix)]
+    unsafe {
+        command.pre_exec(|| {
+            if libc::setsid() < 0 {
+                Err(std::io::Error::last_os_error())
+            } else {
+                Ok(())
+            }
+        });
+    }
+    #[cfg(not(unix))]
+    let _ = command;
+}
+
+fn process_group_for_child(child: &StdChild) -> Option<ProcessGroup> {
+    #[cfg(unix)]
+    {
+        Some(ProcessGroup {
+            pgid: child.id() as libc::pid_t,
+        })
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = child;
+        None
+    }
 }
 
 async fn spawn_pty_backend(
@@ -882,7 +927,7 @@ impl ManagedProcess {
         let status = {
             let mut child = self.child.lock().await;
             match &mut *child {
-                ManagedChild::Pipe(child) => child
+                ManagedChild::Pipe { child, .. } => child
                     .try_wait()
                     .map_err(|source| {
                         ToolError::Other(anyhow::anyhow!("polling process: {source}"))
@@ -971,9 +1016,11 @@ impl ManagedProcess {
         {
             let mut child = self.child.lock().await;
             match &mut *child {
-                ManagedChild::Pipe(child) => {
-                    let _ = child.kill();
-                    wait_for_std_child_exit(child, Duration::from_secs(2)).await;
+                ManagedChild::Pipe {
+                    child,
+                    process_group,
+                } => {
+                    terminate_std_child_tree(child, *process_group, Duration::from_secs(2)).await;
                 }
                 ManagedChild::Pty(child) => {
                     let _ = child.kill();
@@ -993,9 +1040,11 @@ impl ManagedProcess {
         {
             let mut child = self.child.lock().await;
             match &mut *child {
-                ManagedChild::Pipe(child) => {
-                    let _ = child.kill();
-                    wait_for_std_child_exit(child, Duration::from_secs(2)).await;
+                ManagedChild::Pipe {
+                    child,
+                    process_group,
+                } => {
+                    terminate_std_child_tree(child, *process_group, Duration::from_secs(2)).await;
                 }
                 ManagedChild::Pty(child) => {
                     let _ = child.kill();
@@ -1014,9 +1063,15 @@ impl ManagedProcess {
         {
             let mut child = self.child.blocking_lock();
             match &mut *child {
-                ManagedChild::Pipe(child) => {
-                    let _ = child.kill();
-                    wait_for_std_child_exit_blocking(child, Duration::from_secs(2));
+                ManagedChild::Pipe {
+                    child,
+                    process_group,
+                } => {
+                    terminate_std_child_tree_blocking(
+                        child,
+                        *process_group,
+                        Duration::from_secs(2),
+                    );
                 }
                 ManagedChild::Pty(child) => {
                     let _ = child.kill();
@@ -1296,6 +1351,18 @@ async fn wait_for_std_child_exit(child: &mut StdChild, max_wait: Duration) {
     }
 }
 
+async fn terminate_std_child_tree(
+    child: &mut StdChild,
+    process_group: Option<ProcessGroup>,
+    max_wait: Duration,
+) {
+    signal_process_group(process_group, ProcessSignal::Terminate);
+    let _ = child.kill();
+    wait_for_std_child_exit(child, max_wait).await;
+    signal_process_group(process_group, ProcessSignal::Kill);
+    wait_for_std_child_exit(child, Duration::from_millis(EXIT_WATCH_INTERVAL_MS)).await;
+}
+
 fn wait_for_std_child_exit_blocking(child: &mut StdChild, max_wait: Duration) {
     let deadline = Instant::now() + max_wait;
     loop {
@@ -1305,6 +1372,42 @@ fn wait_for_std_child_exit_blocking(child: &mut StdChild, max_wait: Duration) {
             Ok(None) => thread::sleep(Duration::from_millis(EXIT_WATCH_INTERVAL_MS)),
         }
     }
+}
+
+fn terminate_std_child_tree_blocking(
+    child: &mut StdChild,
+    process_group: Option<ProcessGroup>,
+    max_wait: Duration,
+) {
+    signal_process_group(process_group, ProcessSignal::Terminate);
+    let _ = child.kill();
+    wait_for_std_child_exit_blocking(child, max_wait);
+    signal_process_group(process_group, ProcessSignal::Kill);
+    wait_for_std_child_exit_blocking(child, Duration::from_millis(EXIT_WATCH_INTERVAL_MS));
+}
+
+#[derive(Clone, Copy)]
+enum ProcessSignal {
+    Terminate,
+    Kill,
+}
+
+fn signal_process_group(process_group: Option<ProcessGroup>, signal: ProcessSignal) {
+    #[cfg(unix)]
+    {
+        let Some(process_group) = process_group else {
+            return;
+        };
+        let signal = match signal {
+            ProcessSignal::Terminate => libc::SIGTERM,
+            ProcessSignal::Kill => libc::SIGKILL,
+        };
+        unsafe {
+            let _ = libc::kill(-process_group.pgid, signal);
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = (process_group, signal);
 }
 
 fn clamp_yield_time(yield_time_ms: u64, empty_poll: bool) -> u64 {
@@ -1382,4 +1485,57 @@ fn signal_exit_code(status: &std::process::ExitStatus) -> i32 {
     }
     let _ = status;
     -1
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashMap;
+    use std::time::Duration;
+
+    use super::{SpawnProcessRequest, UnifiedExecManager};
+
+    fn request(argv: Vec<String>, cwd: std::path::PathBuf, timeout_ms: u64) -> SpawnProcessRequest {
+        SpawnProcessRequest {
+            argv,
+            cwd,
+            env: HashMap::new(),
+            tty: false,
+            yield_time_ms: 1_000,
+            max_output_tokens: None,
+            timeout_ms: Some(timeout_ms),
+            kill_on_cancel: true,
+            call_id: "test-call".to_string(),
+            tool_name: "shell".to_string(),
+            emitter: None,
+            cancel: None,
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn timeout_kills_background_children_before_they_can_write() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let late_file = dir.path().join("late.txt");
+        let manager = UnifiedExecManager::deterministic_for_tests();
+
+        let snapshot = manager
+            .run_to_completion(request(
+                vec![
+                    "sh".to_string(),
+                    "-c".to_string(),
+                    "(sleep 1; printf bad > late.txt) & sleep 5".to_string(),
+                ],
+                dir.path().to_path_buf(),
+                200,
+            ))
+            .await
+            .expect("run command");
+
+        assert!(snapshot.timed_out, "command should time out");
+        tokio::time::sleep(Duration::from_millis(1_400)).await;
+        assert!(
+            !late_file.exists(),
+            "timed-out background child must not survive to write artifacts"
+        );
+    }
 }

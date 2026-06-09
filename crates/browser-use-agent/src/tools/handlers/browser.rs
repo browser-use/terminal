@@ -88,6 +88,9 @@ const BROWSER_PREF_MODE: &str = "browser.preference.mode";
 const BROWSER_PREF_BROWSER: &str = "browser.preference.browser";
 const BROWSER_PREF_BROWSER_LABEL: &str = "browser.preference.browser_label";
 const BROWSER_PREF_PROFILE: &str = "browser.preference.profile";
+const EVAL_DONE_AUDIT_ENV: &str = "BROWSER_USE_EVAL_DONE_AUDIT";
+const EVAL_MAX_OBSERVE_TIMEOUT_ENV: &str = "BROWSER_USE_EVAL_MAX_OBSERVE_TIMEOUT_MS";
+const DEFAULT_EVAL_MAX_OBSERVE_TIMEOUT_MS: u64 = 30_000;
 const BROWSER_DOMAIN_PROFILE_PREFIX: &str = "browser.domain_profile.";
 const BROWSER_SCRIPT_MAX_IMAGE_DIMENSION: u32 = 8_000;
 const BROWSER_PREF_PROFILE_LABEL: &str = "browser.preference.profile_label";
@@ -201,10 +204,38 @@ impl BrowserRequest {
     }
 
     fn effective_observe_ms(&self) -> u64 {
-        self.observe_timeout_ms
+        let normal = self
+            .observe_timeout_ms
             .unwrap_or(DEFAULT_OBSERVE_TIMEOUT_MS)
-            .clamp(DEFAULT_OBSERVE_TIMEOUT_MS, MAX_OBSERVE_TIMEOUT_MS)
+            .clamp(DEFAULT_OBSERVE_TIMEOUT_MS, MAX_OBSERVE_TIMEOUT_MS);
+        match eval_max_observe_timeout_ms() {
+            Some(max_ms) => normal.min(max_ms.max(1_000)),
+            None => normal,
+        }
     }
+}
+
+fn eval_max_observe_timeout_ms() -> Option<u64> {
+    if let Some(value) = std::env::var(EVAL_MAX_OBSERVE_TIMEOUT_ENV)
+        .ok()
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .filter(|value| *value > 0)
+    {
+        return Some(value);
+    }
+    std::env::var(EVAL_DONE_AUDIT_ENV)
+        .ok()
+        .is_some_and(|value| env_flag_enabled(&value))
+        .then_some(DEFAULT_EVAL_MAX_OBSERVE_TIMEOUT_MS)
+}
+
+fn env_flag_enabled(value: &str) -> bool {
+    let normalized = value.trim().to_ascii_lowercase();
+    !normalized.is_empty()
+        && !matches!(
+            normalized.as_str(),
+            "0" | "false" | "off" | "no" | "disabled"
+        )
 }
 
 /// Model-facing wire arguments for the browser tool.
@@ -3186,6 +3217,7 @@ mod browser_mode_tests {
         let err = resolve_browser_command_for_selected_mode(
             Some(&store),
             "browser recover restart-owned-browser",
+            None,
             None,
         )
         .unwrap_err();
