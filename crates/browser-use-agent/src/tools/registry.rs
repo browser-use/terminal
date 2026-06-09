@@ -1168,12 +1168,8 @@ to the single frame that proves the task succeeded."
     pub fn search() -> ToolDefinition {
         ToolDefinition {
             name: "search".to_string(),
-            description: "Search the web with the browser-use search API and return compact \
-                 text results. This does not use or require a browser connection or browser \
-                 session. Use this instead of navigating a browser to Google, DuckDuckGo, Bing, \
-                 or any other search engine; it is far more token-efficient than reading a search \
-                 results page in the browser. Only use the browser after search when you need to \
-                 inspect a specific result page."
+            description: "Search the web for a free-text query and return results as text. \
+                 No browser needed; prefer this over opening a browser to a search engine."
                 .to_string(),
             input_schema: json!({
                 "type": "object",

@@ -576,23 +576,25 @@ fn default_registry_registers_all_tools() {
 }
 
 #[test]
-fn search_definition_guides_model_away_from_browser_search_engines() {
+fn search_definition_is_concise_and_guides_away_from_browser() {
     let desc = definitions::search().description;
     assert!(
-        desc.contains("browser-use search API"),
-        "search description should explain the search backend: {desc}"
+        desc.contains("Search the web"),
+        "describes a web search: {desc}"
     );
     assert!(
-        desc.contains("does not use or require a browser connection or browser session"),
-        "search description should make clear no browser connection is needed: {desc}"
+        desc.contains("No browser needed"),
+        "search description should make clear no browser is needed: {desc}"
     );
     assert!(
-        desc.contains("instead of navigating a browser"),
+        desc.contains("prefer this over opening a browser"),
         "search description should prefer this tool over browser search-engine navigation: {desc}"
     );
+    // Keep it concise (Codex-style one-liner), unlike a multi-sentence blurb.
     assert!(
-        desc.contains("token-efficient"),
-        "search description should call out the token-efficiency reason: {desc}"
+        desc.len() < 160,
+        "search description should stay concise, got {} chars: {desc}",
+        desc.len()
     );
 }
 
