@@ -417,10 +417,12 @@ struct JsonPlaceholderStats {
 
 fn collect_json_placeholder_stats(value: &Value, stats: &mut JsonPlaceholderStats) {
     match value {
-        Value::Null => {
-            stats.total_scalar_fields += 1;
-            stats.placeholder_fields += 1;
-        }
+        // A field explicitly set to null means the agent checked the source and
+        // recorded a genuine absence. Many tasks REQUIRE null/empty for
+        // unavailable fields, so count null toward the denominator but NOT as a
+        // placeholder. Counting it as a placeholder pushed the agent to delete
+        // required fields to satisfy the audit (real_v8 task 53 regression).
+        Value::Null => stats.total_scalar_fields += 1,
         Value::Bool(_) | Value::Number(_) => stats.total_scalar_fields += 1,
         Value::String(text) => {
             stats.total_scalar_fields += 1;
