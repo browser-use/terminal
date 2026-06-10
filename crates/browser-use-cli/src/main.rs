@@ -2823,7 +2823,8 @@ fn analytics_provider_kind_for_backend(backend: ProviderBackend) -> &'static str
         ProviderBackend::Openai
         | ProviderBackend::Anthropic
         | ProviderBackend::Openrouter
-        | ProviderBackend::Deepseek => "api_key",
+        | ProviderBackend::Deepseek
+        | ProviderBackend::BrowserUse => "api_key",
         ProviderBackend::Fake | ProviderBackend::None => "other",
     }
 }
@@ -2835,6 +2836,7 @@ fn provider_id_for_backend(backend: ProviderBackend) -> &'static str {
         ProviderBackend::Anthropic => "anthropic",
         ProviderBackend::Openrouter => "openrouter",
         ProviderBackend::Deepseek => "deepseek",
+        ProviderBackend::BrowserUse => "browser-use",
         ProviderBackend::Fake => "fake",
         ProviderBackend::None => "none",
     }
