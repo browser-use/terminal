@@ -516,7 +516,6 @@ fn full_registry() -> ToolRegistry {
             "manage k8s clusters",
             ["namespace"],
         )]),
-        WebSearchTool::new(WebSearchConfig::enabled()),
         SearchTool::with_backend(Arc::new(FakeSearchBackend)),
         DoneTool::new(),
     )
@@ -535,15 +534,17 @@ fn ctx_at(name: &str, cwd: PathBuf) -> ToolCtx {
 #[test]
 fn default_registry_registers_all_tools() {
     let reg = full_registry();
-    assert_eq!(reg.len(), 13, "all tools must register");
+    assert_eq!(reg.len(), 12, "all tools must register");
     let defs = reg.model_visible_definitions();
     assert_eq!(
         defs.len(),
-        13,
+        12,
         "model_visible_definitions must list all tools"
     );
     let mut names: Vec<&str> = defs.iter().map(|d| d.name.as_str()).collect();
     names.sort_unstable();
+    // The hosted `web_search` is intentionally absent: search goes through
+    // the browser-use `search` tool only.
     assert_eq!(
         names,
         vec![
@@ -558,7 +559,6 @@ fn default_registry_registers_all_tools() {
             "tool_search",
             "update_plan",
             "view_image",
-            "web_search",
             "write_stdin",
         ]
     );
@@ -601,7 +601,6 @@ fn parallel_safe_flags_match_registration() {
     let reg = full_registry();
     // Pure / read-only tools are parallel-safe.
     assert_eq!(reg.parallel_safe("tool_search"), Some(true));
-    assert_eq!(reg.parallel_safe("web_search"), Some(true));
     // Everything else is serial — including `search`, pinned serial below as
     // the conservative scheduling default for a billed API call.
     for name in [
@@ -805,7 +804,7 @@ async fn update_plan_dispatches() {
 }
 
 #[tokio::test]
-async fn tool_search_and_web_search_dispatch() {
+async fn tool_search_dispatches_and_web_search_is_unknown() {
     let reg = full_registry();
     let orch = ToolOrchestrator::stub();
     let ts = reg
@@ -825,7 +824,9 @@ async fn tool_search_and_web_search_dispatch() {
         ts.stdout
     );
 
-    let ws = reg
+    // The hosted `web_search` is not in the default set: a dispatch to it is
+    // an unknown-tool error (search goes through the `search` tool only).
+    let err = reg
         .dispatch(
             "web_search",
             &serde_json::json!({ "query": "rust async" }),
@@ -835,12 +836,14 @@ async fn tool_search_and_web_search_dispatch() {
             &orch,
         )
         .await
-        .expect("web_search should dispatch");
-    assert!(
-        ws.stdout.contains("rust async"),
-        "web_search: {:?}",
-        ws.stdout
-    );
+        .expect_err("web_search must not be registered in the default set");
+    match err {
+        ToolError::Other(e) => assert!(
+            e.to_string().contains("unknown tool `web_search`"),
+            "unexpected error: {e}"
+        ),
+        other => panic!("expected Other(unknown tool), got {other:?}"),
+    }
 }
 
 #[tokio::test]

@@ -1,5 +1,17 @@
 //! `web_search` tool: the HOSTED, provider-executed web-search capability.
 //!
+//! # Status: NOT REGISTERED (superseded by `search`)
+//!
+//! This handler is no longer wired into [`default_registry`] or the production
+//! dispatcher: when registered, the OpenAI Responses builder encodes it as the
+//! provider-side `web_search_preview` tool, which competes with — and the
+//! model prefers over — the browser-use [`search`](super::search) tool. All
+//! searches now go through `search`. The handler is kept as the codex-parity
+//! model of the hosted capability (and as a pure registry-test fixture) should
+//! a provider-side search ever need re-enabling.
+//!
+//! [`default_registry`]: crate::tools::registry::default_registry
+//!
 //! Unlike the other handlers in this module (`shell`, `apply_patch`,
 //! `view_image`, `update_plan`, `tool_search`), `web_search`
 //! is **not locally dispatched**. It is a *hosted tool*: the model provider runs

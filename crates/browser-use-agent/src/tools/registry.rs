@@ -1142,29 +1142,12 @@ to the single frame that proves the task succeeded."
         }
     }
 
-    /// `web_search`: a hosted/passthrough web search. Parity: codex
-    /// `WebSearchArgs { query }` / legacy web_search args.
-    pub fn web_search() -> ToolDefinition {
-        ToolDefinition {
-            name: "web_search".to_string(),
-            description: "Search the web for a free-text query.".to_string(),
-            input_schema: json!({
-                "type": "object",
-                "properties": {
-                    "query": { "type": "string", "description": "The free-text search query." }
-                },
-                "required": ["query"],
-                "additionalProperties": false
-            }),
-            output_schema: None,
-            namespace: None,
-            namespace_description: None,
-        }
-    }
-
     /// `search`: a web search via the browser-use search API
-    /// (`search.browser-use.com`). Unlike the hosted [`web_search`], the client
-    /// performs the API call itself and returns the parsed results as text.
+    /// (`search.browser-use.com`). The client performs the API call itself and
+    /// returns the parsed results as text. This replaced the hosted
+    /// [`web_search`](crate::tools::handlers::web_search) tool, which is no
+    /// longer registered (the provider-side `web_search_preview` competed with
+    /// this tool and the model preferred its native search).
     pub fn search() -> ToolDefinition {
         ToolDefinition {
             name: "search".to_string(),
@@ -1957,12 +1940,16 @@ Agent-role guidance below only helps choose which agent to use after spawning is
 /// `WireArgs` types. The browser/python/mcp handlers need an injected backend
 /// (they would otherwise reach the OS), so those are supplied by the caller.
 ///
-/// `parallel_safe` per tool: `exec_command` / `tool_search` / `web_search` =
-/// `true`; `shell` / `apply_patch` / `view_image` / `browser` / `python` /
-/// `search` / `update_plan` / `done` = `false` (serial). `mcp` is registered
-/// `false` here
+/// `parallel_safe` per tool: `exec_command` / `tool_search` = `true`;
+/// `shell` / `apply_patch` / `view_image` / `browser` / `python` / `search` /
+/// `update_plan` / `done` = `false` (serial). `mcp` is registered `false` here
 /// (a serial default); its per-request read-only hint still drives the handler's
 /// own [`ToolRuntime::parallel_safe`](crate::tools::ToolRuntime::parallel_safe).
+///
+/// The hosted [`web_search`](crate::tools::handlers::web_search) handler is
+/// intentionally absent: when registered, the OpenAI Responses builder emits
+/// the provider-side `web_search_preview` tool, which competes with (and the
+/// model prefers over) the browser-use `search` tool.
 #[allow(clippy::too_many_arguments)]
 pub fn default_registry<S, A>(
     shell: crate::tools::handlers::shell::ShellTool,
@@ -1973,7 +1960,6 @@ pub fn default_registry<S, A>(
     mcp: crate::tools::handlers::mcp::McpTool,
     update_plan: crate::tools::handlers::update_plan::UpdatePlanTool,
     tool_search: crate::tools::handlers::tool_search::ToolSearchTool,
-    web_search: crate::tools::handlers::web_search::WebSearchTool,
     search: crate::tools::handlers::search::SearchTool,
     done: crate::tools::handlers::done::DoneTool,
 ) -> ToolRegistry<S, A>
@@ -1993,7 +1979,6 @@ where
     use crate::tools::handlers::tool_search::ToolSearchRequest;
     use crate::tools::handlers::update_plan::UpdatePlanRequest;
     use crate::tools::handlers::view_image::ViewImageRequest;
-    use crate::tools::handlers::web_search::WebSearchRequest;
 
     let mut reg = ToolRegistry::new();
 
@@ -2037,7 +2022,6 @@ where
         true,
         tool_search,
     );
-    reg.register::<_, WebSearchRequest>("web_search", definitions::web_search(), true, web_search);
     // `search`: web search via the browser-use search API. Serial: a
     // conservative scheduling default for a billed API call.
     reg.register::<_, SearchRequest>(
