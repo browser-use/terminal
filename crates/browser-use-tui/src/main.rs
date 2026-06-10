@@ -9077,8 +9077,15 @@ impl App {
                 .live_url
                 .as_deref()
                 .or(state.browser.url.as_deref())
-                .unwrap_or("about:blank")
-                .to_string()
+                .map(ToOwned::to_owned)
+        };
+        // No placeholder fallback here: handing "about:blank" to the OS opener
+        // is never useful, and on macOS LaunchServices can fuzzy-match junk
+        // strings to application names ("about*" uniquely resolves to
+        // /System/Library/CoreServices/Applications/About This Mac.app).
+        let Some(target) = target else {
+            self.browser_notice = Some("No browser URL to open yet.".to_string());
+            return Ok(());
         };
         self.request_open_browser_target(target)
     }
@@ -10704,21 +10711,35 @@ fi | sh -s -- --no-launch
         .with_context(|| format!("download and run installer script {url}"))
 }
 
-#[cfg(not(test))]
-fn open_external_url(target: &str) -> Result<()> {
+/// Validate a string before handing it to the OS URL opener (`/usr/bin/open`
+/// on macOS). Only http(s)/file URLs are externally openable; browser-internal
+/// placeholders like `about:blank` or `chrome://...` must never reach
+/// LaunchServices — it cannot open them, and on macOS an unresolvable string
+/// can be fuzzy-matched as an application name ("about*" uniquely resolves to
+/// "About This Mac.app"), popping the About This Mac window mid-task.
+fn external_browser_target(target: &str) -> Result<&str> {
     let target = target.trim();
     if target.is_empty() {
         anyhow::bail!("browser target is empty");
     }
+    let scheme = target
+        .split_once(':')
+        .map(|(scheme, _)| scheme.to_ascii_lowercase());
+    match scheme.as_deref() {
+        Some("http" | "https" | "file") => Ok(target),
+        _ => anyhow::bail!("not an externally openable URL: {target}"),
+    }
+}
+
+#[cfg(not(test))]
+fn open_external_url(target: &str) -> Result<()> {
+    let target = external_browser_target(target)?;
     open::that_detached(target).with_context(|| format!("launch external browser for {target}"))
 }
 
 #[cfg(test)]
 fn open_external_url(target: &str) -> Result<()> {
-    if target.trim().is_empty() {
-        anyhow::bail!("browser target is empty");
-    }
-    Ok(())
+    external_browser_target(target).map(|_| ())
 }
 
 #[cfg(not(test))]
@@ -18972,6 +18993,8 @@ wire_api = "responses"
     fn browser_panel_actions_record_explicit_events() -> Result<()> {
         let temp = tempfile::tempdir()?;
         let mut app = ready_app(&temp)?;
+        app.browser = BROWSER_USE_CLOUD.to_string();
+        app.store.set_setting("browser", BROWSER_USE_CLOUD)?;
         let session = app.store.create_session(None, std::env::current_dir()?)?;
         app.store.append_event(
             &session.id,
@@ -18996,6 +19019,24 @@ wire_api = "responses"
             .iter()
             .any(|event| event.event_type == "browser.reconnect_requested"));
         Ok(())
+    }
+
+    #[test]
+    fn external_browser_target_rejects_browser_internal_placeholders() {
+        // Only externally openable URLs may reach the OS opener. Passing
+        // browser-internal placeholders like about:blank to `open` on macOS can
+        // fuzzy-match an application name instead ("about*" resolves uniquely
+        // to About This Mac.app), popping About This Mac during agent runs.
+        assert!(external_browser_target("about:blank").is_err());
+        assert!(external_browser_target("chrome://inspect/#remote-debugging").is_err());
+        assert!(external_browser_target("").is_err());
+        assert!(external_browser_target("javascript:alert(1)").is_err());
+        assert_eq!(
+            external_browser_target(" https://live.browser-use.com/?wss=example ").unwrap(),
+            "https://live.browser-use.com/?wss=example"
+        );
+        assert!(external_browser_target("file:///tmp/x/.capture.frames/live.html").is_ok());
+        assert!(external_browser_target("http://127.0.0.1:9222/json/version").is_ok());
     }
 
     #[test]
