@@ -1162,10 +1162,10 @@ fn resolve_provider_with_python(
 /// ## Which tools are wired here
 /// The registry registers the backend-free handlers — `shell`, `apply_patch`,
 /// `view_image`, `update_plan`, `done`, `tool_search` (catalog populated from the registered tools' defs),
-/// `web_search` (ENABLED; the Responses builder encodes it as the hosted
-/// `web_search_preview` tool), `search` (a locally-executed DuckDuckGo search,
-/// distinct from the hosted `web_search`) — plus the two product-surface tools
-/// that drive real subsystems:
+/// `search` (a client-executed call to the browser-use search API; the hosted
+/// `web_search` is intentionally NOT registered, so no provider-side
+/// `web_search_preview` is emitted and all searches go through `search`) —
+/// plus the two product-surface tools that drive real subsystems:
 ///   * `browser` ([`BrowserTool::new`]): standalone — the production
 ///     [`RealBackend`](crate::tools::handlers::browser::RealBackend) wraps the
 ///     `browser-use-browser` crate and manages CDP sessions internally (keyed by
@@ -1261,7 +1261,7 @@ fn build_tool_dispatcher_with_cwd_and_goal_store(
     use crate::tools::handlers::done::{DoneRequest, DoneTool};
     use crate::tools::handlers::mcp::McpToolCallRequest;
     use crate::tools::handlers::python::{PythonRequest, PythonTool};
-    use crate::tools::handlers::search::{SearchRequest, SearchTool};
+    use crate::tools::handlers::search::{SearchRequest, SearchTool, SEARCH_PARALLEL_SAFE};
     use crate::tools::handlers::shell::{
         ExecCommandRequest, ExecCommandTool, ShellRequest, ShellTool, WriteStdinRequest,
         WriteStdinTool,
@@ -1269,7 +1269,6 @@ fn build_tool_dispatcher_with_cwd_and_goal_store(
     use crate::tools::handlers::tool_search::{ToolSearchEntry, ToolSearchRequest, ToolSearchTool};
     use crate::tools::handlers::update_plan::{UpdatePlanRequest, UpdatePlanTool};
     use crate::tools::handlers::view_image::{ViewImageRequest, ViewImageTool};
-    use crate::tools::handlers::web_search::{WebSearchConfig, WebSearchRequest, WebSearchTool};
     use crate::tools::registry::{definitions, ToolRegistry};
 
     // The backend-free handlers, each with its parity-grounded definition + static
@@ -1337,19 +1336,21 @@ fn build_tool_dispatcher_with_cwd_and_goal_store(
         false,
         UpdatePlanTool::new(),
     );
-    // `web_search` is ENABLED (hosted/provider-side). The OpenAI Responses
-    // request builder encodes it as the hosted `{"type":"web_search_preview"}`
-    // tool (see `browser-use-llm` `openai_responses.rs::lower_tool`).
-    reg.register::<_, WebSearchRequest>(
-        "web_search",
-        definitions::web_search(),
-        true,
-        WebSearchTool::new(WebSearchConfig::enabled()),
+    // The hosted `web_search` is intentionally NOT registered: when present,
+    // the OpenAI Responses builder encodes it as the provider-side
+    // `{"type":"web_search_preview"}` tool (`browser-use-llm`
+    // `openai_responses.rs::lower_tool`) and the model prefers its native
+    // search over the browser-use one. All searches go through `search`.
+    //
+    // `search`: web search via the browser-use search API — the client makes
+    // the API call (auth: `BROWSER_USE_API_KEY`) and formats the results
+    // itself. Serial: a conservative scheduling default for a billed API call.
+    reg.register::<_, SearchRequest>(
+        "search",
+        definitions::search(),
+        SEARCH_PARALLEL_SAFE,
+        SearchTool::new(),
     );
-    // `search`: locally-executed DuckDuckGo (Lite) web search — the client runs
-    // the HTTP request and parses the results itself (distinct from the hosted
-    // `web_search` above). Read-only, so parallel_safe = true.
-    reg.register::<_, SearchRequest>("search", definitions::search(), true, SearchTool::new());
     let browser_backend = browser_backend_for_runtime_or_config(
         config,
         runtime_handle.as_ref(),
@@ -3341,12 +3342,17 @@ mod tests {
         assert!(names.contains(&"browser"));
         assert!(names.contains(&"done"));
         assert!(names.contains(&"update_plan"));
-        // Both web searches are wired into the production dispatcher: the hosted
-        // `web_search` and the locally-executed DuckDuckGo `search`.
-        assert!(names.contains(&"web_search"));
+        // Search goes through the browser-use search API `search` tool only;
+        // the hosted `web_search` must NOT be exposed (when registered, the
+        // OpenAI Responses builder emits the provider-side `web_search_preview`
+        // and the model prefers it over `search`).
+        assert!(
+            !names.contains(&"web_search"),
+            "hosted web_search must not be registered in the production dispatcher"
+        );
         assert!(
             names.contains(&"search"),
-            "the locally-executed `search` tool must be reachable by the live model"
+            "the `search` tool must be reachable by the live model"
         );
     }
 

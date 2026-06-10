@@ -59,9 +59,8 @@ pub use mcp::{
 };
 pub use python::{PythonApprovalKey, PythonBackend, PythonRequest, PythonTool};
 pub use search::{
-    classify_response, extract_real_url, format_results, normalize_whitespace, parse_lite_results,
-    HttpSearchBackend, SearchApprovalKey, SearchBackend, SearchError, SearchRequest, SearchResult,
-    SearchTool,
+    classify_response, format_results, normalize_whitespace, parse_results, HttpSearchBackend,
+    SearchApprovalKey, SearchBackend, SearchError, SearchRequest, SearchResult, SearchTool,
 };
 pub use shell::{
     ExecCommandApprovalKey, ExecCommandRequest, ExecCommandTool, ShellApprovalKey, ShellRequest,

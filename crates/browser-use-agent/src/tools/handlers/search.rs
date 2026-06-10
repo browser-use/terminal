@@ -1,50 +1,51 @@
-//! `search` tool: a LOCALLY-executed DuckDuckGo (Lite) web search.
+//! `search` tool: a web search via the browser-use search API.
 //!
-//! This is the async re-implementation of the legacy Python `search` action
-//! (a `browser_use` `Controller` action that fetched
-//! `lite.duckduckgo.com/lite/` over HTTP and parsed the result HTML). Only the
-//! *search logic* is ported — the surrounding `Controller` / DB / session
-//! scaffolding (and the unrelated `request_human_control` action) are dropped.
-//! Like the other handlers it implements the full trait stack
+//! The client POSTs the query to `search.browser-use.com` — a thin proxy in
+//! front of [Parallel](https://parallel.ai)'s Search API with browser-use auth
+//! and billing — and formats the returned JSON results for the model. This
+//! replaced the DuckDuckGo Lite scrape the tool was originally ported from:
+//! the engine changed, the tool surface (name, request shape, output layout)
+//! did not. Like the other handlers it implements the full trait stack
 //! ([`Approvable`] + [`Sandboxable`] + [`ToolRuntime`]) so it can be driven by
-//! the [`ToolOrchestrator`](crate::tools::orchestrator::ToolOrchestrator),
-//! mirroring the `tool_search` tool's structure: a non-FS,
-//! fetch-parse-and-return tool that spawns no process.
+//! the [`ToolOrchestrator`](crate::tools::orchestrator::ToolOrchestrator).
 //!
 //! # Relationship to [`web_search`](super::web_search)
 //!
 //! [`web_search`](super::web_search) is the HOSTED, provider-executed web search
-//! (the provider runs the search server-side; the client only declares + passes
-//! through the result — it performs *no* local HTTP). This `search` tool is the
-//! opposite: it performs a REAL local HTTP GET against DuckDuckGo Lite and parses
-//! the returned HTML itself, exactly as the Python action did. The two are
-//! complementary, not duplicates: `web_search` needs a capable provider; `search`
-//! works against any provider because the client does the work.
+//! (the model provider runs the search server-side; the client only declares +
+//! passes through the result — it performs *no* local HTTP). This `search` tool
+//! is the opposite: the client performs the API call itself, so it works
+//! against any model provider.
+//!
+//! # API contract (verified against the `search` service source)
+//!
+//! * `POST {base}/search` with JSON `{"query": "…"}` and the
+//!   [`X-Browser-Use-API-Key`](SEARCH_API_KEY_HEADER) header (a `bu_…` key,
+//!   read from [`BROWSER_USE_API_KEY`](SEARCH_API_KEY_ENV) — the same variable
+//!   the rest of the workspace uses for browser-use cloud auth). The base URL
+//!   defaults to the production service and can be overridden via
+//!   [`BROWSER_USE_SEARCH_URL`](SEARCH_BASE_URL_ENV) (e.g. a local dev
+//!   instance, which runs as an open proxy without auth).
+//! * `200` → `{"results": [{"title"?, "url", "published_date"?, "content"}]}`;
+//!   `title` / `published_date` are omitted when the source lacks them, and
+//!   `content` is multi-line markdown (whitespace-normalized here).
+//! * Errors: `400` invalid query (the service also sanitizes an
+//!   upstream-rejected query into this), `401` missing/invalid API key, `402`
+//!   insufficient balance, `429` rate limit exceeded (retry later), `502`
+//!   upstream failed, `503` auth/billing backend unavailable.
 //!
 //! # Network seam (testability)
 //!
-//! The HTTP fetch lives behind the [`SearchBackend`] trait, with the real
+//! The HTTP call lives behind the [`SearchBackend`] trait, with the real
 //! [`HttpSearchBackend`] (a `reqwest` client) injected by default and a fake
 //! substitutable in tests. This mirrors how the `browser` / `python` / `mcp`
-//! handlers inject their backends (`BrowserTool::with_backend`,
-//! `McpTool::new(Arc<dyn McpClient>)`), so the tool's parsing/formatting logic is
-//! unit-tested deterministically with fixture HTML — no network is touched.
-//!
-//! # HTML parsing
-//!
-//! The Python original used BeautifulSoup. This crate intentionally carries no
-//! HTML-parser dependency (the existing browser tooling reads the DOM from a real
-//! browser over CDP, never by parsing HTML strings), so to keep the dependency
-//! footprint unchanged we extract the few fields we need with targeted `regex`
-//! over the *specific, stable* DuckDuckGo Lite markup — the same fixed selectors
-//! BeautifulSoup keyed on (`a.result-link`, `td.result-snippet`). The extraction
-//! is faithful to the Python logic and fully fixture-tested in `search_tests.rs`.
+//! handlers inject their backends, so the tool's parsing/formatting logic is
+//! unit-tested deterministically with fixture JSON — no network is touched.
 
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use regex::Regex;
-use reqwest::header::{ACCEPT, ACCEPT_LANGUAGE, USER_AGENT};
 
 use crate::tools::runtime::{
     Approvable, ExecOutput, SandboxAttempt, Sandboxable, ToolCtx, ToolError, ToolRuntime,
@@ -54,21 +55,33 @@ use crate::tools::sandbox::{SandboxPermissions, SandboxPreference};
 /// The tool name surfaced to the model.
 pub const SEARCH_TOOL_NAME: &str = "search";
 
-/// The DuckDuckGo Lite search endpoint the real backend fetches.
-const DDG_LITE_BASE_URL: &str = "https://lite.duckduckgo.com/lite/";
+/// Whether search calls may run concurrently with other parallel-safe tools.
+///
+/// Kept serial: a conservative scheduling default for a billed API call
+/// (carried over from the previous engine's rate-limit concerns).
+pub const SEARCH_PARALLEL_SAFE: bool = false;
 
-/// Browser-like `User-Agent` (ported verbatim from the Python action's headers).
-const DDG_USER_AGENT: &str = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) \
-AppleWebKit/537.36 (KHTML, like Gecko) Chrome/144.0.0.0 Safari/537.36";
+/// The browser-use search service base URL.
+const SEARCH_BASE_URL: &str = "https://search.browser-use.com";
 
-/// `Accept` header (ported verbatim from the Python action's headers).
-const DDG_ACCEPT: &str = "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8";
+/// Environment variable overriding the search service base URL (e.g. a local
+/// dev instance, `http://localhost:8080`, which runs as an open proxy without
+/// auth). Defaults to [`SEARCH_BASE_URL`].
+const SEARCH_BASE_URL_ENV: &str = "BROWSER_USE_SEARCH_URL";
 
-/// `Accept-Language` header (ported verbatim from the Python action's headers).
-const DDG_ACCEPT_LANGUAGE: &str = "en-US,en;q=0.9";
+/// Environment variable holding the `bu_…` browser-use API key. The same
+/// variable the rest of the workspace uses for browser-use cloud auth
+/// (`.env.example`, `browser-use-browser`).
+const SEARCH_API_KEY_ENV: &str = "BROWSER_USE_API_KEY";
 
-/// Request timeout (the Python action used `timeout=30.0`).
-const SEARCH_REQUEST_TIMEOUT_SECS: u64 = 30;
+/// Auth header the search service expects (service `internal/api/server.go` /
+/// its README: `X-Browser-Use-API-Key: bu_…`).
+const SEARCH_API_KEY_HEADER: &str = "X-Browser-Use-API-Key";
+
+/// Client-side request timeout. The service's own upstream (Parallel) timeout
+/// is 30s (`UPSTREAM_TIMEOUT`); 60s gives it room to answer — including with a
+/// `502` — before we cut the connection.
+const SEARCH_REQUEST_TIMEOUT_SECS: u64 = 60;
 
 /// Max characters of a result title in the formatted output. Titles are trimmed
 /// (with an ellipsis counted within the cap) to keep the model-facing text token
@@ -80,20 +93,22 @@ const MAX_DESCRIPTION_CHARS: usize = 125;
 
 /// A single parsed search result.
 ///
-/// Mirrors the Python action's `{title, url, description}` dict.
+/// Mirrors the service's result object; the wire `content` (multi-line
+/// markdown) is whitespace-normalized into the single-line `description`.
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct SearchResult {
-    /// The result's title (the `a.result-link` text).
+    /// The result's title; empty when the source provided none.
     pub title: String,
-    /// The result's destination URL (the DuckDuckGo redirect, unwrapped).
+    /// The result's destination URL.
     pub url: String,
-    /// The result's snippet (the following `td.result-snippet` text), if any.
+    /// `YYYY-MM-DD` publication date, when the source provides one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub published_date: Option<String>,
+    /// The result's content/snippet, normalized to a single line.
     pub description: String,
 }
 
 /// Typed request for the `search` tool.
-///
-/// Mirrors the Python `SearchParams { query }`.
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct SearchRequest {
     /// The search query to look up on the web.
@@ -109,60 +124,79 @@ impl SearchRequest {
     }
 }
 
-/// An error from the search backend's HTTP fetch.
+/// An error from the search backend's HTTP call.
 ///
-/// Reproduces the failure cases the Python `_search_duckduckgo` raised: a
-/// challenge/CAPTCHA page, a non-2xx HTTP status, and a transport error.
+/// The named variants mirror the service's documented statuses so the model
+/// sees an actionable message instead of a bare code.
 #[derive(Debug, thiserror::Error)]
 pub enum SearchError {
-    /// DuckDuckGo returned a challenge/anti-bot page (HTTP 202, or the body
-    /// mentions "anomaly").
-    #[error(
-        "DuckDuckGo is showing a challenge/CAPTCHA – too many requests or suspicious activity."
-    )]
-    Challenge,
-    /// The server returned a client/server error status.
+    /// No API key was configured; the request was not attempted.
+    #[error("BROWSER_USE_API_KEY is not set – the browser-use search API requires an API key")]
+    MissingApiKey,
+    /// The service rejected the API key (HTTP 401).
+    #[error("invalid or missing browser-use API key (HTTP 401)")]
+    Unauthorized,
+    /// The project balance is exhausted (HTTP 402).
+    #[error("insufficient browser-use balance (HTTP 402)")]
+    InsufficientBalance,
+    /// Any other client/server error status (400, 429, 502, 503, …).
     #[error("HTTP {status}: {snippet}")]
     Http {
         /// The HTTP status code.
         status: u16,
-        /// The first 200 chars of the response body (matching the Python
-        /// `response.text[:200]`).
+        /// The first 200 chars of the response body.
         snippet: String,
     },
+    /// A `200` response whose body was not the documented JSON shape.
+    #[error("unexpected response body: {0}")]
+    Decode(String),
     /// A transport-level error (connection, timeout, decoding).
     #[error("{0}")]
     Request(String),
 }
 
-/// The network seam: fetch the raw DuckDuckGo Lite HTML for a query.
+/// The network seam: fetch the raw search-API response body for a query.
 ///
 /// Implemented for real by [`HttpSearchBackend`] and by a fake in tests, so the
 /// tool's parsing/formatting can be exercised without a real network — mirroring
 /// the `browser` / `python` / `mcp` backend seams.
 #[async_trait::async_trait]
 pub trait SearchBackend: Send + Sync {
-    /// Fetch the DuckDuckGo Lite result HTML for `query`.
+    /// Fetch the search service's JSON response body for `query`.
     async fn fetch(&self, query: &str) -> Result<String, SearchError>;
 }
 
-/// The real [`SearchBackend`]: a `reqwest` client against DuckDuckGo Lite.
+/// The real [`SearchBackend`]: a `reqwest` client against the browser-use
+/// search service.
 pub struct HttpSearchBackend {
     client: reqwest::Client,
     base_url: String,
+    api_key: Option<String>,
 }
 
 impl HttpSearchBackend {
-    /// Construct the backend with a default client and the DuckDuckGo Lite
-    /// endpoint.
+    /// Construct the backend from the environment: the base URL from
+    /// [`BROWSER_USE_SEARCH_URL`](SEARCH_BASE_URL_ENV) (defaulting to the
+    /// production [`SEARCH_BASE_URL`]) and the API key from
+    /// [`BROWSER_USE_API_KEY`](SEARCH_API_KEY_ENV).
     pub fn new() -> Self {
+        let base_url = std::env::var(SEARCH_BASE_URL_ENV)
+            .ok()
+            .map(|url| url.trim().trim_end_matches('/').to_string())
+            .filter(|url| !url.is_empty())
+            .unwrap_or_else(|| SEARCH_BASE_URL.to_string());
+        let api_key = std::env::var(SEARCH_API_KEY_ENV)
+            .ok()
+            .map(|key| key.trim().to_string())
+            .filter(|key| !key.is_empty());
         let client = reqwest::Client::builder()
             .timeout(Duration::from_secs(SEARCH_REQUEST_TIMEOUT_SECS))
             .build()
             .unwrap_or_else(|_| reqwest::Client::new());
         Self {
             client,
-            base_url: DDG_LITE_BASE_URL.to_string(),
+            base_url,
+            api_key,
         }
     }
 }
@@ -176,18 +210,22 @@ impl Default for HttpSearchBackend {
 #[async_trait::async_trait]
 impl SearchBackend for HttpSearchBackend {
     async fn fetch(&self, query: &str) -> Result<String, SearchError> {
-        // `reqwest`'s `.query()` produces application/x-www-form-urlencoded
-        // output (space -> `+`); the encoded byte set differs from Python's
-        // `quote_plus` on a few characters (e.g. `~`, `*`), but DuckDuckGo
-        // decodes both to the same query, so results are equivalent. Redirects
-        // are followed by default, matching `follow_redirects=True`.
-        let response = self
+        // The production service always requires a key: fail fast with an
+        // actionable message instead of a guaranteed 401 round-trip. A custom
+        // endpoint (BROWSER_USE_SEARCH_URL, e.g. a local dev instance) may be
+        // an open proxy, so keyless requests are allowed through there.
+        if self.api_key.is_none() && self.base_url == SEARCH_BASE_URL {
+            return Err(SearchError::MissingApiKey);
+        }
+
+        let mut request = self
             .client
-            .get(&self.base_url)
-            .query(&[("q", query)])
-            .header(USER_AGENT, DDG_USER_AGENT)
-            .header(ACCEPT, DDG_ACCEPT)
-            .header(ACCEPT_LANGUAGE, DDG_ACCEPT_LANGUAGE)
+            .post(format!("{}/search", self.base_url))
+            .json(&serde_json::json!({ "query": query }));
+        if let Some(api_key) = self.api_key.as_deref() {
+            request = request.header(SEARCH_API_KEY_HEADER, api_key);
+        }
+        let response = request
             .send()
             .await
             .map_err(|err| SearchError::Request(err.to_string()))?;
@@ -203,18 +241,20 @@ impl SearchBackend for HttpSearchBackend {
     }
 }
 
-/// Classify an HTTP response the way the Python action did: a challenge page
-/// (status 202 or an "anomaly" body) first, then any `>= 400` status as an
-/// error, otherwise success.
+/// Classify an HTTP response per the service's documented statuses: `401` and
+/// `402` get named, actionable errors; any other `>= 400` (400 invalid query,
+/// 429 rate limited, 502 upstream failed, 503 auth backend down) carries the
+/// status plus the first 200 chars of the body; everything else is success.
 pub fn classify_response(status: u16, body: &str) -> Result<(), SearchError> {
-    if status == 202 || body.to_ascii_lowercase().contains("anomaly") {
-        return Err(SearchError::Challenge);
+    match status {
+        401 => Err(SearchError::Unauthorized),
+        402 => Err(SearchError::InsufficientBalance),
+        s if s >= 400 => {
+            let snippet: String = body.chars().take(200).collect();
+            Err(SearchError::Http { status: s, snippet })
+        }
+        _ => Ok(()),
     }
-    if status >= 400 {
-        let snippet: String = body.chars().take(200).collect();
-        return Err(SearchError::Http { status, snippet });
-    }
-    Ok(())
 }
 
 /// The async `search` tool.
@@ -281,8 +321,8 @@ impl Approvable<SearchRequest> for SearchTool {
     }
 
     // `exec_approval_requirement` is intentionally left at its trait default
-    // (`None`): the search is a benign, read-only HTTP GET (the Python action had
-    // no approval gate either). Returning `None` lets the orchestrator apply
+    // (`None`): the search is a benign, read-only query against the browser-use
+    // search API. Returning `None` lets the orchestrator apply
     // `default_exec_approval_requirement`, which yields `Skip` under any
     // non-prompting policy. The outbound request mirrors the crate's existing
     // network usage (the MCP HTTP client, analytics) which is likewise ungated.
@@ -306,10 +346,7 @@ impl Sandboxable for SearchTool {
 #[async_trait::async_trait]
 impl ToolRuntime<SearchRequest, ExecOutput> for SearchTool {
     fn parallel_safe(&self, _req: &SearchRequest) -> bool {
-        // A read-only HTTP GET + pure parse mutates no shared state, so it is safe
-        // to run concurrently with other tools — matching the parallel-safe
-        // stance of `tool_search` / `web_search`.
-        true
+        SEARCH_PARALLEL_SAFE
     }
 
     async fn run(
@@ -329,13 +366,16 @@ impl ToolRuntime<SearchRequest, ExecOutput> for SearchTool {
             ));
         }
 
-        // A fetch failure is surfaced to the model as a soft error (nonzero exit
-        // with the message on stderr), mirroring the Python action's
-        // `ActionResult(error="Search failed: …")` and the MCP handler's
-        // model-facing error mapping — not a hard tool error.
-        match self.backend.fetch(query).await {
-            Ok(html) => {
-                let results = parse_lite_results(&html);
+        // A fetch/parse failure is surfaced to the model as a soft error
+        // (nonzero exit with the message on stderr), mirroring the MCP
+        // handler's model-facing error mapping — not a hard tool error.
+        match self
+            .backend
+            .fetch(query)
+            .await
+            .and_then(|body| parse_results(&body))
+        {
+            Ok(results) => {
                 let stdout = if results.is_empty() {
                     format!("No results found for \"{query}\".")
                 } else {
@@ -357,17 +397,70 @@ impl ToolRuntime<SearchRequest, ExecOutput> for SearchTool {
 }
 
 // ---------------------------------------------------------------------------
-// Pure helpers (parsing + formatting) — ported from the Python action.
+// Pure helpers (parsing + formatting).
 // ---------------------------------------------------------------------------
+
+/// Wire shape of the service's `200` response: `{"results": [...]}`.
+#[derive(serde::Deserialize)]
+struct SearchResponseWire {
+    #[serde(default)]
+    results: Vec<SearchResultWire>,
+}
+
+/// Wire shape of one result. `title` / `published_date` are omitted when the
+/// source lacks them; everything defaults so one sparse result cannot fail the
+/// whole response.
+#[derive(serde::Deserialize)]
+struct SearchResultWire {
+    #[serde(default)]
+    title: String,
+    #[serde(default)]
+    url: String,
+    #[serde(default)]
+    published_date: Option<String>,
+    #[serde(default)]
+    content: String,
+}
+
+/// Parse the search service's JSON response body into results.
+///
+/// The wire `content` arrives as multi-line markdown; it is whitespace-
+/// normalized into the single-line `description`. Results without an
+/// `http(s)://` URL are dropped: a url-less result cannot be followed, and the
+/// formatted output tells the model to navigate to result URLs, so unsafe
+/// schemes (`javascript:`, `data:`, …) must never surface. A body that is not
+/// the documented JSON shape is a [`SearchError::Decode`].
+pub fn parse_results(body: &str) -> Result<Vec<SearchResult>, SearchError> {
+    let wire: SearchResponseWire =
+        serde_json::from_str(body).map_err(|err| SearchError::Decode(err.to_string()))?;
+
+    Ok(wire
+        .results
+        .into_iter()
+        .filter(|result| {
+            let url = result.url.trim();
+            url.starts_with("https://") || url.starts_with("http://")
+        })
+        .map(|result| SearchResult {
+            title: normalize_whitespace(&result.title),
+            url: result.url.trim().to_string(),
+            published_date: result
+                .published_date
+                .map(|date| date.trim().to_string())
+                .filter(|date| !date.is_empty()),
+            description: normalize_whitespace(&result.content),
+        })
+        .collect())
+}
 
 /// Format parsed results into the readable text block the model sees.
 ///
-/// Faithful to the Python action's `extracted_content` layout: a header (count +
-/// the "you already have the results" guidance), then a numbered list with each
-/// result's title, `URL:` line, and optional snippet, blank-line separated. The
-/// title and description are truncated ([`MAX_TITLE_CHARS`] /
-/// [`MAX_DESCRIPTION_CHARS`]) for token efficiency; URLs are kept intact so they
-/// remain usable.
+/// A header (count + the "you already have the results" guidance), then a
+/// numbered list with each result's title (publication date appended when
+/// known), `URL:` line, and optional snippet, blank-line separated. The title
+/// and description are truncated ([`MAX_TITLE_CHARS`] /
+/// [`MAX_DESCRIPTION_CHARS`]) for token efficiency; URLs are kept intact so
+/// they remain usable.
 pub fn format_results(query: &str, results: &[SearchResult]) -> String {
     let mut lines: Vec<String> = Vec::with_capacity(results.len() * 4 + 1);
     lines.push(format!(
@@ -377,11 +470,17 @@ pub fn format_results(query: &str, results: &[SearchResult]) -> String {
         results.len()
     ));
     for (i, result) in results.iter().enumerate() {
-        lines.push(format!(
-            "{}. {}",
-            i + 1,
-            truncate_chars(&result.title, MAX_TITLE_CHARS)
-        ));
+        // Fall back to the URL when the source provided no title.
+        let title = if result.title.is_empty() {
+            result.url.as_str()
+        } else {
+            result.title.as_str()
+        };
+        let mut title_line = format!("{}. {}", i + 1, truncate_chars(title, MAX_TITLE_CHARS));
+        if let Some(date) = result.published_date.as_deref() {
+            title_line.push_str(&format!(" ({date})"));
+        }
+        lines.push(title_line);
         lines.push(format!("   URL: {}", result.url));
         if !result.description.is_empty() {
             lines.push(format!(
@@ -407,368 +506,14 @@ fn truncate_chars(text: &str, max: usize) -> String {
     format!("{}…", prefix.trim_end())
 }
 
-/// Unwrap a DuckDuckGo redirect URL to its real destination.
-///
-/// Ported from the Python `_extract_real_url`:
-/// * protocol-relative `//host/…` gets an `https:` scheme;
-/// * a `duckduckgo.com/l/?uddg=…` redirect is unwrapped to its `uddg` target
-///   (form-decoded, matching `parse_qs` + `unquote`);
-/// * ad links (`duckduckgo.com/y.js`) and non-`http(s)` schemes are dropped
-///   (returns `None`).
-pub fn extract_real_url(ddg_url: &str) -> Option<String> {
-    if ddg_url.is_empty() {
-        return None;
-    }
-
-    let with_scheme = if let Some(rest) = ddg_url.strip_prefix("//") {
-        format!("https://{rest}")
-    } else {
-        ddg_url.to_string()
-    };
-
-    let mut url = with_scheme.clone();
-    if with_scheme.contains("duckduckgo.com/l/") && with_scheme.contains("uddg=") {
-        if let Some(target) = query_param(&with_scheme, "uddg") {
-            url = target;
-        }
-    }
-
-    // Ad links – skip.
-    if url.contains("duckduckgo.com/y.js") {
-        return None;
-    }
-
-    // Only allow http/https to prevent unsafe URLs (javascript:, data:, …).
-    if !(url.starts_with("https://") || url.starts_with("http://")) {
-        return None;
-    }
-
-    Some(url)
-}
-
 /// Collapse runs of whitespace into a single space and trim the ends.
-///
-/// Ported from the Python `_normalize_whitespace`
-/// (`re.sub(r"\s+", " ", text).strip()`).
 pub fn normalize_whitespace(text: &str) -> String {
     whitespace_regex()
         .replace_all(text.trim(), " ")
         .into_owned()
 }
 
-/// Parse search results out of a DuckDuckGo Lite HTML response.
-///
-/// Ported from the Python `_parse_lite_results`: for each `a.result-link`, take
-/// its (entity-decoded) text as the title and unwrap its `href`; skip empty /
-/// "more info" / duplicate / `duckduckgo.com` results; and attach the snippet
-/// from the first following `td.result-snippet` that precedes the next result
-/// link.
-pub fn parse_lite_results(html: &str) -> Vec<SearchResult> {
-    let anchors = collect_anchors(html);
-    let snippets = collect_snippets(html);
-
-    let mut results: Vec<SearchResult> = Vec::new();
-    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
-
-    for (idx, anchor) in anchors.iter().enumerate() {
-        if anchor.title.is_empty() || anchor.title.eq_ignore_ascii_case("more info") {
-            continue;
-        }
-
-        let Some(url) = extract_real_url(&anchor.href) else {
-            continue;
-        };
-        if seen.contains(&url) || is_duckduckgo_result_host(&url) {
-            continue;
-        }
-        seen.insert(url.clone());
-
-        // The snippet is the first `result-snippet` after this anchor and before
-        // the next one (matching the Python sibling-walk that stops at the next
-        // result link).
-        let next_pos = anchors.get(idx + 1).map_or(usize::MAX, |a| a.pos);
-        let description = snippets
-            .iter()
-            .find(|s| s.pos > anchor.pos && s.pos < next_pos)
-            .map(|s| s.text.clone())
-            .unwrap_or_default();
-
-        results.push(SearchResult {
-            title: anchor.title.clone(),
-            url,
-            description,
-        });
-    }
-
-    results
-}
-
-fn is_duckduckgo_result_host(url: &str) -> bool {
-    reqwest::Url::parse(url)
-        .ok()
-        .and_then(|url| url.host_str().map(str::to_ascii_lowercase))
-        .is_some_and(|host| host == "duckduckgo.com" || host.ends_with(".duckduckgo.com"))
-}
-
-/// A raw `a.result-link` extracted from the HTML, with its byte offset.
-struct RawAnchor {
-    pos: usize,
-    href: String,
-    title: String,
-}
-
-/// A raw `td.result-snippet` extracted from the HTML, with its byte offset.
-struct RawSnippet {
-    pos: usize,
-    text: String,
-}
-
-/// Extract every `a.result-link` anchor (offset, href, title) in document order.
-fn collect_anchors(html: &str) -> Vec<RawAnchor> {
-    anchor_regex()
-        .captures_iter(html)
-        .filter_map(|caps| {
-            let whole = caps.get(0)?;
-            let attrs = caps.get(1).map_or("", |m| m.as_str());
-            let inner = caps.get(2).map_or("", |m| m.as_str());
-            if !has_class(attrs, "result-link") {
-                return None;
-            }
-            Some(RawAnchor {
-                pos: whole.start(),
-                href: attr_value(attrs, AttrName::Href).unwrap_or_default(),
-                // Strip tags, decode entities, then trim. DuckDuckGo Lite titles
-                // are plain text, so this matches the Python `get_text(strip=True)`
-                // title extraction; on any inline markup it yields the cleaner
-                // space-preserving text rather than BeautifulSoup's node-join.
-                title: text_from_html(inner, "").trim().to_string(),
-            })
-        })
-        .collect()
-}
-
-/// Extract every `td.result-snippet` (offset, normalized text) in document order.
-fn collect_snippets(html: &str) -> Vec<RawSnippet> {
-    td_regex()
-        .captures_iter(html)
-        .filter_map(|caps| {
-            let whole = caps.get(0)?;
-            let attrs = caps.get(1).map_or("", |m| m.as_str());
-            let inner = caps.get(2).map_or("", |m| m.as_str());
-            if !has_class(attrs, "result-snippet") {
-                return None;
-            }
-            Some(RawSnippet {
-                pos: whole.start(),
-                // `get_text(separator=" ")` then normalize whitespace.
-                text: normalize_whitespace(&text_from_html(inner, " ")),
-            })
-        })
-        .collect()
-}
-
-/// Strip HTML tags (replacing each with `separator`) and decode entities.
-fn text_from_html(html: &str, separator: &str) -> String {
-    let without_tags = tag_regex().replace_all(html, separator);
-    decode_entities(&without_tags)
-}
-
-/// Whether a tag's attribute string declares `class` containing `class_name`.
-fn has_class(attrs: &str, class_name: &str) -> bool {
-    attr_value(attrs, AttrName::Class)
-        .is_some_and(|value| value.split_whitespace().any(|c| c == class_name))
-}
-
-/// The attributes we extract from a tag.
-#[derive(Clone, Copy)]
-enum AttrName {
-    Href,
-    Class,
-}
-
-/// Extract a quoted attribute value from a tag's attribute string.
-fn attr_value(attrs: &str, name: AttrName) -> Option<String> {
-    let re = match name {
-        AttrName::Href => href_regex(),
-        AttrName::Class => class_regex(),
-    };
-    re.captures(attrs)
-        .and_then(|caps| caps.get(1))
-        .map(|m| m.as_str().to_string())
-}
-
-/// Read a single query parameter's value, form-decoded (matching `parse_qs`:
-/// `+` becomes a space and `%XX` is percent-decoded).
-fn query_param(url: &str, key: &str) -> Option<String> {
-    let (_, query) = url.split_once('?')?;
-    // Drop any fragment before splitting pairs.
-    let query = query.split('#').next().unwrap_or(query);
-    for pair in query.split('&') {
-        let (k, v) = pair.split_once('=').unwrap_or((pair, ""));
-        if k == key {
-            return Some(percent_decode_form(v));
-        }
-    }
-    None
-}
-
-/// Form-decode a query component: `+` -> space, `%XX` -> byte, then UTF-8.
-fn percent_decode_form(value: &str) -> String {
-    let spaced = value.replace('+', " ");
-    let bytes = spaced.as_bytes();
-    let mut out: Vec<u8> = Vec::with_capacity(bytes.len());
-    let mut i = 0;
-    while i < bytes.len() {
-        if bytes[i] == b'%' && i + 2 < bytes.len() {
-            if let (Some(hi), Some(lo)) = (hex_val(bytes[i + 1]), hex_val(bytes[i + 2])) {
-                out.push(hi * 16 + lo);
-                i += 3;
-                continue;
-            }
-        }
-        out.push(bytes[i]);
-        i += 1;
-    }
-    String::from_utf8_lossy(&out).into_owned()
-}
-
-/// Hex digit value of an ASCII byte, or `None`.
-fn hex_val(byte: u8) -> Option<u8> {
-    match byte {
-        b'0'..=b'9' => Some(byte - b'0'),
-        b'a'..=b'f' => Some(byte - b'a' + 10),
-        b'A'..=b'F' => Some(byte - b'A' + 10),
-        _ => None,
-    }
-}
-
-/// Decode the common HTML character references in one pass.
-///
-/// Covers the named references that appear in DuckDuckGo snippets plus all
-/// numeric references (`&#NN;` / `&#xHH;`); unknown named references are left
-/// intact (BeautifulSoup decodes the full set — this is the practical subset).
-fn decode_entities(text: &str) -> String {
-    entity_regex()
-        .replace_all(text, |caps: &regex::Captures<'_>| {
-            let body = &caps[1];
-            if let Some(hex) = body.strip_prefix("#x").or_else(|| body.strip_prefix("#X")) {
-                return decode_codepoint(u32::from_str_radix(hex, 16).ok())
-                    .unwrap_or_else(|| caps[0].to_string());
-            }
-            if let Some(dec) = body.strip_prefix('#') {
-                return decode_codepoint(dec.parse::<u32>().ok())
-                    .unwrap_or_else(|| caps[0].to_string());
-            }
-            match body {
-                "amp" => "&",
-                "lt" => "<",
-                "gt" => ">",
-                "quot" => "\"",
-                "apos" => "'",
-                "nbsp" => " ",
-                // Typographic punctuation.
-                "hellip" => "…",
-                "mdash" => "—",
-                "ndash" => "–",
-                "rsquo" => "\u{2019}",
-                "lsquo" => "\u{2018}",
-                "rdquo" => "\u{201D}",
-                "ldquo" => "\u{201C}",
-                "laquo" => "«",
-                "raquo" => "»",
-                "middot" => "·",
-                "bull" => "•",
-                // Common symbols.
-                "copy" => "©",
-                "reg" => "®",
-                "trade" => "™",
-                "times" => "×",
-                "divide" => "÷",
-                "deg" => "°",
-                "euro" => "€",
-                "pound" => "£",
-                "cent" => "¢",
-                "sect" => "§",
-                // Common Western-European accented letters.
-                "aacute" => "á",
-                "agrave" => "à",
-                "acirc" => "â",
-                "auml" => "ä",
-                "aring" => "å",
-                "ccedil" => "ç",
-                "eacute" => "é",
-                "egrave" => "è",
-                "ecirc" => "ê",
-                "euml" => "ë",
-                "iacute" => "í",
-                "iuml" => "ï",
-                "ntilde" => "ñ",
-                "oacute" => "ó",
-                "ocirc" => "ô",
-                "ouml" => "ö",
-                "uacute" => "ú",
-                "uuml" => "ü",
-                "szlig" => "ß",
-                // Unknown named reference: leave the original text intact
-                // (BeautifulSoup decodes the full HTML5 set; this is the
-                // practical subset DuckDuckGo emits, plus all numeric refs).
-                _ => return caps[0].to_string(),
-            }
-            .to_string()
-        })
-        .into_owned()
-}
-
-/// Map a numeric character-reference code point to its string, if valid.
-fn decode_codepoint(code: Option<u32>) -> Option<String> {
-    code.and_then(char::from_u32).map(|c| c.to_string())
-}
-
-// --- Cached regexes (compiled once; patterns are constant) -----------------
-//
-// The tag regexes use `[^>]*` for the attribute span, which assumes attribute
-// values contain no literal `>` — true for the fixed DuckDuckGo Lite markup
-// (see the module doc). On non-conforming markup a `>` inside an attribute
-// value would truncate the match (dropping that result), never panic.
-
-fn anchor_regex() -> &'static Regex {
-    static RE: OnceLock<Regex> = OnceLock::new();
-    RE.get_or_init(|| Regex::new(r"(?is)<a\b([^>]*)>(.*?)</a>").expect("valid anchor regex"))
-}
-
-fn td_regex() -> &'static Regex {
-    static RE: OnceLock<Regex> = OnceLock::new();
-    RE.get_or_init(|| Regex::new(r"(?is)<td\b([^>]*)>(.*?)</td>").expect("valid td regex"))
-}
-
-fn tag_regex() -> &'static Regex {
-    static RE: OnceLock<Regex> = OnceLock::new();
-    RE.get_or_init(|| Regex::new(r"(?s)<[^>]*>").expect("valid tag regex"))
-}
-
-fn href_regex() -> &'static Regex {
-    static RE: OnceLock<Regex> = OnceLock::new();
-    RE.get_or_init(|| {
-        Regex::new(r#"(?i)(?:^|\s)href\s*=\s*["']([^"']*)["']"#).expect("valid href regex")
-    })
-}
-
-fn class_regex() -> &'static Regex {
-    static RE: OnceLock<Regex> = OnceLock::new();
-    RE.get_or_init(|| {
-        Regex::new(r#"(?i)(?:^|\s)class\s*=\s*["']([^"']*)["']"#).expect("valid class regex")
-    })
-}
-
 fn whitespace_regex() -> &'static Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
     RE.get_or_init(|| Regex::new(r"\s+").expect("valid whitespace regex"))
-}
-
-fn entity_regex() -> &'static Regex {
-    static RE: OnceLock<Regex> = OnceLock::new();
-    RE.get_or_init(|| {
-        Regex::new(r"&(#[0-9]+|#[xX][0-9a-fA-F]+|[a-zA-Z][a-zA-Z0-9]*);")
-            .expect("valid entity regex")
-    })
 }

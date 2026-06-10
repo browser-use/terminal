@@ -1631,6 +1631,18 @@ fn run_session_via_engine_with_runtime_and_cancel(
     cancellation_token: tokio_util::sync::CancellationToken,
     browser_id: Option<BrowserId>,
 ) -> Result<String> {
+    // Make the stored cloud API key visible to Rust-side Browser Use API
+    // calls (cloud browser, `search` tool) that read it from the environment,
+    // mirroring the TUI's `prepare_tui_agent_run`. The env wins when already
+    // set; the store fills it in otherwise.
+    if std::env::var(BROWSER_USE_CLOUD_API_KEY_ENV).map_or(true, |v| v.trim().is_empty()) {
+        if let Some(api_key) = store
+            .get_setting(BROWSER_USE_CLOUD_API_KEY_SETTING)?
+            .filter(|value| !value.trim().is_empty())
+        {
+            std::env::set_var(BROWSER_USE_CLOUD_API_KEY_ENV, api_key);
+        }
+    }
     let _local_runtime_server = CliLocalRuntimeServer::ensure(store, &runtime_handle)?;
     let executor = cli_runtime_agent_executor(store, runtime_handle)?;
     attach_cli_child_agent_runner(store, executor.clone(), &mut config);
@@ -2811,7 +2823,8 @@ fn analytics_provider_kind_for_backend(backend: ProviderBackend) -> &'static str
         ProviderBackend::Openai
         | ProviderBackend::Anthropic
         | ProviderBackend::Openrouter
-        | ProviderBackend::Deepseek => "api_key",
+        | ProviderBackend::Deepseek
+        | ProviderBackend::BrowserUse => "api_key",
         ProviderBackend::Fake | ProviderBackend::None => "other",
     }
 }
@@ -2823,6 +2836,7 @@ fn provider_id_for_backend(backend: ProviderBackend) -> &'static str {
         ProviderBackend::Anthropic => "anthropic",
         ProviderBackend::Openrouter => "openrouter",
         ProviderBackend::Deepseek => "deepseek",
+        ProviderBackend::BrowserUse => "browser-use",
         ProviderBackend::Fake => "fake",
         ProviderBackend::None => "none",
     }
