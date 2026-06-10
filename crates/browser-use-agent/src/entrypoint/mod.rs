@@ -1448,11 +1448,25 @@ fn discover_result_files(cwd: &std::path::Path) -> Vec<DiscoveredResultFile> {
         .filter_map(|entry| {
             let path = entry.path();
             let name = path.file_name()?.to_str()?;
-            if !name.starts_with("result.") {
+            // Match any result-shaped artifact, not just `result.*`: the model
+            // routinely saves the deliverable under other names (result_probe.json,
+            // feb17_selected.json, *.csv) and then ends without a clean done(), so a
+            // narrow `result.` filter silently discarded completed work (real_v8
+            // task 52). Priority below still prefers canonical names; we only ever
+            // use this when there is no inline answer at all.
+            let lower = name.to_ascii_lowercase();
+            let result_shaped = lower.starts_with("result")
+                || lower.ends_with(".json")
+                || lower.ends_with(".csv")
+                || lower.ends_with(".md")
+                || lower.ends_with(".txt");
+            if !result_shaped {
                 return None;
             }
             let metadata = entry.metadata().ok()?;
-            if !metadata.is_file() || metadata.len() == 0 {
+            // Require a minimally substantive file so we never finalize on an
+            // empty stub or tiny scratch file.
+            if !metadata.is_file() || metadata.len() < 16 {
                 return None;
             }
             Some(DiscoveredResultFile {
@@ -1472,20 +1486,28 @@ fn discover_result_files(cwd: &std::path::Path) -> Vec<DiscoveredResultFile> {
             .file_name()
             .and_then(|name| name.to_str())
             .unwrap_or("");
+        // Canonical names first; within the same priority prefer the file with
+        // more content (more likely the real deliverable than a scratch file).
         result_file_priority(left_name)
             .cmp(&result_file_priority(right_name))
+            .then_with(|| right.bytes.cmp(&left.bytes))
             .then_with(|| left_name.cmp(right_name))
     });
     files
 }
 
 fn result_file_priority(name: &str) -> usize {
-    match name {
+    let n = name.to_ascii_lowercase();
+    match n.as_str() {
         "result.json" => 0,
         "result.csv" => 1,
         "result.md" => 2,
         "result.txt" => 3,
-        _ => 10,
+        _ if n.starts_with("result") => 4,
+        _ if n.ends_with(".json") => 5,
+        _ if n.ends_with(".csv") => 6,
+        _ if n.ends_with(".md") => 7,
+        _ => 8,
     }
 }
 
@@ -2710,9 +2732,26 @@ impl<Sd: SamplingDriver> RuntimeTurnLoopDriver<Sd> {
             Err(error) => {
                 let _ = cleanup_session_resources_for_terminal(
                     runtime_handle.clone(),
-                    runtime_session_id,
+                    runtime_session_id.clone(),
                 )
                 .await;
+                // Never lose finished work on a crash: if a substantive result
+                // artifact already exists on disk, capture it as session.done
+                // instead of failing with nothing (real_v8 task 99: provider
+                // error mid-run, but result.json was already written).
+                if !cancel.is_cancelled() {
+                    if let Some(fallback) =
+                        fallback_result_file_for_session(&store, session_id.as_str())
+                    {
+                        runtime_handle.append_observed_session_event(
+                            runtime_session_id,
+                            names::SESSION_DONE,
+                            session_done_payload(Some(&fallback.text), Some(&fallback.file)),
+                            RuntimeDurability::Barrier,
+                        )?;
+                        return Ok(Some(fallback.text));
+                    }
+                }
                 Err(error)
             }
         }
