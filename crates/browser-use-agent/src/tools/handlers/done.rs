@@ -445,8 +445,12 @@ fn collect_json_placeholder_stats(value: &Value, stats: &mut JsonPlaceholderStat
 
 fn is_placeholder_string(text: &str) -> bool {
     let normalized = text.trim().to_ascii_lowercase();
+    // An empty string is a deliberate "checked, genuinely absent" sentinel, and
+    // many tasks explicitly MANDATE "" for missing values. Counting "" as a
+    // placeholder rejected spec-correct answers and coerced literal placeholder
+    // prose instead (real_v8 task 94). null is treated the same way.
     if normalized.is_empty() {
-        return true;
+        return false;
     }
     matches!(
         normalized.as_str(),
