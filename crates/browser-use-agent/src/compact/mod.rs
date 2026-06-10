@@ -302,7 +302,16 @@ pub fn compacted_history_from_summary(
     summary_suffix: CompactionSummary,
     token_limit: usize,
 ) -> CompactedHistory {
-    let summary_text = format!("{SUMMARY_PREFIX}\n{}", summary_suffix.text);
+    // Apply the empty-summary fallback to the SUFFIX before prepending the
+    // prefix — otherwise the prefix makes the string non-empty and the fallback
+    // in build_compacted_history is dead code, shipping PREFIX + "" (total
+    // post-compaction amnesia; real_v8 task 24).
+    let suffix_text = if summary_suffix.text.trim().is_empty() {
+        "(no summary available)".to_string()
+    } else {
+        summary_suffix.text.clone()
+    };
+    let summary_text = format!("{SUMMARY_PREFIX}\n{suffix_text}");
     let user_messages: Vec<String> = history.iter().filter_map(real_user_message_text).collect();
     let items = build_compacted_history(&user_messages, &summary_text, token_limit);
 
