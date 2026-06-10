@@ -84,7 +84,7 @@ use crate::context::{
     ContextManager, Item,
 };
 use crate::decision::{AutoCompactTokenLimitScope, SamplingOutcome, TokenStatus};
-use crate::events::{names, session_done_payload, EventSink, PendingEvent, TurnCtx};
+use crate::events::{names, session_done_payload, EventSink, PendingEvent, ResultFilePtr, TurnCtx};
 use crate::live_executor::ensure_agent_attached as ensure_runtime_agent_attached;
 use crate::session::reconstruct::WORKSPACE_CONTEXT_MULTI_AGENT_USAGE_HINT_KIND;
 use crate::session::SessionId;
@@ -1394,6 +1394,101 @@ fn runtime_or_store_events(
         .unwrap_or_default()
 }
 
+/// Fallback final result discovered from the session cwd when the model ends
+/// without a `done()` call (ported from exp/real-v8-restore-88 2bd479d).
+struct FallbackResultFile {
+    text: String,
+    file: ResultFilePtr,
+}
+
+fn fallback_result_file_for_session(
+    store: &SharedStore,
+    session_id: &str,
+) -> Option<FallbackResultFile> {
+    let session = store
+        .lock()
+        .expect("store mutex poisoned")
+        .load_session(session_id)
+        .ok()
+        .flatten()?;
+    let cwd = std::path::PathBuf::from(session.cwd);
+    let files = discover_result_files(&cwd);
+    let first = files.first()?;
+    let text = if files.len() == 1 {
+        format!("Result file: {}", first.path.display())
+    } else {
+        let rendered = files
+            .iter()
+            .map(|file| format!("- {}", file.path.display()))
+            .collect::<Vec<_>>()
+            .join("\n");
+        format!("Result files:\n{rendered}")
+    };
+    Some(FallbackResultFile {
+        text,
+        file: ResultFilePtr {
+            url: None,
+            path: Some(first.path.display().to_string()),
+            bytes: Some(first.bytes),
+        },
+    })
+}
+
+struct DiscoveredResultFile {
+    path: std::path::PathBuf,
+    bytes: u64,
+}
+
+fn discover_result_files(cwd: &std::path::Path) -> Vec<DiscoveredResultFile> {
+    let Ok(entries) = std::fs::read_dir(cwd) else {
+        return Vec::new();
+    };
+    let mut files = entries
+        .filter_map(Result::ok)
+        .filter_map(|entry| {
+            let path = entry.path();
+            let name = path.file_name()?.to_str()?;
+            if !name.starts_with("result.") {
+                return None;
+            }
+            let metadata = entry.metadata().ok()?;
+            if !metadata.is_file() || metadata.len() == 0 {
+                return None;
+            }
+            Some(DiscoveredResultFile {
+                path,
+                bytes: metadata.len(),
+            })
+        })
+        .collect::<Vec<_>>();
+    files.sort_by(|left, right| {
+        let left_name = left
+            .path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("");
+        let right_name = right
+            .path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("");
+        result_file_priority(left_name)
+            .cmp(&result_file_priority(right_name))
+            .then_with(|| left_name.cmp(right_name))
+    });
+    files
+}
+
+fn result_file_priority(name: &str) -> usize {
+    match name {
+        "result.json" => 0,
+        "result.csv" => 1,
+        "result.md" => 2,
+        "result.txt" => 3,
+        _ => 10,
+    }
+}
+
 fn ensure_fallback_capture_recording(store: &SharedStore, session_id: &str) {
     if !fallback_capture_recording_enabled() {
         return;
@@ -2588,15 +2683,29 @@ impl<Sd: SamplingDriver> RuntimeTurnLoopDriver<Sd> {
                     runtime_session_id.clone(),
                 )
                 .await?;
-                if let Some(text) = last_agent_message.as_deref() {
+                // Never lose finished work: if the model ended without a final
+                // message (no done() call — e.g. ended on leaked planning text
+                // or an empty turn), fall back to the best result.* artifact in
+                // the session cwd so session.done still carries the deliverable.
+                let mut final_message = last_agent_message;
+                let mut result_file: Option<ResultFilePtr> = None;
+                if final_message.is_none() && !cancel.is_cancelled() {
+                    if let Some(fallback) =
+                        fallback_result_file_for_session(&store, session_id.as_str())
+                    {
+                        final_message = Some(fallback.text);
+                        result_file = Some(fallback.file);
+                    }
+                }
+                if let Some(text) = final_message.as_deref() {
                     runtime_handle.append_observed_session_event(
                         runtime_session_id,
                         names::SESSION_DONE,
-                        session_done_payload(Some(text), None),
+                        session_done_payload(Some(text), result_file.as_ref()),
                         RuntimeDurability::Barrier,
                     )?;
                 }
-                Ok(last_agent_message)
+                Ok(final_message)
             }
             Err(error) => {
                 let _ = cleanup_session_resources_for_terminal(
