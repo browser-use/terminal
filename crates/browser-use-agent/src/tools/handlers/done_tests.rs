@@ -179,15 +179,17 @@ fn done_is_not_parallel_safe() {
 // ---- (6) eval-mode completion audit catches weak finals before terminal stop ----
 
 #[test]
-fn eval_done_audit_rejects_explicit_partial_completion() {
-    let err = audit_done_request(
+fn eval_done_audit_accepts_honest_partial_declaration() {
+    // Phrase-based wording rejections were removed: they trained the model to
+    // launder the SAME data behind confident phrasing (real_v8 tasks 75/77)
+    // and forced futile work on source-exhausted specs (task 87). Honest
+    // declarations are accepted; evidence checks (empty/placeholder JSON)
+    // still gate weak completions.
+    audit_done_request(
         &DoneRequest::with_result("partial_incomplete: two fields were not checked"),
         &ctx(),
     )
-    .expect_err("partial completion should be rejected");
-
-    assert!(err.contains("partial_incomplete"), "got: {err}");
-    assert!(err.contains("Continue working"), "got: {err}");
+    .expect("honest partial declaration is accepted");
 }
 
 #[test]

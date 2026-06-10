@@ -10,7 +10,8 @@ Important execution model:
 - Python variables do not persist across calls.
 - Browser/CDP state persists in Rust.
 - Fast calls return their final result immediately. Long calls return `status: running` with a `run_id`; keep observing that same run until it finishes, fails, or is cancelled.
-- To listen to a running script, call this tool with `action="observe"`, the returned `run_id`, and optionally `observe_timeout_ms`. Prefer coarse waits such as 30000-120000 ms for long navigation or extraction scripts; do not burn many turns polling the same `run_id` with short waits.
+- To listen to a running script, call this tool with `action="observe"`, the returned `run_id`, and optionally `observe_timeout_ms`. Prefer coarse waits such as 30000-120000 ms for long navigation or extraction scripts; do not burn many turns polling the same `run_id` with short waits. One generous observe beats several short polls. If a script checkpoints progress to a file, read the file from `shell` instead of observing again. If an observe reports the run completed or `not_found`, STOP: do not observe or cancel that run_id again — the result has already been delivered.
+- `js()` returns the JSON-serialized value of your expression: wrap complex returns in `JSON.stringify(...)` inside the JS and parse with `json.loads(...)`; print the raw return once before indexing into it. Never embed Python-built regex literals directly in JS strings (escaping differs) — build the pattern inside the JS or use string methods.
 - To stop a running script, call this tool with `action="cancel"` and the `run_id`. Partial images and artifacts emitted before cancellation are preserved.
 - A failed `browser_script` call may include a short diagnosis. Read that diagnosis first: if it says the browser is still connected or the same page is usable, continue from the same page instead of reconnecting.
 - Helpers are preimported; you do not need imports for normal browser work.

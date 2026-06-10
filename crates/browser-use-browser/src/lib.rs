@@ -1281,7 +1281,16 @@ pub fn observe_browser_script_with_registry(
     };
     let mut run = match lookup {
         BrowserScriptRunLookup::Run(run) => run,
-        BrowserScriptRunLookup::Cached(output) => return Ok(output),
+        BrowserScriptRunLookup::Cached(mut output) => {
+            // Repeat observe of a finished run: the result was already
+            // delivered once. Make that unmissable so the model stops
+            // polling/cancelling completed run_ids (a measured top turn sink).
+            output.text.push_str(
+                "\n[note: this run already completed and its result was already delivered. Do not observe or cancel this run_id again; use the output above or read its checkpoint/result files.]",
+            );
+            output.next_observe_ms = None;
+            return Ok(output);
+        }
         BrowserScriptRunLookup::Unknown => return Ok(unknown_browser_script_run_output(run_id)),
     };
     if run.session_id != session_id {

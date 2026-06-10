@@ -275,7 +275,14 @@ pub(crate) fn audit_done_request(req: &DoneRequest, ctx: &ToolCtx) -> Result<(),
         reasons.push("no final answer text or readable non-empty result_file".to_string());
     }
 
-    reasons.extend(text_audit_reasons(&audit_text));
+    // NOTE: phrase-based wording checks (text_audit_reasons) were removed.
+    // They rejected honest negative findings ("could not access", "blocked
+    // by", "source unavailable"), and the measured agent response was to
+    // resubmit the SAME data with laundered, more confident phrasing — the
+    // audit selected for wording over truth (real_v8 tasks 75, 77) and
+    // forced futile work on source-exhausted specs (task 87, 5.7 min after a
+    // correct final answer). Evidence-based checks (empty result, placeholder
+    // density) below carry the audit's measured wins (task 41).
     reasons.extend(json_audit_reasons(&audit_text));
 
     if reasons.is_empty() {
@@ -340,31 +347,6 @@ fn resolve_result_file(path: &str, ctx: &ToolCtx) -> PathBuf {
     cwd_path
 }
 
-fn text_audit_reasons(text: &str) -> Vec<String> {
-    let normalized = text.to_ascii_lowercase();
-    let markers = [
-        ("partial_incomplete", "declares partial_incomplete"),
-        ("partial / incomplete", "declares partial/incomplete"),
-        ("partial/incomplete", "declares partial/incomplete"),
-        ("not completed", "declares not completed"),
-        ("not checked", "declares not checked"),
-        ("not extracted", "declares not extracted"),
-        ("could not verify", "declares unverified data"),
-        ("couldn't verify", "declares unverified data"),
-        ("could not access", "declares inaccessible source"),
-        ("couldn't access", "declares inaccessible source"),
-        ("unavailable due to", "declares unavailable data"),
-        ("source unavailable", "declares unavailable source"),
-        ("blocked by", "declares blocked source"),
-        ("unable to complete", "declares incomplete task"),
-        ("task is incomplete", "declares incomplete task"),
-    ];
-
-    markers
-        .iter()
-        .filter_map(|(needle, reason)| normalized.contains(needle).then(|| (*reason).to_string()))
-        .collect()
-}
 
 fn json_audit_reasons(text: &str) -> Vec<String> {
     let Some(value) = parse_first_json_value(text) else {
@@ -445,8 +427,14 @@ fn collect_json_placeholder_stats(value: &Value, stats: &mut JsonPlaceholderStat
 
 fn is_placeholder_string(text: &str) -> bool {
     let normalized = text.trim().to_ascii_lowercase();
+    // An empty string, like null, is a deliberate "checked, genuinely absent"
+    // sentinel — and many tasks explicitly MANDATE "" for missing values.
+    // Counting "" as a placeholder rejected a spec-correct answer and coerced
+    // the agent into writing literal placeholder prose instead (real_v8 task
+    // 94: first done used "" per spec, audit bounced it, rewrite with
+    // "Members only - please Login..." text then failed the judge).
     if normalized.is_empty() {
-        return true;
+        return false;
     }
     matches!(
         normalized.as_str(),

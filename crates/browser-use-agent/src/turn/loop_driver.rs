@@ -79,8 +79,14 @@ use super::{CompactionMode, SamplingDriver, TurnObserver, TurnState};
 use crate::decision::{self, LoopStep};
 use crate::events::TurnCtx;
 use crate::task::{TurnAbortReason, TurnLifecycleEvent};
-use browser_use_llm::schema::{ContentPart, Message, MessageRole};
+use browser_use_llm::schema::{ContentPart, FinishReason, Message, MessageRole};
 use tokio_util::sync::CancellationToken;
+
+/// Injected ONCE when a bounded (max_turns) run ends on plain text without a
+/// successful `done` call. The model sometimes leaks planning text as its last
+/// turn (e.g. confusion after compaction) and the loop would otherwise accept
+/// that text as the final result (real_v8 task 24/45 class).
+const CALL_DONE_NUDGE: &str = "You ended your turn with plain text instead of calling the done tool. If the task is finished, call done(result=...) (or done(result_file=path) for a saved artifact) with the complete final answer now. If it is not finished, continue working with tool calls.";
 
 const FINAL_MAX_TURNS_NUDGE: &str = "This is the final allowed step for this run. Stop exploring and call the done tool with the best complete answer you can provide now. Include unknown or unavailable items explicitly instead of continuing to search.";
 const PROGRESS_MAX_TURNS_NUDGE: &str = "Progress checkpoint: If you have enough evidence, a saved artifact, or a complete-enough answer, stop further exploration and call the done tool now. Continue only for clearly missing required information that is likely to change the final answer.";
@@ -160,6 +166,8 @@ impl<St: TurnState, Sd: SamplingDriver, Ob: TurnObserver> TurnLoop<St, Sd, Ob> {
         let mut can_drain = decision::initial_can_drain(turn_has_fresh_input);
         let mut last_agent_message: Option<String> = None;
         let mut turns_run = 0usize;
+        let mut done_nudge_sent = false;
+        let mut pending_done_nudge = false;
 
         // Unbounded (`turn.rs:214`): NO max-turns counter. The only exits are
         // Complete, cancellation, or a hard error.
@@ -189,6 +197,13 @@ impl<St: TurnState, Sd: SamplingDriver, Ob: TurnObserver> TurnLoop<St, Sd, Ob> {
                 request.push(Message::new(
                     MessageRole::Developer,
                     vec![ContentPart::text(PROGRESS_MAX_TURNS_NUDGE)],
+                ));
+            }
+            if pending_done_nudge {
+                pending_done_nudge = false;
+                request.push(Message::new(
+                    MessageRole::Developer,
+                    vec![ContentPart::text(CALL_DONE_NUDGE)],
                 ));
             }
 
@@ -229,6 +244,18 @@ impl<St: TurnState, Sd: SamplingDriver, Ob: TurnObserver> TurnLoop<St, Sd, Ob> {
             // ---- 4. act on the step (codex `turn.rs:250-355`) ----
             match step {
                 LoopStep::Complete => {
+                    // Bounded (dataset/eval) runs should end with an explicit
+                    // done() call: a text-only completion (finish_reason Stop /
+                    // None — never a successful done's ToolUse) gets ONE nudge
+                    // to call done before we accept the text as final.
+                    let ended_without_done =
+                        !matches!(outcome.finish_reason, Some(FinishReason::ToolUse));
+                    if max_turns.is_some() && ended_without_done && !done_nudge_sent {
+                        done_nudge_sent = true;
+                        pending_done_nudge = true;
+                        can_drain = true;
+                        continue;
+                    }
                     // Terminal: no follow-up needed and no compaction. Record the
                     // final agent message and break (`turn.rs:340-355`).
                     self.observer

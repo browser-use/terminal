@@ -1,0 +1,1 @@
+[{"grantee_code":"2ACAH","result_count":60},{"grantee_code":"BCE","result_count":448},{"grantee_code":"2A3UL","result_count":69},{"grantee_code":"X26","result_count":97},{"grantee_code":"U28","result_count":69},{"grantee_code":"2AXDT","result_count":53}]
