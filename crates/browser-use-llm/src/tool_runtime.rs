@@ -108,15 +108,18 @@ fn reduce_turn(events: Vec<LlmEvent>) -> TurnOutcome {
                 id,
                 name,
                 namespace,
+                provider_metadata,
                 input,
             } => {
                 assistant_tool_parts.push(ContentPart::ToolCall {
                     id: id.clone(),
                     name: name.clone(),
                     input: input.clone(),
-                    provider_metadata: namespace
-                        .clone()
-                        .map(|namespace| serde_json::json!({ "namespace": namespace })),
+                    provider_metadata: provider_metadata.clone().or_else(|| {
+                        namespace
+                            .clone()
+                            .map(|namespace| serde_json::json!({ "namespace": namespace }))
+                    }),
                 });
                 tool_calls.push(ToolCall {
                     id,
@@ -383,6 +386,7 @@ mod tests {
                 id: id.into(),
                 name: "add".into(),
                 namespace: None,
+                provider_metadata: None,
                 input: json!({ "a": a, "b": b }),
             },
             LlmEvent::Finish {
@@ -536,6 +540,7 @@ mod tests {
                 id: "bad_1".into(),
                 name: "add".into(),
                 namespace: None,
+                provider_metadata: None,
                 input: json!({ "a": "oops", "b": 3 }),
             },
             LlmEvent::Finish {
@@ -582,6 +587,7 @@ mod tests {
                 id: "u1".into(),
                 name: "nonexistent".into(),
                 namespace: None,
+                provider_metadata: None,
                 input: json!({}),
             },
             LlmEvent::Finish {

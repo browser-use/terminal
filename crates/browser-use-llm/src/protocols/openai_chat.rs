@@ -102,6 +102,12 @@ impl Protocol for OpenAiChatProtocol {
 
         apply_generation(&mut body, &req.generation);
 
+        if let Some(Value::Object(provider_options)) = &req.provider_options {
+            for (key, value) in provider_options {
+                body.entry(key.clone()).or_insert_with(|| value.clone());
+            }
+        }
+
         body.insert("stream".to_string(), Value::Bool(true));
         body.insert(
             "stream_options".to_string(),
@@ -205,7 +211,10 @@ fn build_assistant_message(message: &Message) -> Result<Value, LlmError> {
     let mut tool_calls: Vec<Value> = Vec::new();
     for part in &message.content {
         if let ContentPart::ToolCall {
-            id, name, input, ..
+            id,
+            name,
+            input,
+            provider_metadata,
         } = part
         {
             let arguments = serde_json::to_string(input).map_err(|e| {
@@ -214,11 +223,17 @@ fn build_assistant_message(message: &Message) -> Result<Value, LlmError> {
                     format!("tool call arguments not serializable: {e}"),
                 )
             })?;
-            tool_calls.push(json!({
-                "id": id,
-                "type": "function",
-                "function": { "name": name, "arguments": arguments },
-            }));
+            let mut tool_call = Map::new();
+            tool_call.insert("id".to_string(), json!(id));
+            tool_call.insert("type".to_string(), json!("function"));
+            tool_call.insert(
+                "function".to_string(),
+                json!({ "name": name, "arguments": arguments }),
+            );
+            if let Some(metadata) = provider_metadata {
+                tool_call.insert("provider_metadata".to_string(), metadata.clone());
+            }
+            tool_calls.push(Value::Object(tool_call));
         }
     }
     // Omit `content` for a tool-only assistant turn rather than sending an empty
@@ -654,6 +669,8 @@ impl OpenAiChatStream {
             .and_then(|f| f.get("name"))
             .and_then(Value::as_str)
             .filter(|n| !n.is_empty());
+        self.tools
+            .set_provider_metadata(&id, tool_call_provider_metadata(call));
         let fragment = function
             .and_then(|f| f.get("arguments"))
             .and_then(Value::as_str)
@@ -672,6 +689,13 @@ impl OpenAiChatStream {
 
         self.tools.delta(&id, name, fragment)
     }
+}
+
+fn tool_call_provider_metadata(call: &Value) -> Option<Value> {
+    call.get("provider_metadata")
+        .or_else(|| call.get("browser_use"))
+        .filter(|value| !value.is_null())
+        .cloned()
 }
 
 /// Map a Chat Completions `finish_reason` string onto a [`FinishReason`].
@@ -807,6 +831,44 @@ mod tests {
         });
 
         assert_eq!(body, expected);
+    }
+
+    #[test]
+    fn build_body_replays_tool_call_provider_metadata() {
+        let mut req = LlmRequest::new("bu-3-max", "browser-use");
+        req.messages.push(Message::new(
+            MessageRole::Assistant,
+            vec![ContentPart::ToolCall {
+                id: "call_1".into(),
+                name: "get_weather".into(),
+                input: json!({ "city": "Paris" }),
+                provider_metadata: Some(json!({
+                    "google": { "thought_signature": "sig-123" }
+                })),
+            }],
+        ));
+
+        let body = OpenAiChatProtocol::new().build_body(&req).unwrap();
+        let tool_call = &body["messages"][0]["tool_calls"][0];
+
+        assert_eq!(
+            tool_call["provider_metadata"],
+            json!({ "google": { "thought_signature": "sig-123" } })
+        );
+    }
+
+    #[test]
+    fn build_body_merges_provider_options_without_overriding_core_fields() {
+        let mut req = LlmRequest::new("gpt-4o", "browser-use");
+        req.provider_options = Some(json!({
+            "request_type": "rust_agent",
+            "model": "wrong-model"
+        }));
+
+        let body = OpenAiChatProtocol::new().build_body(&req).unwrap();
+
+        assert_eq!(body["request_type"], "rust_agent");
+        assert_eq!(body["model"], "gpt-4o");
     }
 
     #[test]
@@ -1014,6 +1076,7 @@ mod tests {
                 id: "call_42".into(),
                 name: "get_weather".into(),
                 namespace: None,
+                provider_metadata: None,
                 input: json!({ "city": "Paris" }),
             },
             LlmEvent::StepFinish {
@@ -1027,6 +1090,37 @@ mod tests {
         ];
 
         assert_eq!(events, expected);
+    }
+
+    #[test]
+    fn decoder_preserves_tool_call_provider_metadata() {
+        let mut stream = OpenAiChatProtocol::new().decoder();
+        let mut events = Vec::new();
+        events.extend(
+            stream
+                .on_frame(&frame(
+                    r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_42","type":"function","provider_metadata":{"google":{"thought_signature":"sig-123"}},"function":{"name":"get_weather","arguments":""}}]}}]}"#,
+                ))
+                .unwrap(),
+        );
+        events.extend(
+            stream
+                .on_frame(&frame(
+                    r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"{}"}}]}}]}"#,
+                ))
+                .unwrap(),
+        );
+        events.extend(stream.finish().unwrap());
+
+        assert!(events.contains(&LlmEvent::ToolCall {
+            id: "call_42".into(),
+            name: "get_weather".into(),
+            namespace: None,
+            provider_metadata: Some(json!({
+                "google": { "thought_signature": "sig-123" }
+            })),
+            input: json!({}),
+        }));
     }
 
     #[test]

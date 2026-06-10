@@ -228,6 +228,11 @@ enum Command {
         #[arg(long)]
         model: Option<String>,
     },
+    RunBrowserUse {
+        text: String,
+        #[arg(long, default_value = "bu-3-max")]
+        model: String,
+    },
     RunAnthropic {
         text: String,
         #[arg(long, default_value = "claude-sonnet-4-6")]
@@ -262,6 +267,11 @@ enum Command {
         task_id: String,
         #[arg(long)]
         model: Option<String>,
+    },
+    RunBrowserUseSession {
+        task_id: String,
+        #[arg(long, default_value = "bu-3-max")]
+        model: String,
     },
     RunAnthropicSession {
         task_id: String,
@@ -853,6 +863,15 @@ fn main() -> Result<()> {
             collaboration_mode,
             &runtime_options,
         ),
+        Command::RunBrowserUse { text, model } => run_browser_use(
+            &store,
+            text,
+            model,
+            config_profile.as_deref(),
+            &config_overrides,
+            collaboration_mode,
+            &runtime_options,
+        ),
         Command::RunAnthropic { text, model } => run_anthropic(
             &store,
             text,
@@ -899,6 +918,15 @@ fn main() -> Result<()> {
             &runtime_options,
         ),
         Command::RunOpenaiSession { task_id, model } => run_openai_session(
+            &store,
+            &task_id,
+            model,
+            config_profile.as_deref(),
+            &config_overrides,
+            collaboration_mode,
+            &runtime_options,
+        ),
+        Command::RunBrowserUseSession { task_id, model } => run_browser_use_session(
             &store,
             &task_id,
             model,
@@ -1212,12 +1240,14 @@ fn command_name(command: &Command) -> &'static str {
         Command::Start { .. } => "start",
         Command::RunFake { .. } => "run_fake",
         Command::RunOpenai { .. } => "run_openai",
+        Command::RunBrowserUse { .. } => "run_browser_use",
         Command::RunAnthropic { .. } => "run_anthropic",
         Command::RunOpenrouter { .. } => "run_openrouter",
         Command::RunDeepseek { .. } => "run_deepseek",
         Command::RunCodex { .. } => "run_codex",
         Command::RunCodexSession { .. } => "run_codex_session",
         Command::RunOpenaiSession { .. } => "run_openai_session",
+        Command::RunBrowserUseSession { .. } => "run_browser_use_session",
         Command::RunAnthropicSession { .. } => "run_anthropic_session",
         Command::RunOpenrouterSession { .. } => "run_openrouter_session",
         Command::RunDeepseekSession { .. } => "run_deepseek_session",
@@ -2195,6 +2225,7 @@ fn default_cli_model_for_backend_with_overrides(
         ProviderBackend::Openai => {
             default_model_for_cwd_with_options(cwd, config_profile, config_overrides, false)
         }
+        ProviderBackend::BrowserUse => Ok("bu-3-max".to_string()),
         ProviderBackend::Anthropic => Ok("claude-sonnet-4-6".to_string()),
         ProviderBackend::Openrouter => Ok("openai/gpt-5.5".to_string()),
         ProviderBackend::Deepseek => Ok("deepseek-v4-pro".to_string()),
@@ -2207,6 +2238,7 @@ fn default_cli_model_for_backend_with_overrides(
 fn default_provider_id_for_backend(backend: ProviderBackend) -> &'static str {
     match backend {
         ProviderBackend::Openai => "openai",
+        ProviderBackend::BrowserUse => "browser-use",
         ProviderBackend::Anthropic => "anthropic",
         ProviderBackend::Openrouter => "openrouter",
         ProviderBackend::Deepseek => "deepseek",
@@ -2303,6 +2335,27 @@ fn run_anthropic(
             collaboration_mode,
             runtime_options,
         )?);
+    run_new_session_from_config(store, text, config)
+}
+
+fn run_browser_use(
+    store: &Store,
+    text: String,
+    model: String,
+    config_profile: Option<&str>,
+    raw_config_overrides: &[String],
+    collaboration_mode: CollaborationModeKind,
+    runtime_options: &CliRuntimeOptions,
+) -> Result<()> {
+    let config = ProviderRunConfig::new(ProviderBackend::BrowserUse, model).with_options(
+        cli_agent_options(
+            config_profile,
+            raw_config_overrides,
+            collaboration_mode,
+            runtime_options,
+        )?
+        .with_default_model_provider_id("browser-use"),
+    );
     run_new_session_from_config(store, text, config)
 }
 
@@ -2438,6 +2491,30 @@ fn run_anthropic_session(
             collaboration_mode,
             runtime_options,
         )?);
+    let session_id = run_existing_session_from_config_and_notify(store, task_id, config, None)?;
+    println!("{session_id}");
+    Ok(())
+}
+
+fn run_browser_use_session(
+    store: &Store,
+    task_id: &str,
+    model: String,
+    config_profile: Option<&str>,
+    raw_config_overrides: &[String],
+    collaboration_mode: CollaborationModeKind,
+    runtime_options: &CliRuntimeOptions,
+) -> Result<()> {
+    ensure_task_exists(store, task_id)?;
+    let config = ProviderRunConfig::new(ProviderBackend::BrowserUse, model).with_options(
+        cli_agent_options(
+            config_profile,
+            raw_config_overrides,
+            collaboration_mode,
+            runtime_options,
+        )?
+        .with_default_model_provider_id("browser-use"),
+    );
     let session_id = run_existing_session_from_config_and_notify(store, task_id, config, None)?;
     println!("{session_id}");
     Ok(())
@@ -7134,9 +7211,7 @@ fn sdk_provider_backend(provider: &str, model: &str) -> Result<ProviderBackend> 
     }
     let normalized = provider.trim().to_ascii_lowercase();
     if normalized == "browser-use" || normalized == "browser_use" {
-        bail!(
-            "Browser Use LLM gateway models are not supported by the Rust terminal SDK yet; use ChatOpenAI, ChatAnthropic, ChatOpenRouter, or ChatDeepSeek"
-        );
+        return Ok(ProviderBackend::BrowserUse);
     }
     ProviderBackend::from_provider_id(&normalized)
         .filter(|backend| *backend != ProviderBackend::None)
@@ -7147,7 +7222,7 @@ fn sdk_provider_id(provider: &str, backend: ProviderBackend) -> String {
     let normalized = provider.trim().to_ascii_lowercase();
     if matches!(
         normalized.as_str(),
-        "openai" | "anthropic" | "openrouter" | "deepseek" | "codex" | "fake"
+        "browser-use" | "openai" | "anthropic" | "openrouter" | "deepseek" | "codex" | "fake"
     ) {
         return normalized;
     }
@@ -9896,18 +9971,21 @@ command = "test-mcp"
     }
 
     #[test]
-    fn sdk_provider_run_config_rejects_browser_use_gateway_provider() {
+    fn sdk_provider_run_config_accepts_browser_use_gateway_provider() -> Result<()> {
         let params = serde_json::json!({
             "task": "inspect",
-            "llm": {"provider": "browser-use", "model": "bu-2-0"}
+            "llm": {"provider": "browser-use", "model": "bu-3-max"}
         });
 
-        let error = sdk_provider_run_config(&params, Some("inspect"), None)
-            .expect_err("browser-use gateway provider should not be misrouted to OpenAI");
+        let config = sdk_provider_run_config(&params, Some("inspect"), None)?;
 
-        assert!(error
-            .to_string()
-            .contains("Browser Use LLM gateway models are not supported"));
+        assert_eq!(config.backend, ProviderBackend::BrowserUse);
+        assert_eq!(config.model, "bu-3-max");
+        assert_eq!(
+            config.options.model_provider_id.as_deref(),
+            Some("browser-use")
+        );
+        Ok(())
     }
 
     #[test]
@@ -11726,6 +11804,23 @@ command = "test-mcp"
                 &overrides
             )?,
             "configured-model"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn cli_browser_use_backend_defaults_to_bu3_max() -> Result<()> {
+        assert_eq!(
+            default_cli_model_for_backend_with_overrides(ProviderBackend::BrowserUse, None, &[])?,
+            "bu-3-max"
+        );
+        assert_eq!(
+            resolved_cli_provider_id_for_backend_with_overrides(
+                ProviderBackend::BrowserUse,
+                None,
+                &[]
+            )?,
+            "browser-use"
         );
         Ok(())
     }

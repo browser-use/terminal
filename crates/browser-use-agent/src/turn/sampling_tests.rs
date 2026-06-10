@@ -215,6 +215,7 @@ fn tool_call(name: &str) -> Result<LlmEvent, LlmError> {
         id: "call-1".to_string(),
         name: name.to_string(),
         namespace: None,
+        provider_metadata: None,
         input: serde_json::json!({"arg": 1}),
     })
 }
@@ -224,6 +225,7 @@ fn tool_call_with_input(name: &str, input: serde_json::Value) -> Result<LlmEvent
         id: "call-1".to_string(),
         name: name.to_string(),
         namespace: None,
+        provider_metadata: None,
         input,
     })
 }

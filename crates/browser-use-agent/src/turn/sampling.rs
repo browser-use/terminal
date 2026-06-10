@@ -603,6 +603,7 @@ impl<T: SamplingTransport, R: CallRunner + 'static> ModelSamplingDriver<T, R> {
                 id,
                 name,
                 namespace,
+                provider_metadata,
                 input,
             } => {
                 // Capture the actual call (model order) so the fused dispatch can
@@ -611,8 +612,9 @@ impl<T: SamplingTransport, R: CallRunner + 'static> ModelSamplingDriver<T, R> {
                     id,
                     name,
                     input,
-                    provider_metadata: namespace
-                        .map(|namespace| serde_json::json!({ "namespace": namespace })),
+                    provider_metadata: provider_metadata.or_else(|| {
+                        namespace.map(|namespace| serde_json::json!({ "namespace": namespace }))
+                    }),
                 });
                 Ok(StreamProgress::Continue)
             }
@@ -1083,6 +1085,7 @@ fn build_request(ctx: &TurnCtx, input: Vec<Message>) -> LlmRequest {
             ),
         );
     }
+    super::model_path::apply_browser_use_provider_options(&ctx.provider, &mut req);
     mark_message_cache_breakpoints(&mut req.messages);
     req
 }

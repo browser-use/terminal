@@ -101,6 +101,7 @@ impl Default for MultiAgentV2Options {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ProviderBackend {
     Codex,
+    BrowserUse,
     Openai,
     Anthropic,
     Openrouter,
@@ -113,6 +114,7 @@ impl ProviderBackend {
     pub fn from_provider_id(value: &str) -> Option<Self> {
         match value.trim().to_ascii_lowercase().as_str() {
             "codex" => Some(Self::Codex),
+            "browser-use" | "browser_use" | "browseruse" => Some(Self::BrowserUse),
             "openai" => Some(Self::Openai),
             "anthropic" => Some(Self::Anthropic),
             "openrouter" => Some(Self::Openrouter),
@@ -1957,6 +1959,7 @@ command = "profile-server"
         // full variant set matches `browser-use-core::ProviderBackend`.
         let all = [
             ProviderBackend::Codex,
+            ProviderBackend::BrowserUse,
             ProviderBackend::Openai,
             ProviderBackend::Anthropic,
             ProviderBackend::Openrouter,
@@ -1968,6 +1971,7 @@ command = "profile-server"
             let name = format!("{backend:?}");
             let round_tripped = match name.as_str() {
                 "Codex" => ProviderBackend::Codex,
+                "BrowserUse" => ProviderBackend::BrowserUse,
                 "Openai" => ProviderBackend::Openai,
                 "Anthropic" => ProviderBackend::Anthropic,
                 "Openrouter" => ProviderBackend::Openrouter,
@@ -1978,7 +1982,7 @@ command = "profile-server"
             };
             assert_eq!(backend, round_tripped);
         }
-        assert_eq!(all.len(), 7);
+        assert_eq!(all.len(), 8);
     }
 
     #[test]

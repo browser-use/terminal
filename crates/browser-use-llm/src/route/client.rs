@@ -483,14 +483,16 @@ fn aggregate(events: Vec<LlmEvent>) -> LlmResponse {
                 id,
                 name,
                 namespace,
+                provider_metadata,
                 input,
             } => {
                 tool_calls.push(ContentPart::ToolCall {
                     id,
                     name,
                     input,
-                    provider_metadata: namespace
-                        .map(|namespace| serde_json::json!({ "namespace": namespace })),
+                    provider_metadata: provider_metadata.or_else(|| {
+                        namespace.map(|namespace| serde_json::json!({ "namespace": namespace }))
+                    }),
                 });
             }
             LlmEvent::Finish {
@@ -979,6 +981,7 @@ mod tests {
                 id: "call_1".into(),
                 name: "get_weather".into(),
                 namespace: None,
+                provider_metadata: None,
                 input: serde_json::json!({ "city": "NYC" }),
             },
             LlmEvent::StepFinish {

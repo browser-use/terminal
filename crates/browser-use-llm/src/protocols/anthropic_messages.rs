@@ -1206,6 +1206,7 @@ mod tests {
                 id: "toolu_1".into(),
                 name: "get_weather".into(),
                 namespace: None,
+                provider_metadata: None,
                 input: json!({ "city": "Paris" }),
             },
             LlmEvent::StepFinish {

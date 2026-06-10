@@ -28,7 +28,7 @@ use browser_use_llm::auth::{codex_route, CodexAuth};
 use browser_use_llm::providers::{
     Anthropic, AnthropicConfig, OpenAi, OpenAiCompatible, OpenAiConfig,
 };
-use browser_use_llm::route::{ModelClient, Route};
+use browser_use_llm::route::{Auth, ModelClient, Route};
 use browser_use_llm::schema::{ContentPart, LlmRequest, Message, MessageRole, SystemPart};
 
 use crate::events::{EventSink, TurnCtx};
@@ -71,6 +71,8 @@ pub enum ProviderChoice {
         base_url: String,
         /// API key.
         api_key: String,
+        /// Additional static headers to apply to every request for this route.
+        extra_headers: Vec<(String, String)>,
     },
     /// The codex (chatgpt.com) backend, reached via the Codex CLI OAuth login.
     ///
@@ -166,6 +168,7 @@ pub fn provider_choice_from_env() -> Result<ProviderChoice, ModelPathError> {
             provider_id: "openai-compatible".to_string(),
             base_url,
             api_key,
+            extra_headers: Vec::new(),
         });
     }
     Err(ModelPathError::MissingCredentials(
@@ -202,10 +205,17 @@ pub fn build_route(choice: &ProviderChoice, model: &str) -> Result<Route, ModelP
             provider_id,
             base_url,
             api_key,
+            extra_headers,
         } => {
             let provider =
                 OpenAiCompatible::configure(provider_id.clone(), base_url.clone(), api_key.clone());
-            Ok(provider.chat(model))
+            let mut route = provider.chat(model);
+            for (name, value) in extra_headers {
+                route.auth = route
+                    .auth
+                    .and_then(Auth::header(name.clone(), value.clone()));
+            }
+            Ok(route)
         }
         ProviderChoice::Codex {
             access_token,
@@ -249,8 +259,11 @@ pub fn build_transport(
             ),
         );
     }
+    apply_browser_use_provider_options(&ctx.provider, &mut req);
     ModelClientTransport::new(client, route, req)
 }
+
+pub(crate) fn apply_browser_use_provider_options(_provider: &str, _req: &mut LlmRequest) {}
 
 /// Build the production text-only [`ModelSamplingDriver`] over a live transport.
 ///
@@ -353,12 +366,41 @@ mod tests {
             provider_id: "internal".to_string(),
             base_url: "https://llm.internal/v1".to_string(),
             api_key: "k".to_string(),
+            extra_headers: Vec::new(),
         };
         let route = build_route(&choice, "m").unwrap();
         assert_eq!(
             route.endpoint.url(),
             "https://llm.internal/v1/chat/completions"
         );
+    }
+
+    #[test]
+    fn openai_compatible_custom_applies_extra_headers() {
+        let choice = ProviderChoice::OpenAiCompatibleCustom {
+            provider_id: "browser-use".to_string(),
+            base_url: "https://llm.api.browser-use.com/v1".to_string(),
+            api_key: "k".to_string(),
+            extra_headers: vec![(
+                "x-browser-use-request-type".to_string(),
+                "rust_agent".to_string(),
+            )],
+        };
+        let route = build_route(&choice, "bu-3-max").unwrap();
+
+        assert_eq!(
+            header(&route, "x-browser-use-request-type").as_deref(),
+            Some("rust_agent")
+        );
+    }
+
+    #[test]
+    fn browser_use_provider_options_do_not_tag_request_body() {
+        let mut req = LlmRequest::new("bu-3-max", "browseruse");
+
+        apply_browser_use_provider_options("browser-use", &mut req);
+
+        assert_eq!(req.provider_options, None);
     }
 
     /// Only the `Codex` variant targets chatgpt.com: the env-keyed providers never
@@ -379,6 +421,7 @@ mod tests {
                 provider_id: "x".into(),
                 base_url: "https://llm.internal/v1".into(),
                 api_key: "k".into(),
+                extra_headers: Vec::new(),
             },
         ] {
             let url = build_route(&choice, "m").unwrap().endpoint.url();
