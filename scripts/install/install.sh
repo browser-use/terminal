@@ -65,7 +65,7 @@ Environment:
   BUT_RELEASE_REPO   GitHub repo containing releases. Default: browser-use/terminal
   BUT_INSTALL_DIR    Directory for visible commands. Default: \$HOME/.local/bin
   BUT_HOME           State/package root. Default: \$HOME/.browser-use-terminal
-  BUT_AUTO_UPDATE    Set to 0 to skip automatic update checks in launchers.
+  BUT_AUTO_UPDATE    Set to 0 to skip startup update prompts in launchers.
   BUT_REQUIRE_LATEST Set to 1 to fail startup if the automatic update check fails.
 EOF
         exit 0
@@ -555,7 +555,7 @@ export BUT_HOME="\$BUT_HOME_DIR"
 export BUT_INSTALL_DIR="\${BUT_INSTALL_DIR:-$BIN_DIR}"
 export BUT_RELEASE_REPO="\${BUT_RELEASE_REPO:-$REPO}"
 export PYTHONPATH="\$CURRENT/python\${PYTHONPATH:+:\$PYTHONPATH}"
-auto_update_browser_use_terminal() {
+prompt_browser_use_terminal_update() {
   case "\${BUT_AUTO_UPDATE:-1}" in
     0 | false | FALSE | off | OFF | no | NO)
       return
@@ -564,40 +564,49 @@ auto_update_browser_use_terminal() {
 
   [ -x "\$CURRENT/bin/browser-use-terminal" ] || return
 
-  stamp_dir="\$BUT_HOME_DIR/packages/standalone"
-  stamp="\$stamp_dir/last_update_check"
-  log="\$stamp_dir/last_update.log"
-  interval="\${BUT_AUTO_UPDATE_INTERVAL_SECS:-72000}"
-  case "\$interval" in
-    "" | *[!0-9]*)
-      interval=72000
-      ;;
-  esac
+  log_dir="\$BUT_HOME_DIR/packages/standalone"
+  log="\$log_dir/last_update_check.log"
+  mkdir -p "\$log_dir" 2>/dev/null || return
 
-  now="\$(date +%s 2>/dev/null || printf '0')"
-  [ "\$now" -gt 0 ] || return
-  last=0
-  if [ -f "\$stamp" ]; then
-    last="\$(cat "\$stamp" 2>/dev/null || printf '0')"
-    case "\$last" in
-      "" | *[!0-9]*)
-        last=0
+  check_output="\$("\$CURRENT/bin/browser-use-terminal" update --check 2>&1)"
+  check_status="\$?"
+  printf '%s\n' "\$check_output" >"\$log" 2>/dev/null || true
+
+  if [ "\$check_status" -eq 0 ]; then
+    case "\$check_output" in
+      *"update available"*)
+        if [ ! -t 0 ]; then
+          printf '\n✨ Update available!\n' >&2
+          printf 'Run browser-use-terminal update to update.\n' >&2
+          printf 'Skipping update prompt because stdin is not interactive; launching current version.\n' >&2
+          return
+        fi
+        while :; do
+          printf '\n✨ Update available!\n\n' >&2
+          printf '  Release notes: https://github.com/%s/releases/latest\n\n' "\$BUT_RELEASE_REPO" >&2
+          printf '› 1. Update now (runs \`browser-use-terminal update\`)\n' >&2
+          printf '  2. Skip\n\n' >&2
+          printf '  Press enter to continue\n\n' >&2
+          printf 'Selection [1]: ' >&2
+          if ! IFS= read -r update_reply; then
+            printf '\nNo answer received; closing.\n' >&2
+            exit 0
+          fi
+          case "\$update_reply" in
+            "" | 1)
+              printf '\nUpdating Browser Use Terminal via \`browser-use-terminal update\`...\n' >&2
+              exec "\$CURRENT/bin/browser-use-terminal" update
+              ;;
+            2)
+              return
+              ;;
+            *)
+              printf 'Please choose 1 or 2.\n' >&2
+              ;;
+          esac
+        done
         ;;
     esac
-  fi
-  if [ "\$interval" -gt 0 ] && [ \$((now - last)) -lt "\$interval" ]; then
-    return
-  fi
-
-  mkdir -p "\$stamp_dir" 2>/dev/null || return
-  printf '%s\n' "\$now" >"\$stamp" 2>/dev/null || true
-
-  before="\$("\$CURRENT/bin/but" --version 2>/dev/null | sed -n 's/.* \([0-9][0-9A-Za-z.+-]*\)$/\1/p' | head -n 1 || true)"
-  if "\$CURRENT/bin/browser-use-terminal" update --release latest >"\$log" 2>&1; then
-    after="\$("\$CURRENT/bin/but" --version 2>/dev/null | sed -n 's/.* \([0-9][0-9A-Za-z.+-]*\)$/\1/p' | head -n 1 || true)"
-    if [ -n "\$before" ] && [ -n "\$after" ] && [ "\$before" != "\$after" ]; then
-      printf 'browser-use terminal updated: %s -> %s\n' "\$before" "\$after" >&2
-    fi
     return
   fi
 
@@ -607,7 +616,7 @@ auto_update_browser_use_terminal() {
   fi
   printf 'browser-use terminal update check failed; launching current version.\n' >&2
 }
-auto_update_browser_use_terminal
+prompt_browser_use_terminal_update
 exec "\$CURRENT/bin/$target" "\$@"
 EOF
   chmod 0755 "$tmp_wrapper"
@@ -628,7 +637,7 @@ export BUT_INSTALL_DIR="\${BUT_INSTALL_DIR:-$BIN_DIR}"
 export BUT_RELEASE_REPO="\${BUT_RELEASE_REPO:-$REPO}"
 export PYTHONPATH="\$CURRENT/python\${PYTHONPATH:+:\$PYTHONPATH}"
 if [ "\$#" -eq 0 ]; then
-  auto_update_browser_use_terminal() {
+  prompt_browser_use_terminal_update() {
     case "\${BUT_AUTO_UPDATE:-1}" in
       0 | false | FALSE | off | OFF | no | NO)
         return
@@ -637,40 +646,49 @@ if [ "\$#" -eq 0 ]; then
 
     [ -x "\$CURRENT/bin/browser-use-terminal" ] || return
 
-    stamp_dir="\$BUT_HOME_DIR/packages/standalone"
-    stamp="\$stamp_dir/last_update_check"
-    log="\$stamp_dir/last_update.log"
-    interval="\${BUT_AUTO_UPDATE_INTERVAL_SECS:-72000}"
-    case "\$interval" in
-      "" | *[!0-9]*)
-        interval=72000
-        ;;
-    esac
+    log_dir="\$BUT_HOME_DIR/packages/standalone"
+    log="\$log_dir/last_update_check.log"
+    mkdir -p "\$log_dir" 2>/dev/null || return
 
-    now="\$(date +%s 2>/dev/null || printf '0')"
-    [ "\$now" -gt 0 ] || return
-    last=0
-    if [ -f "\$stamp" ]; then
-      last="\$(cat "\$stamp" 2>/dev/null || printf '0')"
-      case "\$last" in
-        "" | *[!0-9]*)
-          last=0
+    check_output="\$("\$CURRENT/bin/browser-use-terminal" update --check 2>&1)"
+    check_status="\$?"
+    printf '%s\n' "\$check_output" >"\$log" 2>/dev/null || true
+
+    if [ "\$check_status" -eq 0 ]; then
+      case "\$check_output" in
+        *"update available"*)
+          if [ ! -t 0 ]; then
+            printf '\n✨ Update available!\n' >&2
+            printf 'Run browser-use-terminal update to update.\n' >&2
+            printf 'Skipping update prompt because stdin is not interactive; launching current version.\n' >&2
+            return
+          fi
+          while :; do
+            printf '\n✨ Update available!\n\n' >&2
+            printf '  Release notes: https://github.com/%s/releases/latest\n\n' "\$BUT_RELEASE_REPO" >&2
+            printf '› 1. Update now (runs \`browser-use-terminal update\`)\n' >&2
+            printf '  2. Skip\n\n' >&2
+            printf '  Press enter to continue\n\n' >&2
+            printf 'Selection [1]: ' >&2
+            if ! IFS= read -r update_reply; then
+              printf '\nNo answer received; closing.\n' >&2
+              exit 0
+            fi
+            case "\$update_reply" in
+              "" | 1)
+                printf '\nUpdating Browser Use Terminal via \`browser-use-terminal update\`...\n' >&2
+                exec "\$CURRENT/bin/browser-use-terminal" update
+                ;;
+              2)
+                return
+                ;;
+              *)
+                printf 'Please choose 1 or 2.\n' >&2
+                ;;
+            esac
+          done
           ;;
       esac
-    fi
-    if [ "\$interval" -gt 0 ] && [ \$((now - last)) -lt "\$interval" ]; then
-      return
-    fi
-
-    mkdir -p "\$stamp_dir" 2>/dev/null || return
-    printf '%s\n' "\$now" >"\$stamp" 2>/dev/null || true
-
-    before="\$("\$CURRENT/bin/but" --version 2>/dev/null | sed -n 's/.* \([0-9][0-9A-Za-z.+-]*\)$/\1/p' | head -n 1 || true)"
-    if "\$CURRENT/bin/browser-use-terminal" update --release latest >"\$log" 2>&1; then
-      after="\$("\$CURRENT/bin/but" --version 2>/dev/null | sed -n 's/.* \([0-9][0-9A-Za-z.+-]*\)$/\1/p' | head -n 1 || true)"
-      if [ -n "\$before" ] && [ -n "\$after" ] && [ "\$before" != "\$after" ]; then
-        printf 'browser-use terminal updated: %s -> %s\n' "\$before" "\$after" >&2
-      fi
       return
     fi
 
@@ -680,7 +698,7 @@ if [ "\$#" -eq 0 ]; then
     fi
     printf 'browser-use terminal update check failed; launching current version.\n' >&2
   }
-  auto_update_browser_use_terminal
+  prompt_browser_use_terminal_update
   exec "\$CURRENT/bin/but"
 fi
 exec "\$CURRENT/bin/browser-use-terminal" "\$@"

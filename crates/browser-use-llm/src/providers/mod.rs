@@ -13,9 +13,11 @@
 //! protocol and model vary per call.
 
 mod anthropic;
+mod google;
 mod openai;
 mod openai_compatible;
 
 pub use anthropic::{Anthropic, AnthropicConfig};
+pub use google::{Google, GoogleConfig};
 pub use openai::{OpenAi, OpenAiConfig};
 pub use openai_compatible::OpenAiCompatible;

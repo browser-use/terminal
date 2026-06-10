@@ -603,6 +603,7 @@ impl<T: SamplingTransport, R: CallRunner + 'static> ModelSamplingDriver<T, R> {
                 id,
                 name,
                 namespace,
+                provider_metadata,
                 input,
             } => {
                 // Capture the actual call (model order) so the fused dispatch can
@@ -611,8 +612,7 @@ impl<T: SamplingTransport, R: CallRunner + 'static> ModelSamplingDriver<T, R> {
                     id,
                     name,
                     input,
-                    provider_metadata: namespace
-                        .map(|namespace| serde_json::json!({ "namespace": namespace })),
+                    provider_metadata: tool_call_provider_metadata(namespace, provider_metadata),
                 });
                 Ok(StreamProgress::Continue)
             }
@@ -630,6 +630,23 @@ impl<T: SamplingTransport, R: CallRunner + 'static> ModelSamplingDriver<T, R> {
             // no accumulation; their UI mapping (if any) already happened above.
             _ => Ok(StreamProgress::Continue),
         }
+    }
+}
+
+fn tool_call_provider_metadata(
+    namespace: Option<String>,
+    provider_metadata: Option<serde_json::Value>,
+) -> Option<serde_json::Value> {
+    match (namespace, provider_metadata) {
+        (Some(namespace), Some(serde_json::Value::Object(mut meta))) => {
+            meta.insert("namespace".to_string(), serde_json::json!(namespace));
+            Some(serde_json::Value::Object(meta))
+        }
+        (Some(namespace), Some(meta)) => {
+            Some(serde_json::json!({ "namespace": namespace, "provider": meta }))
+        }
+        (Some(namespace), None) => Some(serde_json::json!({ "namespace": namespace })),
+        (None, metadata) => metadata,
     }
 }
 
@@ -1103,6 +1120,7 @@ fn build_request(ctx: &TurnCtx, input: Vec<Message>) -> LlmRequest {
             ),
         );
     }
+    super::model_path::apply_browser_use_provider_options(&ctx.provider, &mut req);
     mark_message_cache_breakpoints(&mut req.messages);
     req
 }

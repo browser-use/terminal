@@ -14,6 +14,10 @@ if [[ -x "$DEST_DIR/rg" ]] && "$DEST_DIR/rg" --version 2>/dev/null | sed -n '1p'
   exit 0
 fi
 
+if [[ -x "$DEST_DIR/rg.exe" ]] && "$DEST_DIR/rg.exe" --version 2>/dev/null | sed -n '1p' | grep -q '^ripgrep '; then
+  exit 0
+fi
+
 if [[ -z "$TARGET_TRIPLE" ]]; then
   case "$(uname -s)" in
     Darwin)
@@ -27,6 +31,12 @@ if [[ -z "$TARGET_TRIPLE" ]]; then
       case "$(uname -m)" in
         arm64|aarch64) TARGET_TRIPLE="aarch64-unknown-linux-musl" ;;
         x86_64|amd64) TARGET_TRIPLE="x86_64-unknown-linux-musl" ;;
+        *) echo "unsupported architecture: $(uname -m)" >&2; exit 1 ;;
+      esac
+      ;;
+    MINGW*|MSYS*|CYGWIN*)
+      case "$(uname -m)" in
+        x86_64|amd64) TARGET_TRIPLE="x86_64-pc-windows-msvc" ;;
         *) echo "unsupported architecture: $(uname -m)" >&2; exit 1 ;;
       esac
       ;;
@@ -75,6 +85,7 @@ file_sha256() {
 url=""
 digest=""
 member=""
+archive_kind="tar"
 
 case "$TARGET_TRIPLE" in
   aarch64-apple-darwin)
@@ -97,6 +108,12 @@ case "$TARGET_TRIPLE" in
     digest="1c9297be4a084eea7ecaedf93eb03d058d6faae29bbc57ecdaf5063921491599"
     member="ripgrep-$RG_VERSION-x86_64-unknown-linux-musl/rg"
     ;;
+  x86_64-pc-windows-msvc)
+    url="https://github.com/BurntSushi/ripgrep/releases/download/$RG_VERSION/ripgrep-$RG_VERSION-x86_64-pc-windows-msvc.zip"
+    digest="124510b94b6baa3380d051fdf4650eaa80a302c876d611e9dba0b2e18d87493a"
+    member="ripgrep-$RG_VERSION-x86_64-pc-windows-msvc/rg.exe"
+    archive_kind="zip"
+    ;;
   *)
     echo "unsupported ripgrep target: $TARGET_TRIPLE" >&2
     exit 1
@@ -117,7 +134,26 @@ if [[ "$actual_digest" != "$digest" ]]; then
   exit 1
 fi
 
-tar -xzf "$archive" -C "$tmp" "$member"
+if [[ "$archive_kind" == "zip" ]]; then
+  if command -v unzip >/dev/null 2>&1; then
+    unzip -q "$archive" "$member" -d "$tmp"
+  else
+    python - "$archive" "$member" "$tmp" <<'PY'
+import sys
+import zipfile
+
+archive, member, dest = sys.argv[1:]
+with zipfile.ZipFile(archive) as zf:
+    zf.extract(member, dest)
+PY
+  fi
+else
+  tar -xzf "$archive" -C "$tmp" "$member"
+fi
 mkdir -p "$DEST_DIR"
-cp "$tmp/$member" "$DEST_DIR/rg"
-chmod 0755 "$DEST_DIR/rg"
+case "$TARGET_TRIPLE" in
+  *windows*) output="$DEST_DIR/rg.exe" ;;
+  *) output="$DEST_DIR/rg" ;;
+esac
+cp "$tmp/$member" "$output"
+chmod 0755 "$output"

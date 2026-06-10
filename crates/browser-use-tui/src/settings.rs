@@ -8,6 +8,7 @@ pub(crate) enum AgentBackend {
     Codex,
     Openai,
     Anthropic,
+    Google,
     Openrouter,
     Deepseek,
     Fake,
@@ -20,6 +21,7 @@ impl AgentBackend {
             Self::Codex => "codex",
             Self::Openai => "openai",
             Self::Anthropic => "anthropic",
+            Self::Google => "google",
             Self::Openrouter => "openrouter",
             Self::Deepseek => "deepseek",
             Self::Fake => "fake",
@@ -32,6 +34,7 @@ impl AgentBackend {
             "codex" => Some(Self::Codex),
             "openai" => Some(Self::Openai),
             "anthropic" => Some(Self::Anthropic),
+            "google" | "gemini" => Some(Self::Google),
             "openrouter" => Some(Self::Openrouter),
             "deepseek" => Some(Self::Deepseek),
             "fake" => Some(Self::Fake),
@@ -47,6 +50,7 @@ impl From<AgentBackend> for ProviderBackend {
             AgentBackend::Codex => Self::Codex,
             AgentBackend::Openai => Self::Openai,
             AgentBackend::Anthropic => Self::Anthropic,
+            AgentBackend::Google => Self::Google,
             AgentBackend::Openrouter => Self::Openrouter,
             AgentBackend::Deepseek => Self::Deepseek,
             AgentBackend::Fake => Self::Fake,
@@ -59,6 +63,7 @@ impl From<AgentBackend> for ProviderBackend {
 pub(crate) enum ModelChoiceGroup {
     Recommended,
     BringYourOwnKey,
+    Google,
     OpenRouter,
     Deepseek,
 }
@@ -81,6 +86,12 @@ pub(crate) struct RecommendedModel {
     pub(crate) provider_model: &'static str,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct ProviderDefaultModel {
+    pub(crate) display: &'static str,
+    pub(crate) provider_model: &'static str,
+}
+
 pub(crate) const RECOMMENDED_MODELS: &[RecommendedModel] = &[
     RecommendedModel {
         display: "GPT-5.5",
@@ -91,6 +102,11 @@ pub(crate) const RECOMMENDED_MODELS: &[RecommendedModel] = &[
         display: "Claude Opus 4.8",
         account: ACCOUNT_ANTHROPIC,
         provider_model: "claude-opus-4-8",
+    },
+    RecommendedModel {
+        display: "Claude Fable 5",
+        account: ACCOUNT_ANTHROPIC,
+        provider_model: "claude-fable-5",
     },
     RecommendedModel {
         display: "Gemini 3.1 Pro",
@@ -113,21 +129,58 @@ pub(crate) fn recommended_models_for_codex_availability(
     models
 }
 
+pub(crate) fn provider_default_model(account: &str) -> Option<ProviderDefaultModel> {
+    Some(match account {
+        ACCOUNT_CODEX | ACCOUNT_OPENAI => ProviderDefaultModel {
+            display: "GPT-5.5",
+            provider_model: "gpt-5.5",
+        },
+        ACCOUNT_ANTHROPIC => ProviderDefaultModel {
+            display: "Claude Opus 4.8",
+            provider_model: "claude-opus-4-8",
+        },
+        ACCOUNT_GOOGLE => ProviderDefaultModel {
+            display: "Gemini 3.5 Flash",
+            provider_model: "gemini-3.5-flash",
+        },
+        ACCOUNT_OPENROUTER => ProviderDefaultModel {
+            display: "Gemini 3.1 Pro",
+            provider_model: "google/gemini-3.1-pro-preview",
+        },
+        ACCOUNT_DEEPSEEK => ProviderDefaultModel {
+            display: "DeepSeek V4 Pro",
+            provider_model: "deepseek-v4-pro",
+        },
+        _ => return None,
+    })
+}
+
+pub(crate) fn provider_default_model_choice(account: &'static str) -> Option<ModelChoice> {
+    let default = provider_default_model(account)?;
+    Some(model_choice_for(
+        account,
+        default.provider_model,
+        default.display,
+    ))
+}
+
 pub(crate) const ACCOUNT_CODEX: &str = "Codex login";
 pub(crate) const ACCOUNT_CLAUDE_CODE: &str = "Claude Code subscription";
 pub(crate) const ACCOUNT_CLAUDE_CODE_LEGACY: &str = "Claude Code login";
 pub(crate) const ACCOUNT_OPENAI: &str = "OpenAI API key";
 pub(crate) const ACCOUNT_ANTHROPIC: &str = "Anthropic API key";
+pub(crate) const ACCOUNT_GOOGLE: &str = "Google API key";
 pub(crate) const ACCOUNT_OPENROUTER: &str = "OpenRouter API key";
 pub(crate) const ACCOUNT_DEEPSEEK: &str = "DeepSeek API key";
 
 pub(crate) const BROWSER_USE_CLOUD: &str = "Browser Use Cloud";
 pub(crate) const BROWSER_USE_CLOUD_API_KEY_SETTING: &str = "auth.browser_use_cloud.api_key";
 pub(crate) const BROWSER_USE_CLOUD_API_KEY_ENV: &str = "BROWSER_USE_API_KEY";
-pub(crate) const AUTH_CHOICES: [&str; 6] = [
+pub(crate) const AUTH_CHOICES: [&str; 7] = [
     ACCOUNT_CODEX,
     ACCOUNT_OPENAI,
     ACCOUNT_ANTHROPIC,
+    ACCOUNT_GOOGLE,
     ACCOUNT_OPENROUTER,
     ACCOUNT_DEEPSEEK,
     BROWSER_USE_CLOUD,
@@ -187,7 +240,7 @@ pub(crate) fn model_choices_for_catalog(catalog: &ModelCatalog) -> Vec<ModelChoi
         return model_choices_for_catalog(&bundled_model_catalog());
     }
     // Keep the stored order identical to the grouped render order
-    // (Recommended → BringYourOwnKey → OpenRouter → Deepseek). The picker treats
+    // (Recommended → BringYourOwnKey → Google → OpenRouter → Deepseek). The picker treats
     // `selected_row` as an index into this vec (navigation clamp, Enter/save),
     // while `render::model_lines` highlights rows by a grouped row counter.
     // Without this stable regroup the two index spaces diverge for interleaved
@@ -203,8 +256,9 @@ fn group_render_rank(group: &ModelChoiceGroup) -> u8 {
     match group {
         ModelChoiceGroup::Recommended => 0,
         ModelChoiceGroup::BringYourOwnKey => 1,
-        ModelChoiceGroup::OpenRouter => 2,
-        ModelChoiceGroup::Deepseek => 3,
+        ModelChoiceGroup::Google => 2,
+        ModelChoiceGroup::OpenRouter => 3,
+        ModelChoiceGroup::Deepseek => 4,
     }
 }
 
@@ -313,12 +367,52 @@ fn static_external_model_choices() -> Vec<ModelChoice> {
             group: ModelChoiceGroup::BringYourOwnKey,
         },
         ModelChoice {
+            display: "Claude Fable 5".to_string(),
+            account: ACCOUNT_ANTHROPIC,
+            backend: AgentBackend::Anthropic,
+            provider_model: "claude-fable-5".to_string(),
+            descriptor: "needs key".to_string(),
+            group: ModelChoiceGroup::BringYourOwnKey,
+        },
+        ModelChoice {
             display: "Claude Haiku 4.5".to_string(),
             account: ACCOUNT_ANTHROPIC,
             backend: AgentBackend::Anthropic,
             provider_model: "claude-haiku-4-5".to_string(),
             descriptor: "needs key".to_string(),
             group: ModelChoiceGroup::BringYourOwnKey,
+        },
+        ModelChoice {
+            display: "Gemini 3.1 Pro Preview".to_string(),
+            account: ACCOUNT_GOOGLE,
+            backend: AgentBackend::Google,
+            provider_model: "gemini-3.1-pro-preview".to_string(),
+            descriptor: "needs key".to_string(),
+            group: ModelChoiceGroup::Google,
+        },
+        ModelChoice {
+            display: "Gemini 3.5 Flash".to_string(),
+            account: ACCOUNT_GOOGLE,
+            backend: AgentBackend::Google,
+            provider_model: "gemini-3.5-flash".to_string(),
+            descriptor: "needs key".to_string(),
+            group: ModelChoiceGroup::Google,
+        },
+        ModelChoice {
+            display: "Gemini 3 Flash Preview".to_string(),
+            account: ACCOUNT_GOOGLE,
+            backend: AgentBackend::Google,
+            provider_model: "gemini-3-flash-preview".to_string(),
+            descriptor: "needs key".to_string(),
+            group: ModelChoiceGroup::Google,
+        },
+        ModelChoice {
+            display: "Gemini 3.1 Flash-Lite".to_string(),
+            account: ACCOUNT_GOOGLE,
+            backend: AgentBackend::Google,
+            provider_model: "gemini-3.1-flash-lite".to_string(),
+            descriptor: "needs key".to_string(),
+            group: ModelChoiceGroup::Google,
         },
         ModelChoice {
             display: "Qwen3.6 Plus".to_string(),
@@ -407,6 +501,8 @@ pub(crate) fn provider_backend_for_account(account: &str) -> AgentBackend {
         AgentBackend::Openai
     } else if account == ACCOUNT_ANTHROPIC {
         AgentBackend::Anthropic
+    } else if account == ACCOUNT_GOOGLE {
+        AgentBackend::Google
     } else if account == ACCOUNT_DEEPSEEK {
         AgentBackend::Deepseek
     } else {
@@ -514,6 +610,18 @@ pub(crate) fn bundled_openrouter_model_ids() -> Vec<String> {
     .collect()
 }
 
+pub(crate) fn bundled_google_model_ids() -> Vec<String> {
+    [
+        "gemini-3.1-pro-preview",
+        "gemini-3.5-flash",
+        "gemini-3-flash-preview",
+        "gemini-3.1-flash-lite",
+    ]
+    .iter()
+    .map(|id| id.to_string())
+    .collect()
+}
+
 pub(crate) fn provider_model_for_display(display: &str, choices: &[ModelChoice]) -> String {
     choices
         .iter()
@@ -587,6 +695,19 @@ mod tests {
     }
 
     #[test]
+    fn bundled_google_ids_are_the_curated_provider_set() {
+        assert_eq!(
+            bundled_google_model_ids(),
+            vec![
+                "gemini-3.1-pro-preview",
+                "gemini-3.5-flash",
+                "gemini-3-flash-preview",
+                "gemini-3.1-flash-lite",
+            ]
+        );
+    }
+
+    #[test]
     fn bundled_openai_ids_are_the_curated_provider_set() {
         assert_eq!(
             bundled_openai_model_ids(),
@@ -640,5 +761,22 @@ mod tests {
         assert_eq!(models[0].display, "GPT-5.5");
         assert_eq!(models[0].account, ACCOUNT_CODEX);
         assert_eq!(models[0].provider_model, "gpt-5.5");
+    }
+
+    #[test]
+    fn provider_defaults_cover_first_run_accounts() {
+        for (account, provider_model) in [
+            (ACCOUNT_CODEX, "gpt-5.5"),
+            (ACCOUNT_OPENAI, "gpt-5.5"),
+            (ACCOUNT_ANTHROPIC, "claude-opus-4-8"),
+            (ACCOUNT_OPENROUTER, "google/gemini-3.1-pro-preview"),
+            (ACCOUNT_DEEPSEEK, "deepseek-v4-pro"),
+        ] {
+            let default = provider_default_model(account).expect("provider default");
+            assert_eq!(default.provider_model, provider_model);
+            let choice = provider_default_model_choice(account).expect("default choice");
+            assert_eq!(choice.account, account);
+            assert_eq!(choice.provider_model, provider_model);
+        }
     }
 }

@@ -1,6 +1,6 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs;
-use std::io::{self, BufRead, Read, Write};
+use std::io::{self, BufRead, IsTerminal, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::sync::{
@@ -61,13 +61,14 @@ use browser_use_protocol::{
     session_result_from_events, task_from_events,
 };
 use browser_use_providers::{
-    claude_code_oauth_authorize_url, claude_code_oauth_pkce, codex_oauth_authorize_url,
-    codex_oauth_pkce, codex_oauth_state, exchange_claude_code_authorization_code,
-    exchange_codex_authorization_code, load_codex_auth, load_codex_auth_file,
-    load_codex_managed_auth, load_codex_managed_auth_file, parse_claude_code_authorization_input,
-    parse_codex_authorization_input, ClaudeCodeOAuthCredential, CodexAuth, CodexManagedAuth,
-    CLAUDE_CODE_CALLBACK_HOST, CLAUDE_CODE_CALLBACK_PATH, CLAUDE_CODE_CALLBACK_PORT,
-    CODEX_CALLBACK_HOST, CODEX_CALLBACK_PATH, CODEX_CALLBACK_PORT,
+    claude_code_oauth_authorize_url, claude_code_oauth_pkce, codex_callback_page,
+    codex_callback_status, codex_oauth_authorize_url, codex_oauth_pkce, codex_oauth_state,
+    exchange_claude_code_authorization_code, exchange_codex_authorization_code, load_codex_auth,
+    load_codex_auth_file, load_codex_managed_auth, load_codex_managed_auth_file,
+    parse_claude_code_authorization_input, parse_codex_authorization_input,
+    ClaudeCodeOAuthCredential, CodexAuth, CodexManagedAuth, CLAUDE_CODE_CALLBACK_HOST,
+    CLAUDE_CODE_CALLBACK_PATH, CLAUDE_CODE_CALLBACK_PORT, CODEX_CALLBACK_HOST, CODEX_CALLBACK_PATH,
+    CODEX_CALLBACK_PORT,
 };
 use browser_use_python_worker::PythonWorker;
 use browser_use_runtime::{
@@ -75,23 +76,66 @@ use browser_use_runtime::{
     CompleteAgentRequest, CreateRootAgentRequest, Durability as RuntimeDurability,
     FailAgentRequest, LiveThreadPersistence, LocalRuntimeRequest, LocalRuntimeWaitTarget,
     MailboxDeliveryPhase as RuntimeMailboxDeliveryPhase, MailboxItemKind as RuntimeMailboxItemKind,
-    RunAgentRequest, RunId as RuntimeRunId, RuntimeHandle, RuntimeProjectionState, SessionId,
-    SpawnChildRequest, SqliteJournal, StateIndex, SubmitInputRequest,
+    RunAgentRequest, RunId as RuntimeRunId, RuntimeEvent, RuntimeHandle, RuntimeProjectionState,
+    SessionId, SpawnChildRequest, SqliteJournal, StateIndex, SubmitInputRequest,
 };
 #[cfg(test)]
 use browser_use_runtime::{AttachChildAgentRequest, AttachRootAgentRequest};
 use browser_use_store::{now_ms, resolve_state_dir, Store};
 use clap::{Parser, Subcommand, ValueEnum};
+use reqwest::Url;
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
+use serde_json::{json, Value};
 
+const MESSAGE_KIND_INITIAL: &str = "initial";
 const MESSAGE_KIND_FOLLOWUP: &str = "followup";
+const SDK_PROTOCOL_VERSION: u64 = 1;
 const APPROX_CHARS_PER_TOKEN: usize = 4;
 const DATASET_BROWSER_CLEANUP_TIMEOUT: Duration = Duration::from_secs(15);
 const SDK_EVENT_STRING_LIMIT_BYTES: usize = 1_000_000;
 const SDK_JSON_RPC_FRAME_LIMIT_BYTES: usize = 8 * 1024 * 1024;
 const SDK_HISTORY_EVENTS_HEAD_COUNT: usize = 20;
 const SDK_HISTORY_EVENTS_INITIAL_TAIL_COUNT: usize = 400;
+
+#[derive(Clone, Debug, Default)]
+struct MessageAnalytics {
+    provider_kind: Option<String>,
+    provider: Option<String>,
+    model: Option<String>,
+}
+
+fn should_color_stdout() -> bool {
+    io::stdout().is_terminal() && std::env::var_os("NO_COLOR").is_none()
+}
+
+fn ansi(text: impl AsRef<str>, code: &str) -> String {
+    let text = text.as_ref();
+    if should_color_stdout() {
+        format!("\x1b[{code}m{text}\x1b[0m")
+    } else {
+        text.to_string()
+    }
+}
+
+fn cli_heading(text: impl AsRef<str>) -> String {
+    ansi(text, "1;38;5;208")
+}
+
+fn cli_code(text: impl AsRef<str>) -> String {
+    ansi(text, "1;38;5;208")
+}
+
+fn cli_link(text: impl AsRef<str>) -> String {
+    ansi(text, "4;38;5;39")
+}
+
+fn cli_muted(text: impl AsRef<str>) -> String {
+    ansi(text, "2")
+}
+
+fn cli_success(text: impl AsRef<str>) -> String {
+    ansi(text, "1;32")
+}
 
 #[derive(Debug, Parser)]
 #[command(name = "browser-use-terminal", bin_name = "browser-use-terminal")]
@@ -184,9 +228,19 @@ enum Command {
         #[arg(long)]
         model: Option<String>,
     },
+    RunBrowserUse {
+        text: String,
+        #[arg(long, default_value = "bu-3-max")]
+        model: String,
+    },
     RunAnthropic {
         text: String,
         #[arg(long, default_value = "claude-sonnet-4-6")]
+        model: String,
+    },
+    RunGoogle {
+        text: String,
+        #[arg(long, default_value = "gemini-3.5-flash")]
         model: String,
     },
     RunOpenrouter {
@@ -219,9 +273,19 @@ enum Command {
         #[arg(long)]
         model: Option<String>,
     },
+    RunBrowserUseSession {
+        task_id: String,
+        #[arg(long, default_value = "bu-3-max")]
+        model: String,
+    },
     RunAnthropicSession {
         task_id: String,
         #[arg(long, default_value = "claude-sonnet-4-6")]
+        model: String,
+    },
+    RunGoogleSession {
+        task_id: String,
+        #[arg(long, default_value = "gemini-3.5-flash")]
         model: String,
     },
     RunOpenrouterSession {
@@ -574,6 +638,8 @@ enum AuthCommand {
         #[arg(long)]
         code: Option<String>,
         #[arg(long)]
+        device_code: bool,
+        #[arg(long)]
         no_browser: bool,
     },
     ImportCodex {
@@ -582,6 +648,8 @@ enum AuthCommand {
     },
     Logout {
         account: AuthAccount,
+        #[arg(long)]
+        local_only: bool,
     },
 }
 
@@ -685,6 +753,7 @@ enum AuthAccount {
     BrowserUseCloud,
     Openai,
     Anthropic,
+    Google,
     Openrouter,
     Deepseek,
 }
@@ -805,7 +874,25 @@ fn main() -> Result<()> {
             collaboration_mode,
             &runtime_options,
         ),
+        Command::RunBrowserUse { text, model } => run_browser_use(
+            &store,
+            text,
+            model,
+            config_profile.as_deref(),
+            &config_overrides,
+            collaboration_mode,
+            &runtime_options,
+        ),
         Command::RunAnthropic { text, model } => run_anthropic(
+            &store,
+            text,
+            model,
+            config_profile.as_deref(),
+            &config_overrides,
+            collaboration_mode,
+            &runtime_options,
+        ),
+        Command::RunGoogle { text, model } => run_google(
             &store,
             text,
             model,
@@ -859,7 +946,25 @@ fn main() -> Result<()> {
             collaboration_mode,
             &runtime_options,
         ),
+        Command::RunBrowserUseSession { task_id, model } => run_browser_use_session(
+            &store,
+            &task_id,
+            model,
+            config_profile.as_deref(),
+            &config_overrides,
+            collaboration_mode,
+            &runtime_options,
+        ),
         Command::RunAnthropicSession { task_id, model } => run_anthropic_session(
+            &store,
+            &task_id,
+            model,
+            config_profile.as_deref(),
+            &config_overrides,
+            collaboration_mode,
+            &runtime_options,
+        ),
+        Command::RunGoogleSession { task_id, model } => run_google_session(
             &store,
             &task_id,
             model,
@@ -1164,13 +1269,17 @@ fn command_name(command: &Command) -> &'static str {
         Command::Start { .. } => "start",
         Command::RunFake { .. } => "run_fake",
         Command::RunOpenai { .. } => "run_openai",
+        Command::RunBrowserUse { .. } => "run_browser_use",
         Command::RunAnthropic { .. } => "run_anthropic",
+        Command::RunGoogle { .. } => "run_google",
         Command::RunOpenrouter { .. } => "run_openrouter",
         Command::RunDeepseek { .. } => "run_deepseek",
         Command::RunCodex { .. } => "run_codex",
         Command::RunCodexSession { .. } => "run_codex_session",
         Command::RunOpenaiSession { .. } => "run_openai_session",
+        Command::RunBrowserUseSession { .. } => "run_browser_use_session",
         Command::RunAnthropicSession { .. } => "run_anthropic_session",
+        Command::RunGoogleSession { .. } => "run_google_session",
         Command::RunOpenrouterSession { .. } => "run_openrouter_session",
         Command::RunDeepseekSession { .. } => "run_deepseek_session",
         Command::Followup { .. } => "followup",
@@ -1433,11 +1542,22 @@ fn sessions(store: &Store, command: SessionsCommand) -> Result<()> {
 fn start(store: &Store, text: String) -> Result<()> {
     let cwd = std::env::current_dir()?;
     let task = store.create_session(None, &cwd)?;
-    store.append_event(
+    let input_record = store.append_event(
         &task.id,
         "session.input",
         typed_user_input_payload_from_text_for_cwd(&text, &cwd)?,
     )?;
+    let analytics = MessageAnalytics::default();
+    capture_user_message(
+        store,
+        "cli",
+        &task.id,
+        task.parent_id.is_some(),
+        MESSAGE_KIND_INITIAL,
+        input_record.seq,
+        &text,
+        analytics,
+    );
     maybe_append_message_history(&task.id, &text, &cwd, &AgentRunOptions::default());
     println!("{}", task.id);
     Ok(())
@@ -1450,11 +1570,22 @@ fn run_new_session_from_config(
 ) -> Result<()> {
     let cwd = std::env::current_dir()?;
     let session = store.create_session(None, &cwd)?;
-    store.append_event(
+    let input_record = store.append_event(
         &session.id,
         "session.input",
         typed_user_input_payload_from_text_for_cwd(&text, &cwd)?,
     )?;
+    let analytics = message_analytics_for_config(&config);
+    capture_user_message(
+        store,
+        "cli",
+        &session.id,
+        session.parent_id.is_some(),
+        MESSAGE_KIND_INITIAL,
+        input_record.seq,
+        &text,
+        analytics,
+    );
     maybe_append_message_history(&session.id, &text, &cwd, &config.options);
     let session_id = run_session_via_engine(store, &session.id, config)?;
     println!("{session_id}");
@@ -1991,13 +2122,24 @@ fn child_request_fork_mode(raw: Option<&str>) -> Result<ForkMode> {
 fn run_fake(store: &Store, text: String, python_code: Option<String>) -> Result<()> {
     let cwd = std::env::current_dir()?;
     let session = store.create_session(None, &cwd)?;
-    store.append_event(
+    let input_record = store.append_event(
         &session.id,
         "session.input",
         typed_user_input_payload_from_text_for_cwd(&text, &cwd)?,
     )?;
     let config = ProviderRunConfig::new(ProviderBackend::Fake, "fake")
         .with_fake_result(fake_agent_result_text(&text, python_code.as_deref()));
+    let analytics = message_analytics_for_config(&config);
+    capture_user_message(
+        store,
+        "cli",
+        &session.id,
+        session.parent_id.is_some(),
+        MESSAGE_KIND_INITIAL,
+        input_record.seq,
+        &text,
+        analytics,
+    );
     let session_id = run_session_via_engine(store, &session.id, config)?;
     println!("{session_id}");
     Ok(())
@@ -2102,7 +2244,9 @@ fn default_cli_model_for_backend_with_overrides(
         ProviderBackend::Openai => {
             default_model_for_cwd_with_options(cwd, config_profile, config_overrides, false)
         }
+        ProviderBackend::BrowserUse => Ok("bu-3-max".to_string()),
         ProviderBackend::Anthropic => Ok("claude-sonnet-4-6".to_string()),
+        ProviderBackend::Google => Ok("gemini-3.5-flash".to_string()),
         ProviderBackend::Openrouter => Ok("openai/gpt-5.5".to_string()),
         ProviderBackend::Deepseek => Ok("deepseek-v4-pro".to_string()),
         ProviderBackend::Codex | ProviderBackend::Fake | ProviderBackend::None => {
@@ -2114,7 +2258,9 @@ fn default_cli_model_for_backend_with_overrides(
 fn default_provider_id_for_backend(backend: ProviderBackend) -> &'static str {
     match backend {
         ProviderBackend::Openai => "openai",
+        ProviderBackend::BrowserUse => "browser-use",
         ProviderBackend::Anthropic => "anthropic",
+        ProviderBackend::Google => "google",
         ProviderBackend::Openrouter => "openrouter",
         ProviderBackend::Deepseek => "deepseek",
         ProviderBackend::Fake => "fake",
@@ -2205,6 +2351,46 @@ fn run_anthropic(
 ) -> Result<()> {
     let config =
         ProviderRunConfig::new(ProviderBackend::Anthropic, model).with_options(cli_agent_options(
+            config_profile,
+            raw_config_overrides,
+            collaboration_mode,
+            runtime_options,
+        )?);
+    run_new_session_from_config(store, text, config)
+}
+
+fn run_browser_use(
+    store: &Store,
+    text: String,
+    model: String,
+    config_profile: Option<&str>,
+    raw_config_overrides: &[String],
+    collaboration_mode: CollaborationModeKind,
+    runtime_options: &CliRuntimeOptions,
+) -> Result<()> {
+    let config = ProviderRunConfig::new(ProviderBackend::BrowserUse, model).with_options(
+        cli_agent_options(
+            config_profile,
+            raw_config_overrides,
+            collaboration_mode,
+            runtime_options,
+        )?
+        .with_default_model_provider_id("browser-use"),
+    );
+    run_new_session_from_config(store, text, config)
+}
+
+fn run_google(
+    store: &Store,
+    text: String,
+    model: String,
+    config_profile: Option<&str>,
+    raw_config_overrides: &[String],
+    collaboration_mode: CollaborationModeKind,
+    runtime_options: &CliRuntimeOptions,
+) -> Result<()> {
+    let config =
+        ProviderRunConfig::new(ProviderBackend::Google, model).with_options(cli_agent_options(
             config_profile,
             raw_config_overrides,
             collaboration_mode,
@@ -2340,6 +2526,52 @@ fn run_anthropic_session(
     ensure_task_exists(store, task_id)?;
     let config =
         ProviderRunConfig::new(ProviderBackend::Anthropic, model).with_options(cli_agent_options(
+            config_profile,
+            raw_config_overrides,
+            collaboration_mode,
+            runtime_options,
+        )?);
+    let session_id = run_existing_session_from_config_and_notify(store, task_id, config, None)?;
+    println!("{session_id}");
+    Ok(())
+}
+
+fn run_browser_use_session(
+    store: &Store,
+    task_id: &str,
+    model: String,
+    config_profile: Option<&str>,
+    raw_config_overrides: &[String],
+    collaboration_mode: CollaborationModeKind,
+    runtime_options: &CliRuntimeOptions,
+) -> Result<()> {
+    ensure_task_exists(store, task_id)?;
+    let config = ProviderRunConfig::new(ProviderBackend::BrowserUse, model).with_options(
+        cli_agent_options(
+            config_profile,
+            raw_config_overrides,
+            collaboration_mode,
+            runtime_options,
+        )?
+        .with_default_model_provider_id("browser-use"),
+    );
+    let session_id = run_existing_session_from_config_and_notify(store, task_id, config, None)?;
+    println!("{session_id}");
+    Ok(())
+}
+
+fn run_google_session(
+    store: &Store,
+    task_id: &str,
+    model: String,
+    config_profile: Option<&str>,
+    raw_config_overrides: &[String],
+    collaboration_mode: CollaborationModeKind,
+    runtime_options: &CliRuntimeOptions,
+) -> Result<()> {
+    ensure_task_exists(store, task_id)?;
+    let config =
+        ProviderRunConfig::new(ProviderBackend::Google, model).with_options(cli_agent_options(
             config_profile,
             raw_config_overrides,
             collaboration_mode,
@@ -2639,6 +2871,114 @@ fn child_run_was_interrupted_from_events(events: &[browser_use_protocol::EventRe
     session_was_interrupted(events)
 }
 
+fn message_analytics_for_config(config: &ProviderRunConfig) -> MessageAnalytics {
+    MessageAnalytics {
+        provider_kind: Some(analytics_provider_kind_for_backend(config.backend).to_string()),
+        provider: Some(provider_id_for_backend(config.backend).to_string()),
+        model: Some(config.model.clone()),
+    }
+}
+
+fn analytics_provider_kind_for_backend(backend: ProviderBackend) -> &'static str {
+    match backend {
+        ProviderBackend::Codex => "subscription",
+        ProviderBackend::Openai
+        | ProviderBackend::Anthropic
+        | ProviderBackend::Google
+        | ProviderBackend::Openrouter
+        | ProviderBackend::Deepseek
+        | ProviderBackend::BrowserUse => "api_key",
+        ProviderBackend::Fake | ProviderBackend::None => "other",
+    }
+}
+
+fn provider_id_for_backend(backend: ProviderBackend) -> &'static str {
+    match backend {
+        ProviderBackend::Codex => "codex",
+        ProviderBackend::Openai => "openai",
+        ProviderBackend::Anthropic => "anthropic",
+        ProviderBackend::Google => "google",
+        ProviderBackend::Openrouter => "openrouter",
+        ProviderBackend::Deepseek => "deepseek",
+        ProviderBackend::BrowserUse => "browser-use",
+        ProviderBackend::Fake => "fake",
+        ProviderBackend::None => "none",
+    }
+}
+
+fn append_message_analytics(properties: &mut serde_json::Value, analytics: MessageAnalytics) {
+    let Some(object) = properties.as_object_mut() else {
+        return;
+    };
+    for (key, value) in [
+        ("provider_kind", analytics.provider_kind),
+        ("provider", analytics.provider),
+    ] {
+        if let Some(value) = value
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty())
+        {
+            object.insert(key.to_string(), serde_json::Value::String(value));
+        }
+    }
+    if let Some(raw_model) = analytics
+        .model
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+    {
+        let simple_model = simple_model_id(&raw_model);
+        object.insert(
+            "model".to_string(),
+            serde_json::Value::String(simple_model.clone()),
+        );
+        if simple_model != raw_model {
+            object.insert(
+                "provider_model".to_string(),
+                serde_json::Value::String(raw_model),
+            );
+        }
+    }
+}
+
+fn append_user_text_analytics(properties: &mut serde_json::Value, text: &str) {
+    let Some(object) = properties.as_object_mut() else {
+        return;
+    };
+    let trimmed = text.trim();
+    let char_count = trimmed.chars().count();
+    let word_count = if trimmed.is_empty() {
+        0
+    } else {
+        trimmed.split_whitespace().count()
+    };
+    let approx_tokens = char_count.div_ceil(APPROX_CHARS_PER_TOKEN);
+    object.insert(
+        "text".to_string(),
+        serde_json::Value::String(text.to_string()),
+    );
+    object.insert(
+        "text_chars".to_string(),
+        serde_json::json!(text.chars().count()),
+    );
+    object.insert("char_count".to_string(), serde_json::json!(char_count));
+    object.insert("word_count".to_string(), serde_json::json!(word_count));
+    object.insert(
+        "approx_tokens".to_string(),
+        serde_json::json!(approx_tokens),
+    );
+}
+
+fn simple_model_id(model: &str) -> String {
+    model
+        .trim()
+        .rsplit('/')
+        .next()
+        .unwrap_or(model)
+        .trim()
+        .replace('_', "-")
+        .to_ascii_lowercase()
+}
+
 #[allow(clippy::too_many_arguments)]
 fn capture_user_message(
     store: &Store,
@@ -2648,29 +2988,18 @@ fn capture_user_message(
     kind: &str,
     seq: i64,
     text: &str,
+    analytics: MessageAnalytics,
 ) {
-    let trimmed = text.trim();
-    let char_count = trimmed.chars().count();
-    let word_count = if trimmed.is_empty() {
-        0
-    } else {
-        trimmed.split_whitespace().count()
-    };
-    let approx_tokens = char_count.div_ceil(APPROX_CHARS_PER_TOKEN);
-    capture_async(
-        store,
-        "bu:tui user_message",
-        serde_json::json!({
-            "surface": surface,
-            "session_id": session_id,
-            "is_subagent": is_subagent,
-            "kind": kind,
-            "seq": seq,
-            "char_count": char_count,
-            "word_count": word_count,
-            "approx_tokens": approx_tokens,
-        }),
-    );
+    let mut properties = serde_json::json!({
+        "surface": surface,
+        "session_id": session_id,
+        "is_subagent": is_subagent,
+        "kind": kind,
+        "seq": seq,
+    });
+    append_user_text_analytics(&mut properties, text);
+    append_message_analytics(&mut properties, analytics);
+    capture_async(store, "bu:tui user_message", properties);
 }
 
 fn followup(store: &Store, task_id: &str, text: String) -> Result<()> {
@@ -2684,6 +3013,7 @@ fn followup(store: &Store, task_id: &str, text: String) -> Result<()> {
             MESSAGE_KIND_FOLLOWUP,
             seq,
             &text,
+            MessageAnalytics::default(),
         );
         maybe_append_message_history(
             task_id,
@@ -2707,6 +3037,7 @@ fn followup(store: &Store, task_id: &str, text: String) -> Result<()> {
         MESSAGE_KIND_FOLLOWUP,
         followup_record.seq,
         &text,
+        MessageAnalytics::default(),
     );
     maybe_append_message_history(
         task_id,
@@ -3027,6 +3358,7 @@ fn run_cookie_sync_browser_command(store: &Store, args: &[String]) -> Result<Val
     let artifact_root = cli_browser_artifact_root(store)?;
     let options = browser_use_browser::BrowserCommandOptions {
         browser_use_api_key,
+        browser_use_api_url: Some(browser_use_cloud_api_base_url()),
     };
     Ok(browser_use_browser::run_browser_command_with_options(
         "cli-browser",
@@ -3319,7 +3651,20 @@ fn is_secret_setting(key: &str) -> bool {
 }
 
 const BROWSER_USE_CLOUD_API_KEY_SETTING: &str = "auth.browser_use_cloud.api_key";
+const BROWSER_USE_CLOUD_API_KEY_ID_SETTING: &str = "auth.browser_use_cloud.api_key_id";
+const BROWSER_USE_CLOUD_API_KEY_SOURCE_SETTING: &str = "auth.browser_use_cloud.api_key_source";
+const BROWSER_USE_CLOUD_API_KEY_PROJECT_SETTING: &str = "auth.browser_use_cloud.project_id";
+const BROWSER_USE_CLOUD_API_KEY_EXPIRES_SETTING: &str = "auth.browser_use_cloud.expires_at";
+const BROWSER_USE_CLOUD_API_KEY_SCOPES_SETTING: &str = "auth.browser_use_cloud.scopes";
 const BROWSER_USE_CLOUD_API_KEY_ENV: &str = "BROWSER_USE_API_KEY";
+const BROWSER_USE_CLOUD_API_URL_ENV: &str = "BROWSER_USE_CLOUD_API_URL";
+const BROWSER_USE_CLOUD_DEFAULT_API_URL: &str = "https://api.browser-use.com";
+const BROWSER_USE_CLOUD_LOCAL_API_URL: &str = "http://localhost:8000";
+const BROWSER_USE_CLOUD_LOCAL_APP_URL: &str = "http://localhost:3000";
+const BROWSER_USE_CLOUD_DEVICE_GRANT_TYPE: &str = "urn:ietf:params:oauth:grant-type:device_code";
+const BROWSER_USE_CLOUD_AUTHORIZATION_CODE_GRANT_TYPE: &str = "authorization_code";
+const BROWSER_USE_CLOUD_CLIENT_ID: &str = "browser-use-terminal";
+const BROWSER_USE_CLOUD_CALLBACK_PATH: &str = "/browser-use-cloud/callback";
 
 fn secrets(store: &Store, command: SecretsCommand) -> Result<()> {
     use browser_use_agent::tools::handlers::secrets_admin as sa;
@@ -3519,6 +3864,16 @@ fn auth(store: &Store, command: AuthCommand) -> Result<()> {
             )?;
             print_api_key_status(
                 store,
+                "Google API key",
+                "auth.google.api_key",
+                &[
+                    "LLM_BROWSER_GOOGLE_API_KEY",
+                    "GEMINI_API_KEY",
+                    "GOOGLE_API_KEY",
+                ],
+            )?;
+            print_api_key_status(
+                store,
                 "OpenRouter API key",
                 "auth.openrouter.api_key",
                 &["LLM_BROWSER_OPENAI_COMPAT_API_KEY", "OPENROUTER_API_KEY"],
@@ -3538,6 +3893,7 @@ fn auth(store: &Store, command: AuthCommand) -> Result<()> {
             access_token,
             account_id,
             code,
+            device_code,
             no_browser,
         } => auth_login(
             store,
@@ -3546,6 +3902,7 @@ fn auth(store: &Store, command: AuthCommand) -> Result<()> {
             access_token,
             account_id,
             code,
+            device_code,
             no_browser,
         ),
         AuthCommand::ImportCodex { input } => {
@@ -3572,8 +3929,11 @@ fn auth(store: &Store, command: AuthCommand) -> Result<()> {
             println!("Codex login: imported account {}", auth.account_id);
             Ok(())
         }
-        AuthCommand::Logout { account } => {
-            auth_logout(store, account)?;
+        AuthCommand::Logout {
+            account,
+            local_only,
+        } => {
+            auth_logout(store, account, local_only)?;
             println!("{}: logged out", auth_account_label(account));
             Ok(())
         }
@@ -3595,6 +3955,68 @@ fn print_auth_line(label: &str, connected: bool) {
     println!("{label}: {status}");
 }
 
+#[derive(Debug, Deserialize)]
+struct BrowserUseCloudDeviceStartResponse {
+    device_code: String,
+    user_code: String,
+    verification_uri: String,
+    expires_in: u64,
+    interval: u64,
+}
+
+#[derive(Debug, Serialize)]
+struct BrowserUseCloudDeviceStartRequest {
+    device_name: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct BrowserUseCloudDeviceTokenRequest<'a> {
+    grant_type: &'a str,
+    device_code: &'a str,
+}
+
+#[derive(Debug, Serialize)]
+struct BrowserUseCloudBrowserStartRequest<'a> {
+    client_id: &'a str,
+    response_type: &'a str,
+    redirect_uri: &'a str,
+    code_challenge: &'a str,
+    code_challenge_method: &'a str,
+    state: &'a str,
+    device_name: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct BrowserUseCloudBrowserStartResponse {
+    authorization_uri: String,
+    expires_in: u64,
+}
+
+#[derive(Debug, Serialize)]
+struct BrowserUseCloudAuthorizationCodeTokenRequest<'a> {
+    grant_type: &'a str,
+    code: &'a str,
+    redirect_uri: &'a str,
+    code_verifier: &'a str,
+    client_id: &'a str,
+}
+
+#[derive(Debug, Deserialize)]
+struct BrowserUseCloudTokenResponse {
+    api_key: String,
+    api_key_id: String,
+    project_id: String,
+    expires_at: Option<String>,
+    scopes: Vec<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct BrowserUseCloudTokenError {
+    error: String,
+    error_description: Option<String>,
+    interval: Option<u64>,
+}
+
 fn auth_login(
     store: &Store,
     account: AuthAccount,
@@ -3602,20 +4024,48 @@ fn auth_login(
     access_token: Option<String>,
     account_id: Option<String>,
     code: Option<String>,
+    device_code: bool,
     no_browser: bool,
 ) -> Result<()> {
     match account {
         AuthAccount::BrowserUseCloud => {
-            let api_key =
-                read_required_secret(api_key, &format!("{} API key", auth_account_label(account)))?;
-            let key = api_key_setting(account).context("account does not use an API key")?;
-            store.set_setting(key, api_key.trim())?;
+            if let Some(api_key) = api_key {
+                let api_key = read_required_secret(
+                    Some(api_key),
+                    &format!("{} API key", auth_account_label(account)),
+                )?;
+                store_browser_use_cloud_api_key(store, api_key.trim(), None)?;
+                println!(
+                    "{}: connected (stored API key)",
+                    auth_account_label(account)
+                );
+                return Ok(());
+            }
+            if code.is_some() {
+                bail!(
+                    "auth login browser-use-cloud uses --device-code for manual sign-in; --code is for Claude Code OAuth"
+                );
+            }
+            let credential = if device_code {
+                browser_use_cloud_device_login(!no_browser)?
+            } else {
+                browser_use_cloud_browser_login(!no_browser)?
+            };
+            store_browser_use_cloud_api_key(store, &credential.api_key, Some(&credential))?;
             store.set_setting("browser", "Browser Use Cloud")?;
-            println!("{}: connected (stored)", auth_account_label(account));
+            println!(
+                "{} {}",
+                cli_success(format!(
+                    "{}: connected to project",
+                    auth_account_label(account)
+                )),
+                credential.project_id
+            );
             Ok(())
         }
         AuthAccount::Openai
         | AuthAccount::Anthropic
+        | AuthAccount::Google
         | AuthAccount::Openrouter
         | AuthAccount::Deepseek => {
             let api_key =
@@ -3657,7 +4107,338 @@ fn auth_login(
     }
 }
 
-fn auth_logout(store: &Store, account: AuthAccount) -> Result<()> {
+fn browser_use_cloud_api_base_url() -> String {
+    if let Some(url) = std::env::var(BROWSER_USE_CLOUD_API_URL_ENV)
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+    {
+        return normalize_browser_use_cloud_url(&url);
+    }
+
+    if browser_use_cloud_local_dev_available() {
+        return BROWSER_USE_CLOUD_LOCAL_API_URL.to_string();
+    }
+
+    BROWSER_USE_CLOUD_DEFAULT_API_URL.to_string()
+}
+
+fn normalize_browser_use_cloud_url(url: &str) -> String {
+    url.trim().trim_end_matches('/').to_string()
+}
+
+fn browser_use_cloud_local_dev_available() -> bool {
+    let Ok(client) = reqwest::blocking::Client::builder()
+        .timeout(Duration::from_millis(700))
+        .build()
+    else {
+        return false;
+    };
+
+    browser_use_cloud_local_backend_available(&client)
+        && browser_use_cloud_local_frontend_available(&client)
+}
+
+fn browser_use_cloud_local_backend_available(client: &reqwest::blocking::Client) -> bool {
+    let version_ok = client
+        .get(format!(
+            "{BROWSER_USE_CLOUD_LOCAL_API_URL}/browser-use-version"
+        ))
+        .send()
+        .is_ok_and(|response| response.status().is_success());
+    if !version_ok {
+        return false;
+    }
+
+    client
+        .get(format!(
+            "{BROWSER_USE_CLOUD_LOCAL_API_URL}/cloud/cli-auth/device/0000-0000"
+        ))
+        .send()
+        .is_ok_and(|response| response.status() == reqwest::StatusCode::UNAUTHORIZED)
+}
+
+fn browser_use_cloud_local_frontend_available(client: &reqwest::blocking::Client) -> bool {
+    client
+        .head(format!("{BROWSER_USE_CLOUD_LOCAL_APP_URL}/device"))
+        .send()
+        .is_ok_and(|response| response.status().is_success())
+}
+
+fn browser_use_cloud_device_name() -> Option<String> {
+    std::env::var("HOSTNAME")
+        .or_else(|_| std::env::var("COMPUTERNAME"))
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
+fn browser_use_cloud_browser_login(open_browser: bool) -> Result<BrowserUseCloudTokenResponse> {
+    let base_url = browser_use_cloud_api_base_url();
+    let client = reqwest::blocking::Client::builder()
+        .timeout(Duration::from_secs(15))
+        .build()
+        .context("build Browser Use Cloud auth client")?;
+    let (code_verifier, code_challenge) = claude_code_oauth_pkce();
+    let (state, _) = claude_code_oauth_pkce();
+    let (tx, rx) = mpsc::channel();
+    let (_callback, redirect_uri) = start_browser_use_cloud_callback_server(state.clone(), tx)?;
+
+    let start = client
+        .post(format!("{base_url}/cloud/cli-auth/browser"))
+        .json(&BrowserUseCloudBrowserStartRequest {
+            client_id: BROWSER_USE_CLOUD_CLIENT_ID,
+            response_type: "code",
+            redirect_uri: &redirect_uri,
+            code_challenge: &code_challenge,
+            code_challenge_method: "S256",
+            state: &state,
+            device_name: browser_use_cloud_device_name(),
+        })
+        .send()
+        .context("start Browser Use Cloud browser authorization")?
+        .error_for_status()
+        .context("start Browser Use Cloud browser authorization")?
+        .json::<BrowserUseCloudBrowserStartResponse>()
+        .context("parse Browser Use Cloud browser authorization")?;
+
+    println!("{}", cli_heading("Browser Use Cloud sign-in"));
+    println!();
+    println!(
+        "{} {}",
+        cli_muted("Open:"),
+        cli_link(&start.authorization_uri)
+    );
+    println!(
+        "{}",
+        cli_muted(format!(
+            "Waiting for browser approval on {redirect_uri} ..."
+        ))
+    );
+    println!();
+    println!(
+        "{}",
+        cli_muted("If the browser does not open, open the URL above.")
+    );
+    if open_browser {
+        if let Err(error) = open::that(&start.authorization_uri) {
+            eprintln!("Could not open browser automatically: {error}");
+        }
+    }
+
+    let authorization = rx
+        .recv_timeout(Duration::from_secs(start.expires_in.max(1)))
+        .context("timed out waiting for Browser Use Cloud browser approval")??;
+    if authorization.state.as_deref() != Some(&state) {
+        bail!("Browser Use Cloud OAuth state mismatch");
+    }
+    if let Some(error) = authorization.error {
+        let description = authorization
+            .error_description
+            .unwrap_or_else(|| "Browser Use Cloud sign-in was denied".to_string());
+        bail!("{description} ({error})");
+    }
+    let code = authorization
+        .code
+        .context("Browser Use Cloud authorization code was missing")?;
+
+    let response = client
+        .post(format!("{base_url}/cloud/cli-auth/token"))
+        .json(&BrowserUseCloudAuthorizationCodeTokenRequest {
+            grant_type: BROWSER_USE_CLOUD_AUTHORIZATION_CODE_GRANT_TYPE,
+            code: &code,
+            redirect_uri: &redirect_uri,
+            code_verifier: &code_verifier,
+            client_id: BROWSER_USE_CLOUD_CLIENT_ID,
+        })
+        .send()
+        .context("exchange Browser Use Cloud authorization code")?;
+    if response.status().is_success() {
+        return response
+            .json::<BrowserUseCloudTokenResponse>()
+            .context("parse Browser Use Cloud browser token");
+    }
+    let status = response.status();
+    let text = response.text().unwrap_or_default();
+    let error = serde_json::from_str::<BrowserUseCloudTokenError>(&text).unwrap_or(
+        BrowserUseCloudTokenError {
+            error: "server_error".to_string(),
+            error_description: Some(format!(
+                "Browser Use Cloud returned {status} during authorization code exchange"
+            )),
+            interval: None,
+        },
+    );
+    bail!(
+        "{}",
+        error
+            .error_description
+            .unwrap_or_else(|| format!("Browser Use Cloud sign-in failed: {}", error.error))
+    )
+}
+
+fn browser_use_cloud_device_login(open_browser: bool) -> Result<BrowserUseCloudTokenResponse> {
+    let base_url = browser_use_cloud_api_base_url();
+    let client = reqwest::blocking::Client::builder()
+        .timeout(Duration::from_secs(15))
+        .build()
+        .context("build Browser Use Cloud auth client")?;
+    let start = client
+        .post(format!("{base_url}/cloud/cli-auth/device"))
+        .json(&BrowserUseCloudDeviceStartRequest {
+            device_name: browser_use_cloud_device_name(),
+        })
+        .send()
+        .context("start Browser Use Cloud device authorization")?
+        .error_for_status()
+        .context("start Browser Use Cloud device authorization")?
+        .json::<BrowserUseCloudDeviceStartResponse>()
+        .context("parse Browser Use Cloud device authorization")?;
+
+    println!("{}", cli_heading("Browser Use Cloud sign-in"));
+    println!();
+    println!(
+        "{} {}",
+        cli_muted("Open:"),
+        cli_link(&start.verification_uri)
+    );
+    println!("{} {}", cli_muted("Code:"), cli_code(&start.user_code));
+    println!();
+    println!(
+        "{}",
+        cli_muted(format!(
+            "If the browser does not open, go to {} and enter the code.",
+            start.verification_uri
+        ))
+    );
+    if open_browser {
+        if let Err(error) = open::that(&start.verification_uri) {
+            eprintln!("Could not open browser automatically: {error}");
+        }
+    }
+
+    let deadline = Instant::now() + Duration::from_secs(start.expires_in);
+    let mut interval = Duration::from_secs(start.interval.max(1));
+    while Instant::now() < deadline {
+        thread::sleep(interval);
+        let response = match client
+            .post(format!("{base_url}/cloud/cli-auth/token"))
+            .json(&BrowserUseCloudDeviceTokenRequest {
+                grant_type: BROWSER_USE_CLOUD_DEVICE_GRANT_TYPE,
+                device_code: &start.device_code,
+            })
+            .send()
+        {
+            Ok(response) => response,
+            Err(_) => continue,
+        };
+        if response.status().is_success() {
+            return response
+                .json::<BrowserUseCloudTokenResponse>()
+                .context("parse Browser Use Cloud device token");
+        }
+
+        let status = response.status();
+        let text = response.text().unwrap_or_default();
+        let error = serde_json::from_str::<BrowserUseCloudTokenError>(&text).unwrap_or(
+            BrowserUseCloudTokenError {
+                error: "server_error".to_string(),
+                error_description: Some(format!(
+                    "Browser Use Cloud returned {status} during device authorization"
+                )),
+                interval: None,
+            },
+        );
+        match error.error.as_str() {
+            "authorization_pending" => {}
+            "slow_down" => {
+                interval = Duration::from_secs(error.interval.unwrap_or(10).max(1));
+            }
+            "access_denied" => bail!(
+                "{}",
+                error
+                    .error_description
+                    .unwrap_or_else(|| "Browser Use Cloud sign-in was denied".to_string())
+            ),
+            "expired_token" => bail!(
+                "{}",
+                error
+                    .error_description
+                    .unwrap_or_else(|| "Browser Use Cloud sign-in expired".to_string())
+            ),
+            _ => bail!(
+                "{}",
+                error.error_description.unwrap_or_else(|| format!(
+                    "Browser Use Cloud sign-in failed: {}",
+                    error.error
+                ))
+            ),
+        }
+    }
+    bail!("Browser Use Cloud sign-in expired")
+}
+
+fn store_browser_use_cloud_api_key(
+    store: &Store,
+    api_key: &str,
+    credential: Option<&BrowserUseCloudTokenResponse>,
+) -> Result<()> {
+    store.set_setting(BROWSER_USE_CLOUD_API_KEY_SETTING, api_key.trim())?;
+    store.set_setting("browser", "Browser Use Cloud")?;
+    if let Some(credential) = credential {
+        store.set_setting(BROWSER_USE_CLOUD_API_KEY_SOURCE_SETTING, "cli_login")?;
+        store.set_setting(BROWSER_USE_CLOUD_API_KEY_ID_SETTING, &credential.api_key_id)?;
+        store.set_setting(
+            BROWSER_USE_CLOUD_API_KEY_PROJECT_SETTING,
+            &credential.project_id,
+        )?;
+        if let Some(expires_at) = credential.expires_at.as_deref() {
+            store.set_setting(BROWSER_USE_CLOUD_API_KEY_EXPIRES_SETTING, expires_at)?;
+        } else {
+            store.delete_setting(BROWSER_USE_CLOUD_API_KEY_EXPIRES_SETTING)?;
+        }
+        store.set_setting(
+            BROWSER_USE_CLOUD_API_KEY_SCOPES_SETTING,
+            &serde_json::to_string(&credential.scopes)?,
+        )?;
+    } else {
+        store.set_setting(BROWSER_USE_CLOUD_API_KEY_SOURCE_SETTING, "manual")?;
+        store.delete_setting(BROWSER_USE_CLOUD_API_KEY_ID_SETTING)?;
+        store.delete_setting(BROWSER_USE_CLOUD_API_KEY_PROJECT_SETTING)?;
+        store.delete_setting(BROWSER_USE_CLOUD_API_KEY_EXPIRES_SETTING)?;
+        store.delete_setting(BROWSER_USE_CLOUD_API_KEY_SCOPES_SETTING)?;
+    }
+    Ok(())
+}
+
+fn revoke_browser_use_cloud_api_key(api_key: &str) -> Result<()> {
+    let base_url = browser_use_cloud_api_base_url();
+    let response = reqwest::blocking::Client::builder()
+        .timeout(Duration::from_secs(15))
+        .build()
+        .context("build Browser Use Cloud auth client")?
+        .delete(format!("{base_url}/cloud/cli-auth/current-key"))
+        .header("X-Browser-Use-API-Key", api_key.trim())
+        .send()
+        .context("revoke Browser Use Cloud API key")?;
+    if response.status().is_success() {
+        return Ok(());
+    }
+    let status = response.status();
+    let body = response.text().unwrap_or_default();
+    bail!("Browser Use Cloud key revocation failed with {status}: {body}")
+}
+
+fn clear_browser_use_cloud_api_key(store: &Store) -> Result<()> {
+    store.delete_setting(BROWSER_USE_CLOUD_API_KEY_SETTING)?;
+    store.delete_setting(BROWSER_USE_CLOUD_API_KEY_ID_SETTING)?;
+    store.delete_setting(BROWSER_USE_CLOUD_API_KEY_SOURCE_SETTING)?;
+    store.delete_setting(BROWSER_USE_CLOUD_API_KEY_PROJECT_SETTING)?;
+    store.delete_setting(BROWSER_USE_CLOUD_API_KEY_EXPIRES_SETTING)?;
+    store.delete_setting(BROWSER_USE_CLOUD_API_KEY_SCOPES_SETTING)?;
+    Ok(())
+}
+
+fn auth_logout(store: &Store, account: AuthAccount, local_only: bool) -> Result<()> {
     match account {
         AuthAccount::Codex => {
             store.delete_setting("auth.codex.access_token")?;
@@ -3669,6 +4450,7 @@ fn auth_logout(store: &Store, account: AuthAccount) -> Result<()> {
         }
         AuthAccount::Openai
         | AuthAccount::Anthropic
+        | AuthAccount::Google
         | AuthAccount::Openrouter
         | AuthAccount::Deepseek => {
             if let Some(key) = api_key_setting(account) {
@@ -3676,7 +4458,16 @@ fn auth_logout(store: &Store, account: AuthAccount) -> Result<()> {
             }
         }
         AuthAccount::BrowserUseCloud => {
-            store.delete_setting(BROWSER_USE_CLOUD_API_KEY_SETTING)?;
+            let source = store.get_setting(BROWSER_USE_CLOUD_API_KEY_SOURCE_SETTING)?;
+            let api_key = store.get_setting(BROWSER_USE_CLOUD_API_KEY_SETTING)?;
+            if !local_only && source.as_deref() == Some("cli_login") {
+                if let Some(api_key) = api_key.as_deref().filter(|value| !value.trim().is_empty()) {
+                    revoke_browser_use_cloud_api_key(api_key).with_context(|| {
+                        "remote revocation failed; rerun with --local-only to remove only the local credential"
+                    })?;
+                }
+            }
+            clear_browser_use_cloud_api_key(store)?;
         }
         AuthAccount::ClaudeCode => {
             store.delete_setting("auth.claude_code.access_token")?;
@@ -3801,6 +4592,134 @@ impl Drop for CallbackServerHandle {
     }
 }
 
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct BrowserUseCloudAuthorization {
+    code: Option<String>,
+    state: Option<String>,
+    error: Option<String>,
+    error_description: Option<String>,
+}
+
+fn start_browser_use_cloud_callback_server(
+    expected_state: String,
+    sender: mpsc::Sender<Result<BrowserUseCloudAuthorization>>,
+) -> Result<(CallbackServerHandle, String)> {
+    let listener = TcpListener::bind(("127.0.0.1", 0))
+        .context("bind Browser Use Cloud OAuth callback on 127.0.0.1")?;
+    let redirect_uri = format!(
+        "http://127.0.0.1:{}{}",
+        listener
+            .local_addr()
+            .context("read Browser Use Cloud OAuth callback address")?
+            .port(),
+        BROWSER_USE_CLOUD_CALLBACK_PATH
+    );
+    listener
+        .set_nonblocking(true)
+        .context("configure Browser Use Cloud OAuth callback listener")?;
+    let (stop_tx, stop_rx) = mpsc::channel::<()>();
+    let thread = std::thread::spawn(move || {
+        let deadline = Instant::now() + Duration::from_secs(900);
+        loop {
+            if stop_rx.try_recv().is_ok() || Instant::now() >= deadline {
+                break;
+            }
+            match listener.accept() {
+                Ok((mut stream, _)) => {
+                    let result = handle_browser_use_cloud_callback(&mut stream, &expected_state);
+                    let _ = sender.send(result);
+                    break;
+                }
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                    std::thread::sleep(Duration::from_millis(50));
+                }
+                Err(error) => {
+                    let _ =
+                        sender.send(Err(error).context("accept Browser Use Cloud OAuth callback"));
+                    break;
+                }
+            }
+        }
+    });
+    Ok((
+        CallbackServerHandle {
+            stop: stop_tx,
+            thread: Some(thread),
+        },
+        redirect_uri,
+    ))
+}
+
+fn handle_browser_use_cloud_callback(
+    stream: &mut TcpStream,
+    expected_state: &str,
+) -> Result<BrowserUseCloudAuthorization> {
+    let mut request = [0_u8; 4096];
+    let read = stream
+        .read(&mut request)
+        .context("read Browser Use Cloud OAuth callback")?;
+    let request = String::from_utf8_lossy(&request[..read]);
+    let path = request
+        .lines()
+        .next()
+        .and_then(|line| line.split_whitespace().nth(1))
+        .context("parse Browser Use Cloud OAuth callback request")?;
+    let parsed = parse_browser_use_cloud_authorization_path(path)?;
+    let callback_path = Url::parse(&format!("http://127.0.0.1{path}"))
+        .ok()
+        .map(|url| url.path().to_string())
+        .unwrap_or_default();
+    let status = if callback_path != BROWSER_USE_CLOUD_CALLBACK_PATH {
+        404
+    } else if parsed.state.as_deref() != Some(expected_state) {
+        400
+    } else if parsed.code.is_none() && parsed.error.is_none() {
+        400
+    } else {
+        200
+    };
+    let text = match status {
+        200 if parsed.error.is_some() => {
+            "Browser Use Cloud authorization was cancelled. You can close this window."
+        }
+        200 => "Browser Use Cloud authentication completed. You can close this window.",
+        400 => "Browser Use Cloud authentication failed: missing code or state mismatch.",
+        _ => "Browser Use Cloud callback route not found.",
+    };
+    let body = format!("<html><body><p>{text}</p></body></html>");
+    let reason = match status {
+        200 => "OK",
+        400 => "Bad Request",
+        _ => "Not Found",
+    };
+    let response = format!(
+        "HTTP/1.1 {status} {reason}\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        body.len()
+    );
+    stream.write_all(response.as_bytes()).ok();
+    if status == 200 {
+        Ok(parsed)
+    } else {
+        bail!("{text}")
+    }
+}
+
+fn parse_browser_use_cloud_authorization_path(path: &str) -> Result<BrowserUseCloudAuthorization> {
+    let url = Url::parse(&format!("http://127.0.0.1{path}"))
+        .context("parse Browser Use Cloud OAuth callback URL")?;
+    let mut authorization = BrowserUseCloudAuthorization::default();
+    for (key, value) in url.query_pairs() {
+        match key.as_ref() {
+            "code" => authorization.code = Some(value.into_owned()),
+            "state" => authorization.state = Some(value.into_owned()),
+            "error" => authorization.error = Some(value.into_owned()),
+            "error_description" => authorization.error_description = Some(value.into_owned()),
+            _ => {}
+        }
+    }
+    Ok(authorization)
+}
+
 fn start_codex_callback_server(
     expected_state: String,
     sender: mpsc::Sender<Result<browser_use_providers::CodexAuthorization>>,
@@ -3856,34 +4775,19 @@ fn handle_codex_callback(
         .and_then(|line| line.split_whitespace().nth(1))
         .context("parse Codex OAuth callback request")?;
     let parsed = parse_codex_authorization_input(path);
-    let status = if !path.starts_with(CODEX_CALLBACK_PATH) {
-        404
-    } else if parsed.error.is_some() {
-        400
-    } else if parsed.code.is_none() || parsed.state.as_deref() != Some(expected_state) {
-        400
-    } else {
-        200
-    };
-    let text = match status {
-        200 => "Codex authentication completed. You can close this window.",
-        400 => parsed
-            .error_description
-            .as_deref()
-            .or(parsed.error.as_deref())
-            .unwrap_or("Codex authentication failed: missing code or state mismatch."),
-        _ => "Codex callback route not found.",
-    };
-    let body = format!("<html><body><p>{text}</p></body></html>");
+    let status = codex_callback_status(path, expected_state, &parsed);
+    let page = codex_callback_page(status, &parsed);
     let response = format!(
-        "HTTP/1.1 {status} OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-        body.len()
+        "HTTP/1.1 {status} {}\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+        page.status_text,
+        page.body.len(),
+        page.body
     );
     stream.write_all(response.as_bytes()).ok();
     if status == 200 {
         Ok(parsed)
     } else {
-        bail!("{text}")
+        bail!("{}", page.message)
     }
 }
 
@@ -4176,6 +5080,7 @@ fn api_key_setting(account: AuthAccount) -> Option<&'static str> {
     match account {
         AuthAccount::Openai => Some("auth.openai.api_key"),
         AuthAccount::Anthropic => Some("auth.anthropic.api_key"),
+        AuthAccount::Google => Some("auth.google.api_key"),
         AuthAccount::Openrouter => Some("auth.openrouter.api_key"),
         AuthAccount::Deepseek => Some("auth.deepseek.api_key"),
         AuthAccount::BrowserUseCloud => Some(BROWSER_USE_CLOUD_API_KEY_SETTING),
@@ -4190,6 +5095,7 @@ fn auth_account_label(account: AuthAccount) -> &'static str {
         AuthAccount::BrowserUseCloud => "Browser Use Cloud",
         AuthAccount::Openai => "OpenAI API key",
         AuthAccount::Anthropic => "Anthropic API key",
+        AuthAccount::Google => "Google API key",
         AuthAccount::Openrouter => "OpenRouter API key",
         AuthAccount::Deepseek => "DeepSeek API key",
     }
@@ -4282,6 +5188,580 @@ fn sdk_server(transport: SdkTransportArg) -> Result<()> {
     }
 }
 
+#[derive(Default)]
+struct BrowserUseSdkPresentationProjection {
+    sessions: HashMap<String, BrowserUseSdkPresentationSession>,
+}
+
+#[derive(Default)]
+struct BrowserUseSdkPresentationSession {
+    current_step: usize,
+    active_step_started_ms: Option<i64>,
+    active_actions: HashMap<String, BrowserUseSdkAction>,
+    assistant_text: String,
+}
+
+struct BrowserUseSdkAction {
+    name: String,
+    started_ms: i64,
+}
+
+#[derive(Default)]
+struct BrowserUseSdkTerminalFrameRenderer {
+    current_step: Option<usize>,
+    action_count: usize,
+    pending_model_text: Option<String>,
+    final_text: Option<String>,
+}
+
+#[derive(Default)]
+struct BrowserUseSdkTerminalFrameProjection {
+    sessions: HashMap<String, BrowserUseSdkTerminalFrameRenderer>,
+}
+
+impl BrowserUseSdkPresentationProjection {
+    fn apply(&mut self, event: &RuntimeEvent) -> Vec<Value> {
+        let Some(session_id) = event.session_id.as_ref().map(|id| id.as_str().to_string()) else {
+            return Vec::new();
+        };
+        let session = self.sessions.entry(session_id.clone()).or_default();
+        let (event_type, payload) = sdk_presentation_event_parts(event);
+        let mut out = Vec::new();
+
+        match event_type {
+            "model.turn.request" => {
+                if let Some(completed) = session.complete_step(event.ts_ms) {
+                    out.push(completed);
+                }
+                session.current_step = session.current_step.saturating_add(1);
+                session.active_step_started_ms = Some(event.ts_ms);
+                session.assistant_text.clear();
+                out.push(json!({
+                    "type": "step.started",
+                    "step": session.current_step,
+                    "ts_ms": event.ts_ms,
+                }));
+            }
+            "model.stream_delta" => {
+                if let Some(text) = payload
+                    .get("text")
+                    .or_else(|| payload.get("delta"))
+                    .and_then(Value::as_str)
+                {
+                    session.assistant_text.push_str(text);
+                }
+            }
+            "tool.started" => {
+                let action = sdk_presentation_action_name(payload).unwrap_or("tool");
+                let key = sdk_presentation_tool_key(event, payload, action);
+                session.active_actions.insert(
+                    key.clone(),
+                    BrowserUseSdkAction {
+                        name: action.to_string(),
+                        started_ms: event.ts_ms,
+                    },
+                );
+                out.push(json!({
+                    "type": "action.started",
+                    "step": session.current_step.max(1),
+                    "id": key,
+                    "name": action,
+                    "params_preview": sdk_presentation_params_preview(payload),
+                    "action": {
+                        "id": key,
+                        "name": action,
+                        "params_preview": sdk_presentation_params_preview(payload),
+                    },
+                    "ts_ms": event.ts_ms,
+                }));
+            }
+            "tool.output" | "tool.completed" | "tool.failed" | "tool.aborted" => {
+                let action = sdk_presentation_action_name(payload).unwrap_or("tool");
+                let key = sdk_presentation_tool_key(event, payload, action);
+                let active = session.active_actions.remove(&key);
+                let name = active
+                    .as_ref()
+                    .map(|action| action.name.as_str())
+                    .unwrap_or(action);
+                let started_ms = active.as_ref().map(|action| action.started_ms);
+                out.push(json!({
+                    "type": "action.completed",
+                    "step": session.current_step.max(1),
+                    "id": key,
+                    "name": name,
+                    "success": !matches!(event_type, "tool.failed" | "tool.aborted"),
+                    "output_preview": sdk_presentation_output_preview(payload),
+                    "action": {
+                        "id": key,
+                        "name": name,
+                        "success": !matches!(event_type, "tool.failed" | "tool.aborted"),
+                        "output_preview": sdk_presentation_output_preview(payload),
+                    },
+                    "duration_ms": started_ms.map(|started| event.ts_ms.saturating_sub(started)),
+                    "ts_ms": event.ts_ms,
+                }));
+            }
+            "session.done" => {
+                if let Some(message) = session.drain_assistant_message(event.ts_ms) {
+                    out.push(message);
+                }
+                out.push(json!({
+                    "type": "final_result",
+                    "step": session.current_step.max(1),
+                    "success": true,
+                    "text": payload
+                        .get("result")
+                        .or_else(|| payload.get("text"))
+                        .and_then(Value::as_str),
+                    "result_file": payload.get("result_file").and_then(Value::as_str),
+                    "ts_ms": event.ts_ms,
+                }));
+            }
+            "session.failed" => {
+                if let Some(message) = session.drain_assistant_message(event.ts_ms) {
+                    out.push(message);
+                }
+                out.push(json!({
+                    "type": "final_result",
+                    "step": session.current_step.max(1),
+                    "success": false,
+                    "text": payload
+                        .get("error")
+                        .or_else(|| payload.get("message"))
+                        .and_then(Value::as_str),
+                    "ts_ms": event.ts_ms,
+                }));
+            }
+            "agent.completed" => {
+                if let Some(completed) = session.complete_step(event.ts_ms) {
+                    out.push(completed);
+                }
+                out.push(json!({
+                    "type": "agent.completed",
+                    "success": true,
+                    "result": payload.get("result").and_then(Value::as_str),
+                    "ts_ms": event.ts_ms,
+                }));
+            }
+            "agent.failed" => {
+                if let Some(completed) = session.complete_step(event.ts_ms) {
+                    out.push(completed);
+                }
+                out.push(json!({
+                    "type": "agent.completed",
+                    "success": false,
+                    "error": payload
+                        .get("error")
+                        .or_else(|| payload.get("message"))
+                        .and_then(Value::as_str),
+                    "ts_ms": event.ts_ms,
+                }));
+            }
+            "agent.turn.completed" | "agent.turn.aborted" => {
+                if let Some(completed) = session.complete_step(event.ts_ms) {
+                    out.push(completed);
+                }
+            }
+            _ => {}
+        }
+
+        out
+    }
+}
+
+impl BrowserUseSdkTerminalFrameRenderer {
+    fn apply(&mut self, event: &Value) -> Option<String> {
+        let event_type = event.get("type").and_then(Value::as_str)?;
+        match event_type {
+            "step.started" => {
+                self.flush_pending_model_text();
+                self.current_step = event
+                    .get("step")
+                    .and_then(Value::as_u64)
+                    .and_then(|step| usize::try_from(step).ok());
+                self.action_count = 0;
+                self.final_text = None;
+                let step = self.current_step.unwrap_or(0);
+                Some(format!("\x1b[36m┌─ Step {}\x1b[0m", step.max(1)))
+            }
+            "action.started" => {
+                self.flush_pending_model_text();
+                self.action_count = self.action_count.saturating_add(1);
+                let name = event
+                    .get("name")
+                    .and_then(Value::as_str)
+                    .unwrap_or("action");
+                let detail = event
+                    .get("params_preview")
+                    .and_then(Value::as_str)
+                    .map(|preview| sdk_terminal_format_action_detail(name, preview))
+                    .unwrap_or_default();
+                Some(sdk_terminal_row("▶", name, &detail, "\x1b[34m"))
+            }
+            "action.completed" => {
+                if event.get("success").and_then(Value::as_bool) == Some(false) {
+                    let name = event
+                        .get("name")
+                        .and_then(Value::as_str)
+                        .unwrap_or("action");
+                    let detail = event
+                        .get("output_preview")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default();
+                    return Some(sdk_terminal_row("✖", name, detail, "\x1b[31m"));
+                }
+                None
+            }
+            "model.message" => {
+                if let Some(text) = event.get("text").and_then(Value::as_str) {
+                    self.pending_model_text = Some(text.to_string());
+                }
+                None
+            }
+            "final_result" => {
+                let text = event
+                    .get("text")
+                    .or_else(|| event.get("result"))
+                    .and_then(Value::as_str)?;
+                let mut lines = Vec::new();
+                if let Some(pending) = self.pending_model_text.take() {
+                    if sdk_terminal_normalize(&pending) != sdk_terminal_normalize(text) {
+                        lines.push(sdk_terminal_text_block("💬 Response", &pending, "\x1b[35m"));
+                    }
+                }
+                self.final_text = Some(text.to_string());
+                let success = event.get("success").and_then(Value::as_bool) != Some(false);
+                let title = if success {
+                    "📄 Final Result"
+                } else {
+                    "📄 Final Result (failed)"
+                };
+                let color = if success { "\x1b[32m" } else { "\x1b[31m" };
+                lines.push(sdk_terminal_text_block(title, text, color));
+                Some(lines.join("\n"))
+            }
+            "step.completed" => {
+                if let Some(preview) = event.get("assistant_preview").and_then(Value::as_str) {
+                    if sdk_terminal_normalize(preview)
+                        != sdk_terminal_normalize(self.final_text.as_deref().unwrap_or_default())
+                    {
+                        self.pending_model_text = Some(preview.to_string());
+                    }
+                }
+                let mut lines = Vec::new();
+                if let Some(pending) = self.flush_pending_model_text() {
+                    lines.push(pending);
+                }
+                let duration = event
+                    .get("duration_ms")
+                    .and_then(Value::as_i64)
+                    .map(|ms| format!("{:.2}s", (ms as f64) / 1000.0))
+                    .unwrap_or_else(|| "complete".to_string());
+                let summary = if self.action_count > 0 {
+                    format!(
+                        "{} action{} · {}",
+                        self.action_count,
+                        if self.action_count == 1 { "" } else { "s" },
+                        duration
+                    )
+                } else {
+                    duration
+                };
+                lines.push(format!("\x1b[36m└─ {}\x1b[0m", summary));
+                Some(lines.join("\n"))
+            }
+            "agent.completed" => {
+                if event.get("success").and_then(Value::as_bool) == Some(false) {
+                    let error = event
+                        .get("error")
+                        .and_then(Value::as_str)
+                        .unwrap_or("Task failed");
+                    return Some(sdk_terminal_text_block("Task failed", error, "\x1b[31m"));
+                }
+                None
+            }
+            _ => None,
+        }
+    }
+
+    fn flush_pending_model_text(&mut self) -> Option<String> {
+        let pending = self.pending_model_text.take()?;
+        if sdk_terminal_normalize(&pending)
+            == sdk_terminal_normalize(self.final_text.as_deref().unwrap_or_default())
+        {
+            return None;
+        }
+        Some(sdk_terminal_text_block("💬 Response", &pending, "\x1b[35m"))
+    }
+}
+
+impl BrowserUseSdkTerminalFrameProjection {
+    fn apply(&mut self, session_id: Option<&str>, event: &Value) -> Option<String> {
+        let key = session_id.unwrap_or("<unknown>").to_string();
+        let renderer = self.sessions.entry(key.clone()).or_default();
+        let frame = renderer.apply(event);
+        if matches!(
+            event.get("type").and_then(Value::as_str),
+            Some("agent.completed")
+        ) {
+            self.sessions.remove(&key);
+        }
+        frame
+    }
+}
+
+fn sdk_terminal_row(icon: &str, label: &str, detail: &str, color: &str) -> String {
+    let reset = "\x1b[0m";
+    let label = format!("{icon} {label}");
+    if detail.trim().is_empty() {
+        return format!("│  {color}{label}{reset}");
+    }
+    let line = format!("│  {color}{label:<18}{reset} {}", detail.trim());
+    sdk_terminal_wrap(&line, 96, "│                      ")
+}
+
+fn sdk_terminal_text_block(title: &str, text: &str, color: &str) -> String {
+    let reset = "\x1b[0m";
+    let mut lines = vec![format!("│  {color}{title}{reset}")];
+    for paragraph in text.lines() {
+        let wrapped = sdk_terminal_wrap_plain(paragraph, 92);
+        if wrapped.is_empty() {
+            lines.push("│".to_string());
+        } else {
+            for line in wrapped {
+                lines.push(format!("│     {line}"));
+            }
+        }
+    }
+    if text.is_empty() {
+        lines.push("│".to_string());
+    }
+    lines.join("\n")
+}
+
+fn sdk_terminal_format_action_detail(_name: &str, preview: &str) -> String {
+    let Ok(value) = serde_json::from_str::<Value>(preview) else {
+        return sdk_terminal_compact_preview(preview, 180);
+    };
+    let Some(object) = value.as_object() else {
+        return sdk_terminal_compact_preview(preview, 180);
+    };
+    if let Some(command) = object.get("command").or_else(|| object.get("cmd")) {
+        if let Some(command) = command.as_str() {
+            return format!("command: {}", sdk_terminal_compact_preview(command, 180));
+        }
+        if let Some(parts) = command.as_array() {
+            let text = parts
+                .iter()
+                .filter_map(Value::as_str)
+                .map(sdk_terminal_shell_quote)
+                .collect::<Vec<_>>()
+                .join(" ");
+            if !text.is_empty() {
+                return format!("command: {}", sdk_terminal_compact_preview(&text, 180));
+            }
+        }
+    }
+    if let Some(url) = object.get("url").and_then(Value::as_str) {
+        return format!("url: {url}");
+    }
+    if let Some(code) = object.get("code").and_then(Value::as_str) {
+        return format!("code: {}", sdk_terminal_compact_preview(code, 180));
+    }
+    let mut parts = Vec::new();
+    for (key, value) in object {
+        if value.is_null() {
+            continue;
+        }
+        let text = value
+            .as_str()
+            .map(ToOwned::to_owned)
+            .unwrap_or_else(|| serde_json::to_string(value).unwrap_or_default());
+        if text.trim().is_empty() || text == "[]" || text == "{}" {
+            continue;
+        }
+        parts.push(format!(
+            "{key}: {}",
+            sdk_terminal_compact_preview(&text, 80)
+        ));
+        if parts.len() >= 3 {
+            break;
+        }
+    }
+    if parts.is_empty() {
+        sdk_terminal_compact_preview(preview, 180)
+    } else {
+        parts.join(" · ")
+    }
+}
+
+fn sdk_terminal_compact_preview(text: &str, limit: usize) -> String {
+    let text = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    if text.len() <= limit {
+        return text;
+    }
+    let end = sdk_floor_char_boundary(&text, limit.saturating_sub(16));
+    format!(
+        "{} ... +{} chars",
+        &text[..end],
+        text.len().saturating_sub(end)
+    )
+}
+
+fn sdk_terminal_shell_quote(text: &str) -> String {
+    if text.chars().all(|ch| {
+        ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.' | '/' | ':' | '=' | ',')
+    }) {
+        return text.to_string();
+    }
+    format!("'{}'", text.replace('\'', "'\\''"))
+}
+
+fn sdk_terminal_wrap(text: &str, width: usize, subsequent_indent: &str) -> String {
+    let mut lines = Vec::new();
+    for (index, line) in sdk_terminal_wrap_plain(text, width).into_iter().enumerate() {
+        if index == 0 {
+            lines.push(line);
+        } else {
+            lines.push(format!("{subsequent_indent}{}", line.trim_start()));
+        }
+    }
+    lines.join("\n")
+}
+
+fn sdk_terminal_wrap_plain(text: &str, width: usize) -> Vec<String> {
+    let mut lines = Vec::new();
+    let mut current = String::new();
+    for word in text.split_whitespace() {
+        let separator = if current.is_empty() { 0 } else { 1 };
+        if !current.is_empty() && current.len() + separator + word.len() > width {
+            lines.push(std::mem::take(&mut current));
+        }
+        if !current.is_empty() {
+            current.push(' ');
+        }
+        current.push_str(word);
+    }
+    if !current.is_empty() {
+        lines.push(current);
+    }
+    lines
+}
+
+fn sdk_terminal_normalize(text: &str) -> String {
+    text.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+impl BrowserUseSdkPresentationSession {
+    fn drain_assistant_message(&mut self, ts_ms: i64) -> Option<Value> {
+        let assistant_text = self.assistant_text.trim();
+        if assistant_text.is_empty() {
+            return None;
+        }
+        let text = assistant_text.to_string();
+        self.assistant_text.clear();
+        Some(json!({
+            "type": "model.message",
+            "step": self.current_step.max(1),
+            "text": sdk_presentation_preview(&Value::String(text)),
+            "ts_ms": ts_ms,
+        }))
+    }
+
+    fn complete_step(&mut self, ts_ms: i64) -> Option<Value> {
+        let started_ms = self.active_step_started_ms.take()?;
+        self.active_actions.clear();
+        let assistant_preview = self.drain_assistant_message(ts_ms).and_then(|event| {
+            event
+                .get("text")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+        });
+        Some(json!({
+            "type": "step.completed",
+            "step": self.current_step.max(1),
+            "duration_ms": ts_ms.saturating_sub(started_ms),
+            "assistant_preview": assistant_preview,
+            "ts_ms": ts_ms,
+        }))
+    }
+}
+
+fn sdk_presentation_event_parts(event: &RuntimeEvent) -> (&str, &Value) {
+    let wrapped_type = event.payload.get("event_type").and_then(Value::as_str);
+    let wrapped_payload = event.payload.get("payload");
+    match (wrapped_type, wrapped_payload) {
+        (Some(event_type), Some(payload)) => (event_type, payload),
+        _ => (event.event_type(), &event.payload),
+    }
+}
+
+fn sdk_presentation_action_name(payload: &Value) -> Option<&str> {
+    payload
+        .get("name")
+        .or_else(|| payload.get("tool_name"))
+        .or_else(|| payload.get("tool"))
+        .and_then(Value::as_str)
+}
+
+fn sdk_presentation_tool_key(event: &RuntimeEvent, payload: &Value, fallback_name: &str) -> String {
+    payload
+        .get("tool_call_id")
+        .or_else(|| payload.get("id"))
+        .and_then(Value::as_str)
+        .or_else(|| event.tool_call_id.as_ref().map(|id| id.as_str()))
+        .map(ToOwned::to_owned)
+        .unwrap_or_else(|| fallback_name.to_string())
+}
+
+fn sdk_presentation_params_preview(payload: &Value) -> Option<String> {
+    for key in [
+        "arguments",
+        "args",
+        "input",
+        "command",
+        "cmd",
+        "code",
+        "url",
+    ] {
+        if let Some(value) = payload.get(key) {
+            return sdk_presentation_preview(value);
+        }
+    }
+    None
+}
+
+fn sdk_presentation_output_preview(payload: &Value) -> Option<String> {
+    for key in ["result", "text", "output", "error", "message", "content"] {
+        if let Some(value) = payload.get(key) {
+            return sdk_presentation_preview(value);
+        }
+    }
+    None
+}
+
+fn sdk_presentation_preview(value: &Value) -> Option<String> {
+    let text = match value {
+        Value::Null => return None,
+        Value::String(text) => text.clone(),
+        other => serde_json::to_string(other).ok()?,
+    };
+    let text = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    if text.is_empty() {
+        return None;
+    }
+    const LIMIT: usize = 180;
+    if text.len() <= LIMIT {
+        return Some(text);
+    }
+    let end = sdk_floor_char_boundary(&text, LIMIT);
+    Some(format!(
+        "{}...[{} more chars]",
+        &text[..end],
+        text.len() - end
+    ))
+}
+
 fn sdk_server_stdio() -> Result<()> {
     let context = SdkServerContext::memory()?;
     let (response_tx, response_rx) = mpsc::channel::<Value>();
@@ -4313,6 +5793,8 @@ fn sdk_server_stdio() -> Result<()> {
                     .build()
                     .context("build sdk event runtime")?;
                 rt.block_on(async move {
+                    let mut sdk_projection = BrowserUseSdkPresentationProjection::default();
+                    let mut terminal_renderer = BrowserUseSdkTerminalFrameProjection::default();
                     while !stop.load(Ordering::Relaxed) {
                         match tokio::time::timeout(Duration::from_millis(100), rx.recv()).await {
                             Ok(Ok(event)) => {
@@ -4365,6 +5847,38 @@ fn sdk_server_stdio() -> Result<()> {
                                 });
                                 if response_tx.send(notification).is_err() {
                                     break;
+                                }
+                                for sdk_event in sdk_projection.apply(&event) {
+                                    let notification = serde_json::json!({
+                                        "jsonrpc": "2.0",
+                                        "method": "agent.step",
+                                        "params": {
+                                            "run_id": run_id.clone(),
+                                            "session_id": session_id.clone(),
+                                            "agent_id": agent_id.clone(),
+                                            "event": sdk_transport_value(&sdk_event),
+                                        },
+                                    });
+                                    if response_tx.send(notification).is_err() {
+                                        break;
+                                    }
+                                    if let Some(text) =
+                                        terminal_renderer.apply(session_id.as_deref(), &sdk_event)
+                                    {
+                                        let notification = serde_json::json!({
+                                            "jsonrpc": "2.0",
+                                            "method": "agent.terminal_frame",
+                                            "params": {
+                                                "run_id": run_id.clone(),
+                                                "session_id": session_id.clone(),
+                                                "agent_id": agent_id.clone(),
+                                                "text": text,
+                                            },
+                                        });
+                                        if response_tx.send(notification).is_err() {
+                                            break;
+                                        }
+                                    }
                                 }
                             }
                             Ok(Err(tokio::sync::broadcast::error::RecvError::Lagged(_))) => {
@@ -4437,7 +5951,8 @@ fn handle_sdk_json_rpc_request(context: &SdkServerContext, request: JsonRpcReque
     }
     let id = request.id;
     let result = match request.method.as_str() {
-        "runtime.ping" => Ok(serde_json::json!({ "ok": true })),
+        "runtime.ping" => Ok(sdk_runtime_ping()),
+        "runtime.python_worker_ping" => sdk_runtime_python_worker_ping(context),
         "runtime.snapshot" => sdk_runtime_snapshot(&context.runtime),
         "browser.create" => sdk_browser_create(&context.runtime, &request.params),
         "browser.stop" | "browser.close" => sdk_browser_close(&context.runtime, &request.params),
@@ -4460,6 +5975,43 @@ fn handle_sdk_json_rpc_request(context: &SdkServerContext, request: JsonRpcReque
         }
         Err(error) => json_rpc_error(id, -32000, error.to_string()),
     }
+}
+
+fn sdk_runtime_ping() -> Value {
+    serde_json::json!({
+        "ok": true,
+        "sdk_protocol_version": SDK_PROTOCOL_VERSION,
+        "terminal_version": env!("CARGO_PKG_VERSION"),
+        "capabilities": [
+            "browser.create",
+            "agent.run_task",
+            "agent.run",
+            "agent.stop",
+            "runtime.python_worker_ping",
+        ],
+    })
+}
+
+fn sdk_runtime_python_worker_ping(context: &SdkServerContext) -> Result<Value> {
+    let artifact_dir = context
+        ._ephemeral_state_dir
+        .path()
+        .join("python-worker-ping");
+    fs::create_dir_all(&artifact_dir)?;
+    let cwd = std::env::current_dir()?;
+    let mut worker =
+        PythonWorker::start_with_browser_mode_and_env(None, std::iter::empty::<(&str, &str)>())?;
+    let response = worker.run(
+        "sdk-python-worker-ping",
+        cwd,
+        artifact_dir,
+        "print('browser-use-python-worker-ok')",
+    )?;
+    Ok(serde_json::json!({
+        "ok": response.ok,
+        "text": response.text,
+        "error": response.error,
+    }))
 }
 
 fn sdk_runtime_snapshot(runtime: &RuntimeHandle) -> Result<Value> {
@@ -4635,6 +6187,7 @@ fn sdk_agent_run(context: &SdkServerContext, params: &Value) -> Result<Value> {
     let browser_snapshot = browser_id
         .as_ref()
         .and_then(|browser_id| context.runtime.browsers().snapshot(browser_id).ok());
+    sdk_require_cloud_browser_credentials(context, params, browser_snapshot.as_ref())?;
     let config = sdk_provider_run_config(params, Some(&task), browser_snapshot.as_ref())?;
     let browser_id_value = browser_id
         .as_ref()
@@ -5035,6 +6588,7 @@ fn sdk_floor_char_boundary(text: &str, mut index: usize) -> usize {
 }
 
 fn sdk_agent_run_task(context: &SdkServerContext, params: &Value) -> Result<Value> {
+    sdk_require_cloud_browser_credentials(context, params, None)?;
     let mut run_params = params.clone();
     if let Value::Object(map) = &mut run_params {
         if !map.contains_key("browser_id") {
@@ -5369,6 +6923,25 @@ fn sdk_provider_run_config(
         config = config.with_fake_result(fake_agent_result_text(task.unwrap_or("task"), None));
     }
     Ok(config)
+}
+
+fn sdk_require_cloud_browser_credentials(
+    context: &SdkServerContext,
+    params: &Value,
+    browser_snapshot: Option<&browser_use_runtime::BrowserSnapshot>,
+) -> Result<()> {
+    let browser = params.get("browser").unwrap_or(&Value::Null);
+    let browser_mode = sdk_browser_mode_from_params(params, browser, browser_snapshot);
+    if browser_mode != "cloud" {
+        return Ok(());
+    }
+    let store = context.store.lock().expect("sdk store mutex poisoned");
+    if browser_use_api_key_from_store_or_env(&store)?.is_some() {
+        return Ok(());
+    }
+    bail!(
+        "cloud browser mode requires BROWSER_USE_API_KEY or `browser-use-terminal auth login browser-use-cloud`"
+    )
 }
 
 fn sdk_config_overrides_from_params(params: &Value) -> Result<ConfigOverrides> {
@@ -5718,7 +7291,7 @@ fn sdk_provider_backend(provider: &str, model: &str) -> Result<ProviderBackend> 
     }
     let normalized = provider.trim().to_ascii_lowercase();
     if normalized == "browser-use" || normalized == "browser_use" {
-        return Ok(ProviderBackend::Openai);
+        return Ok(ProviderBackend::BrowserUse);
     }
     ProviderBackend::from_provider_id(&normalized)
         .filter(|backend| *backend != ProviderBackend::None)
@@ -5729,7 +7302,7 @@ fn sdk_provider_id(provider: &str, backend: ProviderBackend) -> String {
     let normalized = provider.trim().to_ascii_lowercase();
     if matches!(
         normalized.as_str(),
-        "openai" | "anthropic" | "openrouter" | "deepseek" | "codex" | "fake"
+        "browser-use" | "openai" | "anthropic" | "openrouter" | "deepseek" | "codex" | "fake"
     ) {
         return normalized;
     }
@@ -7977,6 +9550,18 @@ command = "test-mcp"
     }
 
     #[test]
+    fn appends_user_text_analytics_with_raw_text() {
+        let mut properties = serde_json::json!({"surface": "cli"});
+        append_user_text_analytics(&mut properties, "  open example.com  ");
+
+        assert_eq!(properties["text"], "  open example.com  ");
+        assert_eq!(properties["text_chars"], 20);
+        assert_eq!(properties["char_count"], 16);
+        assert_eq!(properties["word_count"], 2);
+        assert_eq!(properties["approx_tokens"], 4);
+    }
+
+    #[test]
     fn cli_completion_handler_skips_interrupted_child_runs() {
         let interrupted_events = vec![browser_use_protocol::EventRecord {
             seq: 1,
@@ -8166,6 +9751,11 @@ command = "test-mcp"
             r#"{"jsonrpc":"2.0","id":1,"method":"runtime.ping","params":{}}"#,
         );
         assert_eq!(ping["result"]["ok"], true);
+        assert_eq!(ping["result"]["sdk_protocol_version"], SDK_PROTOCOL_VERSION);
+        assert_eq!(
+            ping["result"]["terminal_version"],
+            env!("CARGO_PKG_VERSION")
+        );
         let snapshot = handle_sdk_json_rpc_line(
             &context,
             r#"{"jsonrpc":"2.0","id":10,"method":"runtime.snapshot","params":{}}"#,
@@ -8250,6 +9840,35 @@ command = "test-mcp"
             r#"{"jsonrpc":"2.0","id":4,"method":"missing.method","params":{}}"#,
         );
         assert_eq!(missing["error"]["code"], -32601);
+        Ok(())
+    }
+
+    #[test]
+    fn sdk_json_rpc_cloud_browser_requires_cloud_credentials_before_run() -> Result<()> {
+        let previous = std::env::var(BROWSER_USE_CLOUD_API_KEY_ENV).ok();
+        std::env::remove_var(BROWSER_USE_CLOUD_API_KEY_ENV);
+        let context = SdkServerContext::memory()?;
+        let request = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 31,
+            "method": "agent.run_task",
+            "params": {
+                "task": "inspect",
+                "llm": {"provider": "fake", "model": "fake"},
+                "browser_mode": "cloud"
+            }
+        });
+
+        let response = handle_sdk_json_rpc_line(&context, &serde_json::to_string(&request)?);
+
+        if let Some(value) = previous {
+            std::env::set_var(BROWSER_USE_CLOUD_API_KEY_ENV, value);
+        }
+        assert_eq!(response["error"]["code"], -32000);
+        assert!(response["error"]["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("cloud browser mode requires")));
+        assert!(context.runtime.snapshot().agents.is_empty());
         Ok(())
     }
 
@@ -8428,6 +10047,24 @@ command = "test-mcp"
             .python_env
             .iter()
             .any(|(key, value)| key == "CUSTOM_ENV" && value == "custom-value"));
+        Ok(())
+    }
+
+    #[test]
+    fn sdk_provider_run_config_accepts_browser_use_gateway_provider() -> Result<()> {
+        let params = serde_json::json!({
+            "task": "inspect",
+            "llm": {"provider": "browser-use", "model": "bu-3-max"}
+        });
+
+        let config = sdk_provider_run_config(&params, Some("inspect"), None)?;
+
+        assert_eq!(config.backend, ProviderBackend::BrowserUse);
+        assert_eq!(config.model, "bu-3-max");
+        assert_eq!(
+            config.options.model_provider_id.as_deref(),
+            Some("browser-use")
+        );
         Ok(())
     }
 
@@ -8679,6 +10316,179 @@ command = "test-mcp"
         }));
         assert_eq!(result["result"]["history"]["usage"]["total_tokens"], 6);
         Ok(())
+    }
+
+    #[test]
+    fn sdk_browser_use_projection_maps_runtime_events_to_step_events() -> Result<()> {
+        fn observed(
+            session_id: &SessionId,
+            event_type: &str,
+            payload: Value,
+            ts_ms: i64,
+        ) -> RuntimeEvent {
+            let mut event = RuntimeEvent::new(
+                browser_use_runtime::RuntimeEventKind::StoreEventAppended,
+                RuntimeDurability::Barrier,
+            )
+            .with_session_id(session_id.clone())
+            .with_payload(json!({
+                "event_type": event_type,
+                "payload": payload,
+            }));
+            event.ts_ms = ts_ms;
+            event
+        }
+
+        let session_id = SessionId::from_string("session-1".to_string())?;
+        let mut projection = BrowserUseSdkPresentationProjection::default();
+
+        let first = projection.apply(&observed(
+            &session_id,
+            "model.turn.request",
+            json!({"model": "fake"}),
+            100,
+        ));
+        assert_eq!(first.len(), 1);
+        assert_eq!(first[0]["type"], "step.started");
+        assert_eq!(first[0]["step"], 1);
+
+        let started = projection.apply(&observed(
+            &session_id,
+            "tool.started",
+            json!({
+                "name": "browser",
+                "tool_call_id": "call-1",
+                "arguments": {"command": "browser connect managed --headed"}
+            }),
+            125,
+        ));
+        assert_eq!(started.len(), 1);
+        assert_eq!(started[0]["type"], "action.started");
+        assert_eq!(started[0]["action"]["name"], "browser");
+        assert!(started[0]["action"]["params_preview"]
+            .as_str()
+            .is_some_and(|preview| preview.contains("managed")));
+
+        let completed = projection.apply(&observed(
+            &session_id,
+            "tool.output",
+            json!({
+                "name": "browser",
+                "tool_call_id": "call-1",
+                "text": "{\"status\":\"connected\"}"
+            }),
+            175,
+        ));
+        assert_eq!(completed.len(), 1);
+        assert_eq!(completed[0]["type"], "action.completed");
+        assert_eq!(completed[0]["action"]["success"], true);
+        assert_eq!(completed[0]["duration_ms"], 50);
+
+        let second = projection.apply(&observed(
+            &session_id,
+            "model.turn.request",
+            json!({"model": "fake"}),
+            200,
+        ));
+        assert_eq!(second.len(), 2);
+        assert_eq!(second[0]["type"], "step.completed");
+        assert_eq!(second[0]["step"], 1);
+        assert_eq!(second[1]["type"], "step.started");
+        assert_eq!(second[1]["step"], 2);
+
+        let stream = projection.apply(&observed(
+            &session_id,
+            "model.stream_delta",
+            json!({"text": "final answer"}),
+            225,
+        ));
+        assert!(stream.is_empty());
+
+        let done = projection.apply(&observed(
+            &session_id,
+            "session.done",
+            json!({"result": "final answer"}),
+            250,
+        ));
+        assert_eq!(done.len(), 2);
+        assert_eq!(done[0]["type"], "model.message");
+        assert_eq!(done[0]["text"], "final answer");
+        assert_eq!(done[1]["type"], "final_result");
+        assert_eq!(done[1]["text"], "final answer");
+
+        let mut agent_completed = RuntimeEvent::new(
+            browser_use_runtime::RuntimeEventKind::AgentCompleted,
+            RuntimeDurability::Barrier,
+        )
+        .with_session_id(session_id)
+        .with_payload(json!({"result": "final answer"}));
+        agent_completed.ts_ms = 300;
+        let completed = projection.apply(&agent_completed);
+        assert_eq!(completed.len(), 2);
+        assert_eq!(completed[0]["type"], "step.completed");
+        assert_eq!(completed[0]["step"], 2);
+        assert_eq!(completed[1]["type"], "agent.completed");
+        assert_eq!(completed[1]["success"], true);
+
+        Ok(())
+    }
+
+    #[test]
+    fn sdk_terminal_frames_keep_interleaved_sessions_isolated() {
+        let mut frames = BrowserUseSdkTerminalFrameProjection::default();
+
+        assert!(frames
+            .apply(
+                Some("session-a"),
+                &json!({"type": "step.started", "step": 1})
+            )
+            .unwrap()
+            .contains("Step 1"));
+        let browser_params = json!({"url": "https://example.com"}).to_string();
+        assert!(frames
+            .apply(
+                Some("session-a"),
+                &json!({
+                    "type": "action.started",
+                    "name": "browser",
+                    "params_preview": browser_params
+                })
+            )
+            .unwrap()
+            .contains("browser"));
+
+        assert!(frames
+            .apply(
+                Some("session-b"),
+                &json!({"type": "step.started", "step": 1})
+            )
+            .unwrap()
+            .contains("Step 1"));
+        assert!(frames
+            .apply(
+                Some("session-b"),
+                &json!({"type": "final_result", "text": "session b final", "success": true})
+            )
+            .unwrap()
+            .contains("session b final"));
+        assert!(frames
+            .apply(
+                Some("session-b"),
+                &json!({"type": "step.completed", "step": 1, "duration_ms": 500})
+            )
+            .unwrap()
+            .contains("0.50s"));
+
+        let session_a_completion = frames
+            .apply(
+                Some("session-a"),
+                &json!({"type": "step.completed", "step": 1, "duration_ms": 1200}),
+            )
+            .unwrap();
+        assert!(
+            session_a_completion.contains("1 action · 1.20s"),
+            "session A action count must not be reset by session B: {session_a_completion}"
+        );
     }
 
     #[test]
@@ -10074,6 +11884,23 @@ command = "test-mcp"
                 &overrides
             )?,
             "configured-model"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn cli_browser_use_backend_defaults_to_bu3_max() -> Result<()> {
+        assert_eq!(
+            default_cli_model_for_backend_with_overrides(ProviderBackend::BrowserUse, None, &[])?,
+            "bu-3-max"
+        );
+        assert_eq!(
+            resolved_cli_provider_id_for_backend_with_overrides(
+                ProviderBackend::BrowserUse,
+                None,
+                &[]
+            )?,
+            "browser-use"
         );
         Ok(())
     }

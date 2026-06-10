@@ -15,6 +15,7 @@ use crate::schema::{LlmError, LlmErrorReason, LlmEvent};
 struct Accum {
     name: String,
     namespace: Option<String>,
+    provider_metadata: Option<Value>,
     args: String,
     started: bool,
     ended: bool,
@@ -68,6 +69,18 @@ impl ToolStream {
         vec![LlmEvent::ToolInputStart { id, name: resolved }]
     }
 
+    /// Attach opaque provider metadata to a call. The next request can replay it
+    /// without the core understanding provider-specific fields.
+    pub fn set_provider_metadata(&mut self, id: impl AsRef<str>, metadata: Option<Value>) {
+        if metadata.is_none() {
+            return;
+        }
+        let e = self.entry(id.as_ref());
+        if e.provider_metadata.is_none() {
+            e.provider_metadata = metadata;
+        }
+    }
+
     /// Argument fragment. `name` may be supplied here for providers that only
     /// reveal the tool name on the first delta. Emits `ToolInputStart` (if not
     /// already started) followed by `ToolInputDelta`.
@@ -102,10 +115,15 @@ impl ToolStream {
     /// No-op if the id is unknown or already ended.
     pub fn end(&mut self, id: impl AsRef<str>) -> Result<Vec<LlmEvent>, LlmError> {
         let id = id.as_ref().to_string();
-        let (name, namespace, args) = match self.calls.get_mut(&id) {
+        let (name, namespace, provider_metadata, args) = match self.calls.get_mut(&id) {
             Some(e) if !e.ended => {
                 e.ended = true;
-                (e.name.clone(), e.namespace.clone(), e.args.clone())
+                (
+                    e.name.clone(),
+                    e.namespace.clone(),
+                    e.provider_metadata.clone(),
+                    e.args.clone(),
+                )
             }
             _ => return Ok(Vec::new()),
         };
@@ -116,6 +134,7 @@ impl ToolStream {
                 id,
                 name,
                 namespace,
+                provider_metadata,
                 input,
             },
         ])
@@ -203,6 +222,7 @@ mod tests {
                     id: "c0".into(),
                     name: "shell".into(),
                     namespace: None,
+                    provider_metadata: None,
                     input: json!({ "command": ["ls"] }),
                 },
             ]
@@ -236,6 +256,7 @@ mod tests {
                     id: "0".into(),
                     name: "get_weather".into(),
                     namespace: None,
+                    provider_metadata: None,
                     input: json!({ "city": "NYC" }),
                 },
             ]
@@ -253,6 +274,7 @@ mod tests {
                 id: "c0".into(),
                 name: "now".into(),
                 namespace: None,
+                provider_metadata: None,
                 input: json!({}),
             }
         );

@@ -18,6 +18,7 @@ const FETCH_TIMEOUT: Duration = Duration::from_secs(10);
 pub enum ModelSource {
     OpenAi,
     Anthropic,
+    Google,
     DeepSeek,
     OpenRouter,
     Codex,
@@ -29,6 +30,7 @@ impl ModelSource {
         match self {
             ModelSource::OpenAi => "openai",
             ModelSource::Anthropic => "anthropic",
+            ModelSource::Google => "google",
             ModelSource::DeepSeek => "deepseek",
             ModelSource::OpenRouter => "openrouter",
             ModelSource::Codex => "codex",
@@ -111,6 +113,26 @@ struct CodexModelEntry {
     visibility: Option<String>,
 }
 
+// --- Google `{ "models": [{ "name", "baseModelId", "displayName", "supportedGenerationMethods" }] }` shape ---
+#[derive(Deserialize)]
+struct GoogleModelsResponse {
+    #[serde(default)]
+    models: Vec<GoogleModelEntry>,
+    #[serde(default, rename = "nextPageToken")]
+    next_page_token: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct GoogleModelEntry {
+    name: String,
+    #[serde(default, rename = "baseModelId")]
+    base_model_id: Option<String>,
+    #[serde(default, rename = "displayName")]
+    display_name: Option<String>,
+    #[serde(default, rename = "supportedGenerationMethods")]
+    supported_generation_methods: Vec<String>,
+}
+
 fn now_ms() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -178,10 +200,57 @@ pub fn parse_codex_models(body: &str) -> Result<Vec<ProviderModel>> {
     ))
 }
 
+/// Parse the Gemini `models.list` body, keeping models that can generate content.
+pub fn parse_google_models(body: &str) -> Result<Vec<ProviderModel>> {
+    Ok(parse_google_models_page(body)?.0)
+}
+
+fn parse_google_models_page(body: &str) -> Result<(Vec<ProviderModel>, Option<String>)> {
+    let parsed: GoogleModelsResponse =
+        serde_json::from_str(body).context("parse Google /models response")?;
+    let next_page_token = parsed
+        .next_page_token
+        .map(|token| token.trim().to_string())
+        .filter(|token| !token.is_empty());
+    Ok((
+        sort_dedup(
+            parsed
+                .models
+                .into_iter()
+                .filter(|entry| {
+                    entry.supported_generation_methods.iter().any(|method| {
+                        method == "generateContent" || method == "streamGenerateContent"
+                    })
+                })
+                .map(|entry| {
+                    let id = entry
+                        .base_model_id
+                        .filter(|id| !id.trim().is_empty())
+                        .unwrap_or_else(|| {
+                            entry
+                                .name
+                                .strip_prefix("models/")
+                                .unwrap_or(&entry.name)
+                                .to_string()
+                        });
+                    ProviderModel {
+                        id,
+                        name: entry.display_name,
+                        vision: false,
+                        supports_tools: None,
+                    }
+                })
+                .collect(),
+        ),
+        next_page_token,
+    ))
+}
+
 fn models_url(source: ModelSource) -> &'static str {
     match source {
         ModelSource::OpenAi => "https://api.openai.com/v1/models",
         ModelSource::Anthropic => "https://api.anthropic.com/v1/models",
+        ModelSource::Google => "https://generativelanguage.googleapis.com/v1beta/models",
         ModelSource::DeepSeek => "https://api.deepseek.com/v1/models",
         ModelSource::OpenRouter => "https://openrouter.ai/api/v1/models",
         ModelSource::Codex => "https://chatgpt.com/backend-api/codex/models?client_version=0.1.0",
@@ -197,27 +266,18 @@ pub fn fetch_provider_models(
         .timeout(FETCH_TIMEOUT)
         .build()
         .context("build model-list http client")?;
-    let mut request = client
-        .get(models_url(source))
-        .header("accept", "application/json");
-    if source == ModelSource::Anthropic {
-        request = request.header("anthropic-version", "2023-06-01");
+
+    if source == ModelSource::Google {
+        return fetch_google_provider_models(&client, credential);
     }
-    request = match &credential {
-        ProviderCredential::None => request,
-        ProviderCredential::ApiKey(key) if source == ModelSource::Anthropic => {
-            request.header("x-api-key", key.trim())
-        }
-        ProviderCredential::ApiKey(key) => {
-            request.header("authorization", format!("Bearer {}", key.trim()))
-        }
-        ProviderCredential::Oauth {
-            access_token,
-            account_id,
-        } => request
-            .header("authorization", format!("Bearer {}", access_token.trim()))
-            .header("chatgpt-account-id", account_id.trim()),
-    };
+
+    let request = apply_model_list_auth(
+        client
+            .get(models_url(source))
+            .header("accept", "application/json"),
+        source,
+        &credential,
+    );
     let body = request
         .send()
         .with_context(|| format!("request {} /models", source.as_str()))?
@@ -228,6 +288,68 @@ pub fn fetch_provider_models(
     match source {
         ModelSource::Codex => parse_codex_models(&body),
         _ => parse_openai_compatible_models(&body),
+    }
+}
+
+fn fetch_google_provider_models(
+    client: &reqwest::blocking::Client,
+    credential: ProviderCredential,
+) -> Result<Vec<ProviderModel>> {
+    let mut models = Vec::new();
+    let mut page_token: Option<String> = None;
+
+    loop {
+        let mut request = client
+            .get(models_url(ModelSource::Google))
+            .header("accept", "application/json")
+            .query(&[("pageSize", "1000")]);
+        if let Some(token) = page_token.as_deref() {
+            request = request.query(&[("pageToken", token)]);
+        }
+        let request = apply_model_list_auth(request, ModelSource::Google, &credential);
+        let body = request
+            .send()
+            .context("request google /models")?
+            .error_for_status()
+            .context("google /models returned an error status")?
+            .text()
+            .context("read google /models body")?;
+        let (mut page_models, next_page_token) = parse_google_models_page(&body)?;
+        models.append(&mut page_models);
+        let Some(next_page_token) = next_page_token else {
+            break;
+        };
+        page_token = Some(next_page_token);
+    }
+
+    Ok(sort_dedup(models))
+}
+
+fn apply_model_list_auth(
+    mut request: reqwest::blocking::RequestBuilder,
+    source: ModelSource,
+    credential: &ProviderCredential,
+) -> reqwest::blocking::RequestBuilder {
+    if source == ModelSource::Anthropic {
+        request = request.header("anthropic-version", "2023-06-01");
+    }
+    match credential {
+        ProviderCredential::None => request,
+        ProviderCredential::ApiKey(key) if source == ModelSource::Anthropic => {
+            request.header("x-api-key", key.trim())
+        }
+        ProviderCredential::ApiKey(key) if source == ModelSource::Google => {
+            request.header("x-goog-api-key", key.trim())
+        }
+        ProviderCredential::ApiKey(key) => {
+            request.header("authorization", format!("Bearer {}", key.trim()))
+        }
+        ProviderCredential::Oauth {
+            access_token,
+            account_id,
+        } => request
+            .header("authorization", format!("Bearer {}", access_token.trim()))
+            .header("chatgpt-account-id", account_id.trim()),
     }
 }
 
@@ -312,6 +434,54 @@ mod tests {
         let models = parse_codex_models(body).expect("parse");
         let ids: Vec<&str> = models.iter().map(|model| model.id.as_str()).collect();
         assert_eq!(ids, vec!["gpt-5.5"]);
+    }
+
+    #[test]
+    fn parses_google_models() {
+        let body = r#"{
+            "models": [
+                {
+                    "name": "models/gemini-3.5-flash-001",
+                    "baseModelId": "gemini-3.5-flash",
+                    "displayName": "Gemini 3.5 Flash",
+                    "supportedGenerationMethods": ["generateContent", "countTokens"]
+                },
+                {
+                    "name": "models/text-embedding-004",
+                    "displayName": "Text Embedding 004",
+                    "supportedGenerationMethods": ["embedContent"]
+                },
+                {
+                    "name": "models/gemini-3.1-pro",
+                    "displayName": "Gemini 3.1 Pro",
+                    "supportedGenerationMethods": ["streamGenerateContent"]
+                }
+            ]
+        }"#;
+        let models = parse_google_models(body).expect("parse");
+        let ids: Vec<&str> = models.iter().map(|model| model.id.as_str()).collect();
+        assert_eq!(ids, vec!["gemini-3.1-pro", "gemini-3.5-flash"]);
+        assert_eq!(models[1].name.as_deref(), Some("Gemini 3.5 Flash"));
+    }
+
+    #[test]
+    fn parses_google_models_page_token() {
+        let body = r#"{
+            "models": [
+                {
+                    "name": "models/gemini-3.5-flash",
+                    "baseModelId": "gemini-3.5-flash",
+                    "supportedGenerationMethods": ["generateContent"]
+                }
+            ],
+            "nextPageToken": " next-page "
+        }"#;
+
+        let (models, next_page_token) = parse_google_models_page(body).expect("parse");
+
+        let ids: Vec<&str> = models.iter().map(|model| model.id.as_str()).collect();
+        assert_eq!(ids, vec!["gemini-3.5-flash"]);
+        assert_eq!(next_page_token.as_deref(), Some("next-page"));
     }
 
     #[test]

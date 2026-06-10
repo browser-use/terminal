@@ -251,6 +251,7 @@ fn tool_call_ev(id: &str, name: &str, input: serde_json::Value) -> LlmEvent {
         id: id.to_string(),
         name: name.to_string(),
         namespace: None,
+        provider_metadata: None,
         input,
     }
 }

@@ -2657,6 +2657,182 @@ pub fn parse_codex_authorization_input(value: &str) -> CodexAuthorization {
     authorization
 }
 
+pub fn codex_callback_status(
+    path: &str,
+    expected_state: &str,
+    authorization: &CodexAuthorization,
+) -> u16 {
+    if !path.starts_with(CODEX_CALLBACK_PATH) {
+        404
+    } else if authorization.error.is_some() {
+        400
+    } else if authorization.code.is_none() || authorization.state.as_deref() != Some(expected_state)
+    {
+        400
+    } else {
+        200
+    }
+}
+
+pub struct CodexCallbackPage {
+    pub status_text: &'static str,
+    pub body: String,
+    pub message: String,
+}
+
+pub fn codex_callback_page(status: u16, authorization: &CodexAuthorization) -> CodexCallbackPage {
+    let error_message = authorization
+        .error_description
+        .as_deref()
+        .or(authorization.error.as_deref())
+        .unwrap_or("Codex authentication failed: missing code or state mismatch.");
+    let (title, message) = match status {
+        200 => (
+            "Authorization Successful",
+            "You can close this window and return to Terminal.",
+        ),
+        400 => ("Authorization Failed", error_message),
+        _ => (
+            "Callback Not Found",
+            "This browser tab reached Browser Use, but the callback path was not recognized.",
+        ),
+    };
+
+    CodexCallbackPage {
+        status_text: http_status_text(status),
+        body: codex_callback_html(status, title, message),
+        message: message.to_string(),
+    }
+}
+
+fn http_status_text(status: u16) -> &'static str {
+    match status {
+        200 => "OK",
+        400 => "Bad Request",
+        404 => "Not Found",
+        _ => "Error",
+    }
+}
+
+fn codex_callback_html(status: u16, title: &str, message: &str) -> String {
+    let success = status == 200;
+    let title = escape_html(title);
+    let message = escape_html(message);
+    let body_copy = if success {
+        message.as_str()
+    } else {
+        "Return to the terminal and try signing in again."
+    };
+    let detail = if success {
+        String::new()
+    } else {
+        format!(r#"<div class="error">{message}</div>"#)
+    };
+    let script = if success {
+        r#"<script>setTimeout(() => window.close(), 2000);</script>"#
+    } else {
+        ""
+    };
+
+    format!(
+        r#"<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{title}</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Geist:wght@400;500;650&family=Geist+Mono:wght@400;500&display=swap" rel="stylesheet">
+  <style>
+    :root {{
+      color-scheme: light dark;
+      --bg: #ffffff;
+      --text: #111111;
+      --muted: #666666;
+      --detail-bg: #f5f5f5;
+      --detail-text: #444444;
+    }}
+    @media (prefers-color-scheme: dark) {{
+      :root {{
+        --bg: #000000;
+        --text: #eeeeee;
+        --muted: #9ca3af;
+        --detail-bg: #111111;
+        --detail-text: #b8b8b8;
+      }}
+    }}
+    html, body {{
+      width: 100%;
+      height: 100%;
+      overflow: hidden;
+    }}
+    body {{
+      margin: 0;
+      background: var(--bg);
+      color: var(--text);
+      font: 14px/1.5 "Geist", ui-sans-serif, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    }}
+    main {{
+      position: fixed;
+      top: 50%;
+      left: 50%;
+      width: min(460px, 100vw);
+      padding: 32px;
+      text-align: center;
+      transform: translate(-50%, -50%);
+    }}
+    h1 {{
+      margin: 0 0 8px;
+      color: var(--text);
+      font-size: 24px;
+      font-weight: 650;
+      line-height: 1.2;
+      letter-spacing: 0;
+    }}
+    p {{
+      margin: 0;
+      color: var(--muted);
+      font-size: 14px;
+    }}
+    .error {{
+      margin-top: 16px;
+      padding: 12px 14px;
+      border-radius: 8px;
+      background: var(--detail-bg);
+      color: var(--detail-text);
+      font: 12px/1.45 "Geist Mono", ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      overflow-wrap: anywhere;
+    }}
+  </style>
+</head>
+<body>
+  <main>
+    <h1>{title}</h1>
+    <p>{body_copy}</p>
+    {detail}
+  </main>
+  {script}
+</body>
+</html>"#
+    )
+}
+
+fn escape_html(value: &str) -> String {
+    let mut escaped = String::with_capacity(value.len());
+    for c in value.chars() {
+        match c {
+            '&' => escaped.push_str("&amp;"),
+            '<' => escaped.push_str("&lt;"),
+            '>' => escaped.push_str("&gt;"),
+            '"' => escaped.push_str("&quot;"),
+            '\'' => escaped.push_str("&#39;"),
+            _ => escaped.push(c),
+        }
+    }
+    escaped
+}
+
 pub fn parse_claude_code_authorization_input(value: &str) -> ClaudeCodeAuthorization {
     let mut stripped = value.trim();
     if stripped.is_empty() {

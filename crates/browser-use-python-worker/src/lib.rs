@@ -130,6 +130,23 @@ impl PythonWorker {
         browser_mode: Option<&str>,
         extra_env: &[(OsString, OsString)],
     ) -> Result<Self> {
+        if let Some(python) =
+            std::env::var_os("BROWSER_USE_PYTHON").filter(|value| !value.is_empty())
+        {
+            return Self::start_with_program_args(
+                Path::new(&python),
+                &[],
+                pythonpath.as_ref(),
+                browser_mode,
+                extra_env,
+            )
+            .with_context(|| {
+                format!(
+                    "start python worker with BROWSER_USE_PYTHON={}",
+                    python.to_string_lossy()
+                )
+            });
+        }
         if std::env::var_os("LLM_BROWSER_PYTHON_WORKER_DIRECT").is_none() {
             let uv = PathBuf::from("uv");
             let args = [
@@ -153,8 +170,17 @@ impl PythonWorker {
                 return Ok(worker);
             }
         }
-        Self::start_with_program_args(
+        if let Ok(worker) = Self::start_with_program_args(
             Path::new("python3"),
+            &[],
+            pythonpath.as_ref(),
+            browser_mode,
+            extra_env,
+        ) {
+            return Ok(worker);
+        }
+        Self::start_with_program_args(
+            Path::new("python"),
             &[],
             pythonpath.as_ref(),
             browser_mode,

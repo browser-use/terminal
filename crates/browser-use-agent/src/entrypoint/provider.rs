@@ -19,8 +19,13 @@
 //!   * [`ProviderBackend::Openai`]      → [`ProviderChoice::OpenAiResponses`]
 //!     (key from `OPENAI_API_KEY` / `LLM_BROWSER_OPENAI_API_KEY`, optional
 //!     `LLM_BROWSER_OPENAI_BASE_URL`),
+//!   * [`ProviderBackend::BrowserUse`]  → [`ProviderChoice::OpenAiCompatibleCustom`]
+//!     id `"browser-use"` (key from `BROWSER_USE_API_KEY`, base override
+//!     `LLM_BROWSER_BROWSER_USE_BASE_URL`),
 //!   * [`ProviderBackend::Anthropic`]   → [`ProviderChoice::Anthropic`]
 //!     (key from `ANTHROPIC_API_KEY` / `LLM_BROWSER_ANTHROPIC_API_KEY`),
+//!   * [`ProviderBackend::Google`]      → [`ProviderChoice::Google`]
+//!     (key from `GEMINI_API_KEY` / `GOOGLE_API_KEY` / `LLM_BROWSER_GOOGLE_API_KEY`),
 //!   * [`ProviderBackend::Openrouter`]  → [`ProviderChoice::OpenAiCompatibleProvider`]
 //!     id `"openrouter"` (key from `OPENROUTER_API_KEY`),
 //!   * [`ProviderBackend::Deepseek`]    → [`ProviderChoice::OpenAiCompatibleProvider`]
@@ -800,6 +805,27 @@ pub fn provider_choice_for_backend(
                 base_url: env_first(&["LLM_BROWSER_OPENAI_BASE_URL"]),
             }))
         }
+        ProviderBackend::BrowserUse => {
+            let api_key = key_env_then_store(
+                &["LLM_BROWSER_BROWSER_USE_API_KEY", "BROWSER_USE_API_KEY"],
+                store,
+                "browser_use_cloud",
+            )
+            .ok_or(ProviderResolveError::MissingCredentials(
+                "set BROWSER_USE_API_KEY (or run `auth login browser-use-cloud`) for the browser-use backend",
+            ))?;
+            Ok(Some(ProviderChoice::OpenAiCompatibleCustom {
+                provider_id: "browser-use".to_string(),
+                base_url: env_first(&["LLM_BROWSER_BROWSER_USE_BASE_URL"])
+                    .unwrap_or_else(|| "https://llm.api.browser-use.com/v1".to_string()),
+                api_key,
+                extra_headers: vec![(
+                    "x-browser-use-request-type".to_string(),
+                    env_first(&["LLM_BROWSER_BROWSER_USE_REQUEST_TYPE"])
+                        .unwrap_or_else(|| "rust_agent".to_string()),
+                )],
+            }))
+        }
         ProviderBackend::Anthropic => {
             let api_key = key_env_then_store(
                 &["LLM_BROWSER_ANTHROPIC_API_KEY", "ANTHROPIC_API_KEY"],
@@ -812,6 +838,24 @@ pub fn provider_choice_for_backend(
             Ok(Some(ProviderChoice::Anthropic {
                 api_key,
                 base_url: env_first(&["LLM_BROWSER_ANTHROPIC_BASE_URL"]),
+            }))
+        }
+        ProviderBackend::Google => {
+            let api_key = key_env_then_store(
+                &[
+                    "LLM_BROWSER_GOOGLE_API_KEY",
+                    "GEMINI_API_KEY",
+                    "GOOGLE_API_KEY",
+                ],
+                store,
+                "google",
+            )
+            .ok_or(ProviderResolveError::MissingCredentials(
+                "set GEMINI_API_KEY (or run `auth login google`) for the google backend",
+            ))?;
+            Ok(Some(ProviderChoice::Google {
+                api_key,
+                base_url: env_first(&["LLM_BROWSER_GOOGLE_BASE_URL"]),
             }))
         }
         ProviderBackend::Openrouter => {
@@ -2744,6 +2788,43 @@ mod tests {
         .expect("real openai driver must construct offline");
         std::env::remove_var("OPENAI_API_KEY");
         assert!(matches!(resolved, ResolvedProvider::Real(_)));
+    }
+
+    #[test]
+    fn browser_use_backend_resolves_gateway_route_from_cloud_key() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        std::env::remove_var("BROWSER_USE_API_KEY");
+        std::env::remove_var("LLM_BROWSER_BROWSER_USE_API_KEY");
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = Store::open(dir.path()).expect("store");
+        store
+            .set_setting("auth.browser_use_cloud.api_key", "stored-browser-use-key")
+            .unwrap();
+
+        let choice = provider_choice_for_backend(ProviderBackend::BrowserUse, Some(&store))
+            .expect("resolves")
+            .expect("browser-use is a real provider");
+
+        match choice {
+            ProviderChoice::OpenAiCompatibleCustom {
+                provider_id,
+                base_url,
+                api_key,
+                extra_headers,
+            } => {
+                assert_eq!(provider_id, "browser-use");
+                assert_eq!(base_url, "https://llm.api.browser-use.com/v1");
+                assert_eq!(api_key, "stored-browser-use-key");
+                assert_eq!(
+                    extra_headers,
+                    vec![(
+                        "x-browser-use-request-type".to_string(),
+                        "rust_agent".to_string()
+                    )]
+                );
+            }
+            other => panic!("expected browser-use gateway choice, got {other:?}"),
+        }
     }
 
     /// A real Anthropic backend also constructs offline given its key.

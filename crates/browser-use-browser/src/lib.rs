@@ -51,6 +51,7 @@ pub struct BrowserCommandOutput {
 #[derive(Clone, Debug, Default)]
 pub struct BrowserCommandOptions {
     pub browser_use_api_key: Option<String>,
+    pub browser_use_api_url: Option<String>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
@@ -7652,7 +7653,8 @@ fn browser_use_api_with_options(
 ) -> Result<Value> {
     let key = browser_use_api_key(options).ok_or_else(|| anyhow!("BROWSER_USE_API_KEY missing"))?;
     let client = Client::new();
-    let url = format!("{BU_API}{path}");
+    let api_url = browser_use_api_url(options);
+    let url = format!("{api_url}{path}");
     let request = match method {
         "GET" => client.get(&url),
         "POST" => client.post(&url),
@@ -7673,6 +7675,27 @@ fn browser_use_api_with_options(
         .error_for_status()
         .with_context(|| format!("{method} {url} returned error"))?;
     Ok(response.json().unwrap_or_else(|_| json!({})))
+}
+
+fn browser_use_api_url(options: &BrowserCommandOptions) -> String {
+    let raw = options
+        .browser_use_api_url
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+        .map(ToOwned::to_owned);
+    let Some(raw) = raw else {
+        return BU_API.to_string();
+    };
+    normalize_browser_use_api_url(&raw)
+}
+
+fn normalize_browser_use_api_url(raw: &str) -> String {
+    let trimmed = raw.trim().trim_end_matches('/');
+    if trimmed.ends_with("/api/v3") {
+        trimmed.to_string()
+    } else {
+        format!("{trimmed}/api/v3")
+    }
 }
 
 fn stop_cloud_browser(browser_id: &str) -> Result<Value> {
@@ -13667,12 +13690,37 @@ print("large response ok", len(data["blob"]))
             "browser profile sync --all-cookies",
             BrowserCommandOptions {
                 browser_use_api_key: Some("test-key".to_string()),
+                ..BrowserCommandOptions::default()
             },
         )
         .unwrap();
         assert_eq!(output.content["status"], "needs-user-action");
         assert_eq!(output.content["action"], "select-local-profile");
         assert!(std::env::var("BROWSER_USE_API_KEY").is_err());
+    }
+
+    #[test]
+    fn browser_use_api_url_is_supplied_explicitly_by_caller() {
+        let _env = EnvRestore::set(&[("BROWSER_USE_CLOUD_API_URL", "http://ignored.local:8000")]);
+
+        assert_eq!(
+            browser_use_api_url(&BrowserCommandOptions::default()),
+            "https://api.browser-use.com/api/v3"
+        );
+        assert_eq!(
+            browser_use_api_url(&BrowserCommandOptions {
+                browser_use_api_url: Some("http://localhost:8000".to_string()),
+                ..BrowserCommandOptions::default()
+            }),
+            "http://localhost:8000/api/v3"
+        );
+        assert_eq!(
+            browser_use_api_url(&BrowserCommandOptions {
+                browser_use_api_url: Some("http://localhost:8000/api/v3/".to_string()),
+                ..BrowserCommandOptions::default()
+            }),
+            "http://localhost:8000/api/v3"
+        );
     }
 
     #[test]

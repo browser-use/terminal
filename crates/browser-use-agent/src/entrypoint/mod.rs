@@ -2416,13 +2416,20 @@ fn message_to_provider_item(message: &Message) -> Item {
                 }));
             }
             ContentPart::ToolCall {
-                id, name, input, ..
+                id,
+                name,
+                input,
+                provider_metadata,
             } => {
-                tool_calls.push(json!({
+                let mut call = json!({
                     "id": id,
                     "name": name,
                     "arguments": input,
-                }));
+                });
+                if let Some(metadata) = provider_metadata {
+                    call["provider_metadata"] = metadata.clone();
+                }
+                tool_calls.push(call);
             }
             ContentPart::ToolResult { .. } | ContentPart::Reasoning { .. } => {}
         }
@@ -3380,6 +3387,28 @@ mod tests {
     use tempfile::TempDir;
 
     static ENTRYPOINT_ENV_LOCK: StdOnceLock<StdMutex<()>> = StdOnceLock::new();
+
+    #[test]
+    fn message_to_provider_item_preserves_tool_call_provider_metadata() {
+        let item = message_to_provider_item(&Message::new(
+            MessageRole::Assistant,
+            vec![ContentPart::ToolCall {
+                id: "call_browser".to_string(),
+                name: "browser".to_string(),
+                input: serde_json::json!({ "action": "status" }),
+                provider_metadata: Some(serde_json::json!({
+                    "google": {
+                        "thought_signature": "sig-model-call"
+                    }
+                })),
+            }],
+        ));
+
+        assert_eq!(
+            item["tool_calls"][0]["provider_metadata"]["google"]["thought_signature"],
+            serde_json::json!("sig-model-call")
+        );
+    }
 
     struct EnvRestore {
         _guard: StdMutexGuard<'static, ()>,
@@ -6139,6 +6168,7 @@ mod tests {
                     id: "call-1".to_string(),
                     name: "shell".to_string(),
                     namespace: None,
+                    provider_metadata: None,
                     input: serde_json::json!({ "command": ["echo", "fusion-ok"] }),
                 },
                 LlmEvent::Finish {

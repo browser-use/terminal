@@ -12,6 +12,7 @@
 //! The production providers are the ones `browser-use-llm` ships:
 //! - **OpenAI Responses** (`OPENAI_API_KEY`, base override `LLM_BROWSER_OPENAI_BASE_URL`),
 //! - **Anthropic Messages** (`ANTHROPIC_API_KEY`),
+//! - **Google Gemini** (`GEMINI_API_KEY`, base override `LLM_BROWSER_GOOGLE_BASE_URL`),
 //! - **OpenAI-compatible** (Ollama / OpenRouter / DeepSeek / Fireworks, by id +
 //!   key, or an explicit base url),
 //! - **Codex (chatgpt.com)** via the Codex CLI OAuth login
@@ -26,9 +27,9 @@ use std::sync::Arc;
 
 use browser_use_llm::auth::{codex_route, CodexAuth};
 use browser_use_llm::providers::{
-    Anthropic, AnthropicConfig, OpenAi, OpenAiCompatible, OpenAiConfig,
+    Anthropic, AnthropicConfig, Google, GoogleConfig, OpenAi, OpenAiCompatible, OpenAiConfig,
 };
-use browser_use_llm::route::{ModelClient, Route};
+use browser_use_llm::route::{Auth, ModelClient, Route};
 use browser_use_llm::schema::{ContentPart, LlmRequest, Message, MessageRole, SystemPart};
 
 use crate::events::{EventSink, TurnCtx};
@@ -55,6 +56,13 @@ pub enum ProviderChoice {
         /// Optional base-url override.
         base_url: Option<String>,
     },
+    /// Google Gemini API (`/models/{model}:streamGenerateContent`).
+    Google {
+        /// API key (`GEMINI_API_KEY` / `GOOGLE_API_KEY`).
+        api_key: String,
+        /// Optional base-url override.
+        base_url: Option<String>,
+    },
     /// A known OpenAI-compatible provider, selected by id (e.g. `openrouter`,
     /// `deepseek`, `fireworks`, `ollama`), with the provider's default base url.
     OpenAiCompatibleProvider {
@@ -71,6 +79,8 @@ pub enum ProviderChoice {
         base_url: String,
         /// API key.
         api_key: String,
+        /// Additional static headers to apply to every request for this route.
+        extra_headers: Vec<(String, String)>,
     },
     /// The codex (chatgpt.com) backend, reached via the Codex CLI OAuth login.
     ///
@@ -120,6 +130,7 @@ impl std::error::Error for ModelPathError {}
 /// - OpenAI: `LLM_BROWSER_OPENAI_API_KEY` || `OPENAI_API_KEY`
 ///   (base override: `LLM_BROWSER_OPENAI_BASE_URL`),
 /// - Anthropic: `LLM_BROWSER_ANTHROPIC_API_KEY` || `ANTHROPIC_API_KEY`,
+/// - Google: `LLM_BROWSER_GOOGLE_API_KEY` || `GEMINI_API_KEY` || `GOOGLE_API_KEY`,
 /// - OpenAI-compatible: `LLM_BROWSER_OPENAI_COMPAT_API_KEY` || `OPENROUTER_API_KEY`
 ///   with `LLM_BROWSER_OPENAI_COMPAT_BASE_URL` || `OPENROUTER_BASE_URL`.
 ///
@@ -156,6 +167,15 @@ pub fn provider_choice_from_env() -> Result<ProviderChoice, ModelPathError> {
             base_url: env("LLM_BROWSER_ANTHROPIC_BASE_URL"),
         });
     }
+    if let Some(api_key) = env("LLM_BROWSER_GOOGLE_API_KEY")
+        .or_else(|| env("GEMINI_API_KEY"))
+        .or_else(|| env("GOOGLE_API_KEY"))
+    {
+        return Ok(ProviderChoice::Google {
+            api_key,
+            base_url: env("LLM_BROWSER_GOOGLE_BASE_URL"),
+        });
+    }
     if let Some(api_key) =
         env("LLM_BROWSER_OPENAI_COMPAT_API_KEY").or_else(|| env("OPENROUTER_API_KEY"))
     {
@@ -166,10 +186,11 @@ pub fn provider_choice_from_env() -> Result<ProviderChoice, ModelPathError> {
             provider_id: "openai-compatible".to_string(),
             base_url,
             api_key,
+            extra_headers: Vec::new(),
         });
     }
     Err(ModelPathError::MissingCredentials(
-        "set OPENAI_API_KEY, ANTHROPIC_API_KEY, or an OpenAI-compatible key",
+        "set OPENAI_API_KEY, ANTHROPIC_API_KEY, GEMINI_API_KEY, or an OpenAI-compatible key",
     ))
 }
 
@@ -190,6 +211,13 @@ pub fn build_route(choice: &ProviderChoice, model: &str) -> Result<Route, ModelP
             });
             Ok(provider.model(model))
         }
+        ProviderChoice::Google { api_key, base_url } => {
+            let provider = Google::configure(GoogleConfig {
+                api_key: api_key.clone(),
+                base_url: base_url.clone(),
+            });
+            Ok(provider.model(model))
+        }
         ProviderChoice::OpenAiCompatibleProvider {
             provider_id,
             api_key,
@@ -202,10 +230,17 @@ pub fn build_route(choice: &ProviderChoice, model: &str) -> Result<Route, ModelP
             provider_id,
             base_url,
             api_key,
+            extra_headers,
         } => {
             let provider =
                 OpenAiCompatible::configure(provider_id.clone(), base_url.clone(), api_key.clone());
-            Ok(provider.chat(model))
+            let mut route = provider.chat(model);
+            for (name, value) in extra_headers {
+                route.auth = route
+                    .auth
+                    .and_then(Auth::header(name.clone(), value.clone()));
+            }
+            Ok(route)
         }
         ProviderChoice::Codex {
             access_token,
@@ -249,8 +284,11 @@ pub fn build_transport(
             ),
         );
     }
+    apply_browser_use_provider_options(&ctx.provider, &mut req);
     ModelClientTransport::new(client, route, req)
 }
+
+pub(crate) fn apply_browser_use_provider_options(_provider: &str, _req: &mut LlmRequest) {}
 
 /// Build the production text-only [`ModelSamplingDriver`] over a live transport.
 ///
@@ -353,12 +391,41 @@ mod tests {
             provider_id: "internal".to_string(),
             base_url: "https://llm.internal/v1".to_string(),
             api_key: "k".to_string(),
+            extra_headers: Vec::new(),
         };
         let route = build_route(&choice, "m").unwrap();
         assert_eq!(
             route.endpoint.url(),
             "https://llm.internal/v1/chat/completions"
         );
+    }
+
+    #[test]
+    fn openai_compatible_custom_applies_extra_headers() {
+        let choice = ProviderChoice::OpenAiCompatibleCustom {
+            provider_id: "browser-use".to_string(),
+            base_url: "https://llm.api.browser-use.com/v1".to_string(),
+            api_key: "k".to_string(),
+            extra_headers: vec![(
+                "x-browser-use-request-type".to_string(),
+                "rust_agent".to_string(),
+            )],
+        };
+        let route = build_route(&choice, "bu-3-max").unwrap();
+
+        assert_eq!(
+            header(&route, "x-browser-use-request-type").as_deref(),
+            Some("rust_agent")
+        );
+    }
+
+    #[test]
+    fn browser_use_provider_options_do_not_tag_request_body() {
+        let mut req = LlmRequest::new("bu-3-max", "browseruse");
+
+        apply_browser_use_provider_options("browser-use", &mut req);
+
+        assert_eq!(req.provider_options, None);
     }
 
     /// Only the `Codex` variant targets chatgpt.com: the env-keyed providers never
@@ -375,10 +442,15 @@ mod tests {
                 api_key: "k".into(),
                 base_url: None,
             },
+            ProviderChoice::Google {
+                api_key: "k".into(),
+                base_url: None,
+            },
             ProviderChoice::OpenAiCompatibleCustom {
                 provider_id: "x".into(),
                 base_url: "https://llm.internal/v1".into(),
                 api_key: "k".into(),
+                extra_headers: Vec::new(),
             },
         ] {
             let url = build_route(&choice, "m").unwrap().endpoint.url();
@@ -396,6 +468,20 @@ mod tests {
         };
         let url = build_route(&codex, "m").unwrap().endpoint.url();
         assert_eq!(url, "https://chatgpt.com/backend-api/codex/responses");
+    }
+
+    #[test]
+    fn google_route_uses_gemini_stream_api_key_header() {
+        let choice = ProviderChoice::Google {
+            api_key: "g-key".to_string(),
+            base_url: None,
+        };
+        let route = build_route(&choice, "gemini-3.5-flash").unwrap();
+        assert_eq!(
+            route.endpoint.url(),
+            "https://generativelanguage.googleapis.com/v1beta/models/gemini-3.5-flash:streamGenerateContent?alt=sse"
+        );
+        assert_eq!(header(&route, "x-goog-api-key").as_deref(), Some("g-key"));
     }
 
     /// The codex route carries the Bearer token + `chatgpt-account-id` header and

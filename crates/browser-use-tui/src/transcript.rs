@@ -4667,10 +4667,47 @@ fn styled_wrapped_value_rows(
             .map(|(_, row)| styled_path_tokens(&row, fallback))
             .collect();
     }
+    if let Some(spans) = styled_structured_json_spans(value, fallback) {
+        return wrap_spans(spans, width);
+    }
+    if value.starts_with("https://") || value.starts_with("http://") {
+        return wrap_spans(styled_value_spans(group, value, fallback), width);
+    }
     wrap_plain(value, width)
         .into_iter()
         .map(|(_, row)| styled_value_spans(group, &row, fallback))
         .collect()
+}
+
+fn wrap_spans(spans: Vec<Span<'static>>, width: u16) -> Vec<Vec<Span<'static>>> {
+    let width = width.max(1) as usize;
+    let mut rows = vec![Vec::new()];
+    let mut line_width = 0usize;
+    for span in spans {
+        let style = span.style;
+        for ch in span.content.chars() {
+            let ch_width = ch.width().unwrap_or(0).max(1);
+            if line_width > 0 && line_width + ch_width > width {
+                rows.push(Vec::new());
+                line_width = 0;
+            }
+            append_span_char(
+                rows.last_mut().expect("span rows are never empty"),
+                ch,
+                style,
+            );
+            line_width += ch_width;
+        }
+    }
+    rows
+}
+
+fn append_span_char(row: &mut Vec<Span<'static>>, ch: char, style: Style) {
+    if let Some(last) = row.last_mut().filter(|last| last.style == style) {
+        last.content.to_mut().push(ch);
+        return;
+    }
+    row.push(Span::styled(ch.to_string(), style));
 }
 
 fn styled_shell_command_rows(
@@ -4884,7 +4921,93 @@ fn styled_value_spans(_group: &str, text: &str, fallback: Style) -> Vec<Span<'st
     if let Some(spans) = styled_activity_line_spans(text, fallback) {
         return spans;
     }
+    if let Some(spans) = styled_structured_json_spans(text, fallback) {
+        return spans;
+    }
+    if has_structured_json_prefix(text) {
+        return vec![Span::styled(text.to_string(), fallback)];
+    }
     styled_path_tokens(text, fallback)
+}
+
+fn styled_structured_json_spans(text: &str, fallback: Style) -> Option<Vec<Span<'static>>> {
+    let (prefix, raw_json) = structured_json_parts(text)?;
+    let value = serde_json::from_str::<serde_json::Value>(raw_json).ok()?;
+    let mut spans = vec![Span::styled(prefix.to_string(), fallback)];
+    push_json_value_spans(&mut spans, &value, None, fallback);
+    Some(spans)
+}
+
+fn has_structured_json_prefix(text: &str) -> bool {
+    structured_json_parts(text).is_some()
+}
+
+fn structured_json_parts(text: &str) -> Option<(&'static str, &str)> {
+    ["summary: ", "outputs: ", "data: "]
+        .iter()
+        .find_map(|prefix| {
+            text.strip_prefix(prefix)
+                .map(|raw_json| (*prefix, raw_json))
+        })
+}
+
+fn push_json_value_spans(
+    spans: &mut Vec<Span<'static>>,
+    value: &serde_json::Value,
+    key: Option<&str>,
+    fallback: Style,
+) {
+    match value {
+        serde_json::Value::Null => spans.push(Span::styled("null".to_string(), fallback)),
+        serde_json::Value::Bool(value) => spans.push(Span::styled(value.to_string(), fallback)),
+        serde_json::Value::Number(value) => spans.push(Span::styled(value.to_string(), fallback)),
+        serde_json::Value::String(value) => push_json_string_spans(spans, value, key, fallback),
+        serde_json::Value::Array(values) => {
+            spans.push(Span::styled("[".to_string(), fallback));
+            for (idx, value) in values.iter().enumerate() {
+                if idx > 0 {
+                    spans.push(Span::styled(",".to_string(), fallback));
+                }
+                push_json_value_spans(spans, value, None, fallback);
+            }
+            spans.push(Span::styled("]".to_string(), fallback));
+        }
+        serde_json::Value::Object(values) => {
+            spans.push(Span::styled("{".to_string(), fallback));
+            for (idx, (key, value)) in values.iter().enumerate() {
+                if idx > 0 {
+                    spans.push(Span::styled(",".to_string(), fallback));
+                }
+                spans.push(Span::styled(json_string_literal(key), fallback));
+                spans.push(Span::styled(":".to_string(), fallback));
+                push_json_value_spans(spans, value, Some(key), fallback);
+            }
+            spans.push(Span::styled("}".to_string(), fallback));
+        }
+    }
+}
+
+fn push_json_string_spans(
+    spans: &mut Vec<Span<'static>>,
+    value: &str,
+    key: Option<&str>,
+    fallback: Style,
+) {
+    if key.is_some_and(is_json_url_key) && looks_like_url_token(value) {
+        spans.push(Span::styled("\"".to_string(), fallback));
+        spans.push(Span::styled(value.to_string(), link()));
+        spans.push(Span::styled("\"".to_string(), fallback));
+        return;
+    }
+    spans.push(Span::styled(json_string_literal(value), fallback));
+}
+
+fn json_string_literal(value: &str) -> String {
+    serde_json::to_string(value).unwrap_or_else(|_| "\"\"".to_string())
+}
+
+fn is_json_url_key(key: &str) -> bool {
+    matches!(key, "url" | "live_url" | "href" | "http_url")
 }
 
 fn styled_notice_spans(text: &str, fallback: Style) -> Vec<Span<'static>> {
@@ -5089,6 +5212,9 @@ fn looks_like_command_line(text: &str) -> bool {
 }
 
 fn looks_like_path_token(token: &str) -> bool {
+    if is_non_clickable_special_path(token) {
+        return false;
+    }
     if looks_like_url_token(token) {
         return true;
     }
@@ -5099,6 +5225,10 @@ fn looks_like_path_token(token: &str) -> bool {
         || (has_path_character
             && (token.starts_with("~/") || token.starts_with("./") || token.starts_with("../")))
         || source_extension(token).is_some()
+}
+
+fn is_non_clickable_special_path(token: &str) -> bool {
+    token == "/dev" || token.starts_with("/dev/")
 }
 
 fn reference_token_style(token: &str) -> Style {

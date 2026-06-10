@@ -22,7 +22,9 @@ pub mod schema;
 pub mod tool;
 pub mod tool_runtime;
 
-pub use providers::{Anthropic, AnthropicConfig, OpenAi, OpenAiCompatible, OpenAiConfig};
+pub use providers::{
+    Anthropic, AnthropicConfig, Google, GoogleConfig, OpenAi, OpenAiCompatible, OpenAiConfig,
+};
 pub use schema::*;
 pub use tool::{Tool, ToolFailure, ToolHandler, ToolResult, ToolSet};
 pub use tool_runtime::{run_tool_loop, LoopOutput, LoopStatus, ScriptedTurnSource, TurnSource};

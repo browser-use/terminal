@@ -387,7 +387,7 @@ impl RateLimitInfo {
 }
 
 /// Header keys whose values must never appear in logs, errors, or `Debug`.
-const SECRET_HEADERS: &[&str] = &["authorization", "x-api-key"];
+const SECRET_HEADERS: &[&str] = &["authorization", "x-api-key", "x-goog-api-key"];
 
 /// Redact secret header values for safe display.
 ///
@@ -483,14 +483,14 @@ fn aggregate(events: Vec<LlmEvent>) -> LlmResponse {
                 id,
                 name,
                 namespace,
+                provider_metadata,
                 input,
             } => {
                 tool_calls.push(ContentPart::ToolCall {
                     id,
                     name,
                     input,
-                    provider_metadata: namespace
-                        .map(|namespace| serde_json::json!({ "namespace": namespace })),
+                    provider_metadata: tool_call_provider_metadata(namespace, provider_metadata),
                 });
             }
             LlmEvent::Finish {
@@ -531,6 +531,23 @@ fn aggregate(events: Vec<LlmEvent>) -> LlmResponse {
         content,
         usage,
         finish_reason,
+    }
+}
+
+fn tool_call_provider_metadata(
+    namespace: Option<String>,
+    provider_metadata: Option<serde_json::Value>,
+) -> Option<serde_json::Value> {
+    match (namespace, provider_metadata) {
+        (Some(namespace), Some(serde_json::Value::Object(mut meta))) => {
+            meta.insert("namespace".to_string(), serde_json::json!(namespace));
+            Some(serde_json::Value::Object(meta))
+        }
+        (Some(namespace), Some(meta)) => {
+            Some(serde_json::json!({ "namespace": namespace, "provider": meta }))
+        }
+        (Some(namespace), None) => Some(serde_json::json!({ "namespace": namespace })),
+        (None, metadata) => metadata,
     }
 }
 
@@ -979,6 +996,7 @@ mod tests {
                 id: "call_1".into(),
                 name: "get_weather".into(),
                 namespace: None,
+                provider_metadata: None,
                 input: serde_json::json!({ "city": "NYC" }),
             },
             LlmEvent::StepFinish {
@@ -1263,6 +1281,7 @@ mod tests {
                 "Bearer sk-secret-123".to_string(),
             ),
             ("x-api-key".to_string(), "sk-ant-secret".to_string()),
+            ("x-goog-api-key".to_string(), "google-secret".to_string()),
             ("content-type".to_string(), "application/json".to_string()),
         ];
         let red = redact_headers(&headers);
@@ -1273,11 +1292,13 @@ mod tests {
         };
         assert_eq!(get("Authorization"), Some("<redacted>"));
         assert_eq!(get("x-api-key"), Some("<redacted>"));
+        assert_eq!(get("x-goog-api-key"), Some("<redacted>"));
         assert_eq!(get("content-type"), Some("application/json"));
         // The secret value must not appear anywhere in the redacted view.
         let dump = format!("{red:?}");
         assert!(!dump.contains("sk-secret-123"), "leaked bearer token");
         assert!(!dump.contains("sk-ant-secret"), "leaked api key");
+        assert!(!dump.contains("google-secret"), "leaked Google api key");
     }
 
     #[test]
