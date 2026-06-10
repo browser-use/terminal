@@ -29,7 +29,7 @@ const BU_API: &str = "https://api.browser-use.com/api/v3";
 const LOG_LIMIT: usize = 250;
 const SCRIPT_MAX_OUTPUT_CHARS: usize = 120_000;
 const BROWSER_SCRIPT_DEFAULT_INITIAL_WAIT_MS: u64 = 15_000;
-const BROWSER_SCRIPT_DEFAULT_OBSERVE_MS: u64 = 30_000;
+const BROWSER_SCRIPT_DEFAULT_OBSERVE_MS: u64 = 1_000;
 const BROWSER_SCRIPT_HELPERS: &str = include_str!("browser_script_helpers.py");
 const BROWSER_CONNECT_LOCAL_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(120);
 const BROWSER_CONNECT_ATTACH_DEADLINE: Duration = Duration::from_secs(8);
@@ -277,8 +277,8 @@ static MANAGED_BROWSER_PIDS: OnceLock<Mutex<HashSet<u32>>> = OnceLock::new();
 static LOCAL_CDP_CONNECTIONS: OnceLock<Mutex<HashMap<String, LocalCdpConnectionEntry>>> =
     OnceLock::new();
 static BROWSER_SCRIPT_RUN_COUNTER: AtomicU64 = AtomicU64::new(1);
-const BROWSER_SCRIPT_COMPLETED_CACHE_TTL_MS: u128 = 10 * 60 * 1_000;
-const BROWSER_SCRIPT_COMPLETED_CACHE_MAX: usize = 128;
+const BROWSER_SCRIPT_COMPLETED_CACHE_TTL_MS: u128 = 60 * 60 * 1_000;
+const BROWSER_SCRIPT_COMPLETED_CACHE_MAX: usize = 2048;
 const MANAGED_BROWSER_PROFILE_PREFIX: &str = "but-managed-browser.";
 const MANAGED_BROWSER_MARKER_FILE: &str = "BrowserUseManagedChrome.json";
 
@@ -1283,7 +1283,7 @@ pub fn observe_browser_script_with_registry(
     let mut run = match lookup {
         BrowserScriptRunLookup::Run(run) => run,
         BrowserScriptRunLookup::Cached(output) => return Ok(output),
-        BrowserScriptRunLookup::Unknown => bail!("unknown browser_script run_id {run_id:?}"),
+        BrowserScriptRunLookup::Unknown => return Ok(unknown_browser_script_run_output(run_id)),
     };
     if run.session_id != session_id {
         let owner = run.session_id.clone();
@@ -1360,6 +1360,38 @@ pub fn observe_browser_script_with_registry(
     }
 }
 
+fn unknown_browser_script_run_output(run_id: &str) -> BrowserScriptOutput {
+    BrowserScriptOutput {
+        ok: true,
+        status: Some("not_found".to_string()),
+        run_id: Some(run_id.to_string()),
+        text: format!(
+            "No active or recently completed browser_script run was found for run_id: {run_id}. The id may be stale, already consumed, or from an older turn. Do not retry the same observe blindly; inspect the current page state or start a new browser_script if more data is needed."
+        ),
+        data: json!({
+            "status": "not_found",
+            "run_id": run_id,
+        }),
+        ..Default::default()
+    }
+}
+
+fn unknown_browser_script_cancel_output(run_id: &str) -> BrowserScriptOutput {
+    BrowserScriptOutput {
+        ok: true,
+        status: Some("not_found".to_string()),
+        run_id: Some(run_id.to_string()),
+        text: format!(
+            "No active browser_script run was found to cancel for run_id: {run_id}. The run may have already finished, timed out, or been cancelled. Continue by inspecting the current page state or starting a new browser_script if more data is needed."
+        ),
+        data: json!({
+            "status": "not_found",
+            "run_id": run_id,
+        }),
+        ..Default::default()
+    }
+}
+
 pub fn cancel_browser_script(session_id: &str, run_id: &str) -> Result<BrowserScriptOutput> {
     secrets_runtime::finish_with_redaction(
         session_id,
@@ -1372,11 +1404,13 @@ pub fn cancel_browser_script_with_registry(
     run_id: &str,
     registry: &BrowserScriptRunRegistry,
 ) -> Result<BrowserScriptOutput> {
-    let mut run = registry
+    let Some(mut run) = registry
         .lock()
         .expect("browser_script run registry poisoned")
         .remove(run_id)
-        .ok_or_else(|| anyhow!("unknown browser_script run_id {run_id:?}"))?;
+    else {
+        return Ok(unknown_browser_script_cancel_output(run_id));
+    };
     if run.session_id != session_id {
         let owner = run.session_id.clone();
         registry
@@ -13253,14 +13287,12 @@ print("bridge retry ok")
             "private browser_script runs must not be inserted into the legacy global registry"
         );
         let run_id = started.run_id.as_deref().unwrap();
-        let global_err = observe_browser_script(session_id, run_id, 50)
-            .expect_err("global registry must not see private run");
-        assert!(
-            global_err
-                .to_string()
-                .contains("unknown browser_script run_id"),
-            "unexpected global observe error: {global_err}"
-        );
+        let global_output =
+            observe_browser_script(session_id, run_id, 50).expect("unknown observe is recoverable");
+        assert_eq!(global_output.status.as_deref(), Some("not_found"));
+        assert!(global_output
+            .text
+            .contains("No active or recently completed browser_script run"));
 
         let mut finished =
             observe_browser_script_with_registry(session_id, run_id, 2_500, &registry).unwrap();
@@ -13272,6 +13304,34 @@ print("bridge retry ok")
         assert_eq!(finished.status.as_deref(), Some("finished"));
         assert!(finished.text.contains("private done"));
         assert_eq!(registry.active_run_count_for_session(session_id), 0);
+    }
+
+    #[test]
+    fn browser_script_observe_unknown_run_id_is_recoverable() {
+        let registry = BrowserScriptRunRegistry::new();
+        let output =
+            observe_browser_script_with_registry("script-unknown-run", "bs-missing", 50, &registry)
+                .unwrap();
+
+        assert!(output.ok);
+        assert_eq!(output.status.as_deref(), Some("not_found"));
+        assert_eq!(output.run_id.as_deref(), Some("bs-missing"));
+        assert!(output.text.contains("inspect the current page state"));
+    }
+
+    #[test]
+    fn browser_script_cancel_unknown_run_id_is_recoverable() {
+        let registry = BrowserScriptRunRegistry::new();
+        let output =
+            cancel_browser_script_with_registry("script-unknown-cancel", "bs-missing", &registry)
+                .unwrap();
+
+        assert!(output.ok);
+        assert_eq!(output.status.as_deref(), Some("not_found"));
+        assert_eq!(output.run_id.as_deref(), Some("bs-missing"));
+        assert!(output
+            .text
+            .contains("No active browser_script run was found to cancel"));
     }
 
     #[test]

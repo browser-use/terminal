@@ -49,6 +49,7 @@
 
 pub mod provider;
 
+use std::any::Any;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -83,7 +84,7 @@ use crate::context::{
     ContextManager, Item,
 };
 use crate::decision::{AutoCompactTokenLimitScope, SamplingOutcome, TokenStatus};
-use crate::events::{names, session_done_payload, EventSink, PendingEvent, TurnCtx};
+use crate::events::{names, session_done_payload, EventSink, PendingEvent, ResultFilePtr, TurnCtx};
 use crate::live_executor::ensure_agent_attached as ensure_runtime_agent_attached;
 use crate::session::reconstruct::WORKSPACE_CONTEXT_MULTI_AGENT_USAGE_HINT_KIND;
 use crate::session::SessionId;
@@ -1393,6 +1394,101 @@ fn runtime_or_store_events(
         .unwrap_or_default()
 }
 
+/// Fallback final result discovered from the session cwd when the model ends
+/// without a `done()` call (ported from exp/real-v8-restore-88 2bd479d).
+struct FallbackResultFile {
+    text: String,
+    file: ResultFilePtr,
+}
+
+fn fallback_result_file_for_session(
+    store: &SharedStore,
+    session_id: &str,
+) -> Option<FallbackResultFile> {
+    let session = store
+        .lock()
+        .expect("store mutex poisoned")
+        .load_session(session_id)
+        .ok()
+        .flatten()?;
+    let cwd = std::path::PathBuf::from(session.cwd);
+    let files = discover_result_files(&cwd);
+    let first = files.first()?;
+    let text = if files.len() == 1 {
+        format!("Result file: {}", first.path.display())
+    } else {
+        let rendered = files
+            .iter()
+            .map(|file| format!("- {}", file.path.display()))
+            .collect::<Vec<_>>()
+            .join("\n");
+        format!("Result files:\n{rendered}")
+    };
+    Some(FallbackResultFile {
+        text,
+        file: ResultFilePtr {
+            url: None,
+            path: Some(first.path.display().to_string()),
+            bytes: Some(first.bytes),
+        },
+    })
+}
+
+struct DiscoveredResultFile {
+    path: std::path::PathBuf,
+    bytes: u64,
+}
+
+fn discover_result_files(cwd: &std::path::Path) -> Vec<DiscoveredResultFile> {
+    let Ok(entries) = std::fs::read_dir(cwd) else {
+        return Vec::new();
+    };
+    let mut files = entries
+        .filter_map(Result::ok)
+        .filter_map(|entry| {
+            let path = entry.path();
+            let name = path.file_name()?.to_str()?;
+            if !name.starts_with("result.") {
+                return None;
+            }
+            let metadata = entry.metadata().ok()?;
+            if !metadata.is_file() || metadata.len() == 0 {
+                return None;
+            }
+            Some(DiscoveredResultFile {
+                path,
+                bytes: metadata.len(),
+            })
+        })
+        .collect::<Vec<_>>();
+    files.sort_by(|left, right| {
+        let left_name = left
+            .path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("");
+        let right_name = right
+            .path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("");
+        result_file_priority(left_name)
+            .cmp(&result_file_priority(right_name))
+            .then_with(|| left_name.cmp(right_name))
+    });
+    files
+}
+
+fn result_file_priority(name: &str) -> usize {
+    match name {
+        "result.json" => 0,
+        "result.csv" => 1,
+        "result.md" => 2,
+        "result.txt" => 3,
+        _ => 10,
+    }
+}
+
 fn ensure_fallback_capture_recording(store: &SharedStore, session_id: &str) {
     if !fallback_capture_recording_enabled() {
         return;
@@ -2401,40 +2497,15 @@ fn media_content_part_for_provider(
     }
 }
 
-/// A [`TurnObserver`] that maps loop lifecycle into the durable UI event log.
+/// A [`TurnObserver`] for lifecycle hooks that must not decide terminal status.
 ///
-/// On turn completion it emits the final agent message as a `session.done`
-/// event through the durable UI sink, so the run's result is visible to the TUI
-/// and protocol reducers. The streaming text deltas are emitted by the sampling
-/// driver through the same durable sink.
-struct StoreObserver {
-    sink: Arc<dyn EventSink>,
-    session_id: String,
-}
-
-impl StoreObserver {
-    fn new(sink: Arc<dyn EventSink>, session_id: String) -> Self {
-        Self { sink, session_id }
-    }
-}
+/// Runtime-owned runs accept `session.done` only after the turn loop has returned
+/// and runtime resources have been quiesced. Streaming model/tool events are
+/// still persisted by the sampling driver through [`RuntimeStoreSink`].
+struct StoreObserver;
 
 impl TurnObserver for StoreObserver {
-    fn on_lifecycle(&self, ev: TurnLifecycleEvent) {
-        // Phase-E seam: started/aborted lifecycle markers are not surfaced as
-        // store events yet (the legacy stack had richer turn-lifecycle telemetry).
-        // We persist the terminal session result, which is what readers need today.
-        if let TurnLifecycleEvent::TurnComplete {
-            last_agent_message: Some(text),
-            ..
-        } = ev
-        {
-            self.sink.emit(PendingEvent::new(
-                self.session_id.clone(),
-                names::SESSION_DONE,
-                session_done_payload(Some(&text), None),
-            ));
-        }
-    }
+    fn on_lifecycle(&self, _ev: TurnLifecycleEvent) {}
 }
 
 /// A network-free scripted driver for the `Fake` backend.
@@ -2588,15 +2659,7 @@ impl<Sd: SamplingDriver> RuntimeTurnLoopDriver<Sd> {
         }
         *state.pre_turn_replay_from_seq.lock().unwrap() = None;
 
-        // The observer persists the terminal agent message through the runtime so
-        // `session.done` is journaled and projected by the same live authority as
-        // model/tool events.
-        let sink: Arc<dyn EventSink> = Arc::new(RuntimeStoreSink {
-            runtime: runtime_handle,
-            store: Arc::clone(&store),
-            model_context_window: None,
-        });
-        let observer = StoreObserver::new(sink, session_id.as_str().to_string());
+        let observer = StoreObserver;
 
         let turn_loop = TurnLoop::new(state, driver, observer);
         let result = match max_turns {
@@ -2611,10 +2674,83 @@ impl<Sd: SamplingDriver> RuntimeTurnLoopDriver<Sd> {
                     .await
             }
         };
-        if result.is_ok() {
-            ensure_fallback_capture_recording(&store, session_id.as_str());
+        let runtime_session_id = RuntimeSessionId::from_string(session_id.as_str().to_string())?;
+        match result {
+            Ok(last_agent_message) => {
+                ensure_fallback_capture_recording(&store, session_id.as_str());
+                cleanup_session_resources_for_terminal(
+                    runtime_handle.clone(),
+                    runtime_session_id.clone(),
+                )
+                .await?;
+                // Never lose finished work: if the model ended without a final
+                // message (no done() call — e.g. ended on leaked planning text
+                // or an empty turn), fall back to the best result.* artifact in
+                // the session cwd so session.done still carries the deliverable.
+                let mut final_message = last_agent_message;
+                let mut result_file: Option<ResultFilePtr> = None;
+                if final_message.is_none() && !cancel.is_cancelled() {
+                    if let Some(fallback) =
+                        fallback_result_file_for_session(&store, session_id.as_str())
+                    {
+                        final_message = Some(fallback.text);
+                        result_file = Some(fallback.file);
+                    }
+                }
+                if let Some(text) = final_message.as_deref() {
+                    runtime_handle.append_observed_session_event(
+                        runtime_session_id,
+                        names::SESSION_DONE,
+                        session_done_payload(Some(text), result_file.as_ref()),
+                        RuntimeDurability::Barrier,
+                    )?;
+                }
+                Ok(final_message)
+            }
+            Err(error) => {
+                let _ = cleanup_session_resources_for_terminal(
+                    runtime_handle.clone(),
+                    runtime_session_id,
+                )
+                .await;
+                Err(error)
+            }
         }
-        result
+    }
+}
+
+async fn cleanup_session_resources_for_terminal(
+    runtime_handle: RuntimeHandle,
+    runtime_session_id: RuntimeSessionId,
+) -> Result<usize, AgentError> {
+    let session_for_error = runtime_session_id.as_str().to_string();
+    tokio::task::spawn_blocking(move || {
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            runtime_handle.cleanup_session_resources(&runtime_session_id)
+        }))
+    })
+    .await
+    .map_err(|error| {
+        AgentError::Other(anyhow::anyhow!(
+            "terminal cleanup task failed to join for session {session_for_error}: {error}"
+        ))
+    })?
+    .map_err(|panic| {
+        AgentError::Other(anyhow::anyhow!(
+            "terminal cleanup panicked for session {session_for_error}: {}",
+            panic_payload_message(panic)
+        ))
+    })?
+    .map_err(AgentError::Other)
+}
+
+fn panic_payload_message(payload: Box<dyn Any + Send>) -> String {
+    if let Some(message) = payload.downcast_ref::<&str>() {
+        (*message).to_string()
+    } else if let Some(message) = payload.downcast_ref::<String>() {
+        message.clone()
+    } else {
+        "unknown panic payload".to_string()
     }
 }
 
@@ -4399,6 +4535,105 @@ mod tests {
         assert!(
             saw_session_done,
             "runtime-backed terminal observer must publish session.done through runtime projection"
+        );
+    }
+
+    #[tokio::test]
+    async fn runtime_backed_done_is_journaled_after_resource_cleanup() {
+        let (dir, store, session_id) = store_with_session();
+        seed_user_input(&store, &session_id, "initial").await;
+        let journal = Arc::new(SqliteJournal::from_store(
+            Store::open(dir.path()).expect("open runtime store"),
+        ));
+        let persistence: Arc<dyn LiveThreadPersistence> = journal.clone();
+        let state_index: Arc<dyn StateIndex> = journal;
+        let runtime = BrowserUseRuntime::new(persistence, state_index).handle();
+        let runtime_session_id =
+            RuntimeSessionId::from_string(session_id.clone()).expect("runtime session id");
+        runtime
+            .attach_root_agent(AttachRootAgentRequest {
+                session_id: runtime_session_id.clone(),
+                cwd: std::path::PathBuf::from("/work"),
+                task: "root".to_string(),
+                max_concurrent_threads_per_session: 3,
+            })
+            .expect("attach root");
+
+        let cleanup_store = Arc::clone(&store);
+        let cleanup_session_id = session_id.clone();
+        runtime
+            .get_or_insert_session_resource(
+                &runtime_session_id,
+                "test.cleanup_before_done",
+                || 1usize,
+                move |_resource: Arc<usize>| {
+                    let store = cleanup_store.lock().expect("store mutex poisoned");
+                    store
+                        .append_event(
+                            &cleanup_session_id,
+                            "test.cleanup",
+                            json!({ "phase": "terminal_barrier" }),
+                        )
+                        .expect("append cleanup marker");
+                    1
+                },
+            )
+            .expect("register cleanup marker");
+        let blocking_cleanup_store = Arc::clone(&store);
+        let blocking_cleanup_session_id = session_id.clone();
+        runtime
+            .get_or_insert_session_resource(
+                &runtime_session_id,
+                "test.blocking_cleanup_before_done",
+                || 1usize,
+                move |_resource: Arc<usize>| {
+                    let _client = reqwest::blocking::Client::new();
+                    let store = blocking_cleanup_store.lock().expect("store mutex poisoned");
+                    store
+                        .append_event(
+                            &blocking_cleanup_session_id,
+                            "test.blocking_cleanup",
+                            json!({ "phase": "terminal_barrier" }),
+                        )
+                        .expect("append blocking cleanup marker");
+                    1
+                },
+            )
+            .expect("register blocking cleanup marker");
+
+        run_session_with_config_with_cancel_and_runtime(
+            Arc::clone(&store),
+            &session_id,
+            fake_config(),
+            CancellationToken::new(),
+            Some(runtime),
+        )
+        .await
+        .expect("runtime-backed run");
+
+        let log = events(&store, &session_id);
+        let cleanup_seq = log
+            .iter()
+            .find(|event| event.event_type == "test.cleanup")
+            .map(|event| event.seq)
+            .expect("cleanup marker");
+        let blocking_cleanup_seq = log
+            .iter()
+            .find(|event| event.event_type == "test.blocking_cleanup")
+            .map(|event| event.seq)
+            .expect("blocking cleanup marker");
+        let done_seq = log
+            .iter()
+            .find(|event| event.event_type == names::SESSION_DONE)
+            .map(|event| event.seq)
+            .expect("session.done");
+        assert!(
+            cleanup_seq < done_seq,
+            "terminal cleanup must be durable before session.done: cleanup={cleanup_seq}, done={done_seq}"
+        );
+        assert!(
+            blocking_cleanup_seq < done_seq,
+            "blocking terminal cleanup must be durable before session.done: cleanup={blocking_cleanup_seq}, done={done_seq}"
         );
     }
 

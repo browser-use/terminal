@@ -56,9 +56,7 @@ email_address()
 email_inbox(limit=20, sent_after=None)
 email_message(message_id)
 http_get(url, **kwargs)
-http_get_many(urls, **kwargs)
 browser_fetch(url, **kwargs)
-browser_fetch_many(requests, **kwargs)
 
 copy_artifact(path, kind="file")
 emit_output(value, label=None)
@@ -82,7 +80,7 @@ Usage guidance:
 - Do not combine `Input.dispatchKeyEvent` carrying printable `text` with a manual `char` event for the same character; that double-inserts text in Chrome.
 - If the task is site-specific, call `domain_skills_for_url(url, include_content=True)` before inventing selectors, private API routes, or flows. `goto_url(url)` also returns matching `domain_skills` metadata when a skill root is available.
 - Be patient with loading pages by making several cheap observations, not one long blind wait. Prefer short waits such as `wait_for_load(1)`, `wait_for_element(selector, timeout=2)`, or `wait_for_network_idle(2)`, then inspect again. If a wait returns false, that is not a task failure; inspect the current page and continue from the best available state or decide whether it is stuck.
-- Use screenshots as labeled temporal checkpoints when visual state matters: before/after meaningful clicks, scrolls, route changes, dialogs, uploads, downloads, and visual final verification. For text-heavy research, document reading, search, pricing, tables, and list extraction, prefer `page_info()`, `js(...)`, targeted DOM text, `http_get_many`, or `browser_fetch_many`; screenshots add latency and usually do not help.
+- Use screenshots as labeled temporal checkpoints: initial load, before/after meaningful clicks, scrolls, route changes, dialogs, uploads, downloads, and final verification. For screenshot or visual-output tasks, verify the saved image is contentful and nonblank before `done`.
 - The common screenshot call is `screenshot(label)`, for example `screenshot("before_submit")`.
 - Screenshot/image artifacts are sent as `input_image` content to the next model turn. The user does not see those pixels inline in the terminal; describe what you see or provide the saved artifact path when the user asks for the screenshot.
 - If a script emits screenshots/images and then fails, the next model turn still receives the images alongside the failure diagnosis. Use those pixels to decide the next smaller retry.
@@ -118,45 +116,16 @@ emit_output(rows, label="employee_rows")
 - Use `js(...)` for DOM inspection and raw `cdp(...)` for lower-level browser actions.
 - Use `js(function_source, *args)` when passing JSON-serializable Python values into JavaScript; use `target_id=` as a keyword for iframe targets.
 - For real user forms, act like a browser user: screenshot, click the visible field/control, type with `type_text(...)`, `press_key(...)`, or `fill_input(...)`, then screenshot or otherwise verify. Use coordinate clicks for checkboxes, radios, buttons, dropdowns, and custom controls. Do not assign `element.value`, `element.checked`, `selectedIndex`, React private state, or MutationObserver restore loops on live forms. Do not synthesize `input`, `change`, `click`, or keyboard events in page JavaScript to make a form look filled. Those anti-patterns can desynchronize framework state from the visible DOM.
-- Use `http_get(...)` for one static page/API URL after the browser reveals a stable endpoint, and `http_get_many(...)` for several independent public URLs. Use `browser_fetch(...)` or `browser_fetch_many(...)` when the page's cookies, auth headers, or browser session are needed. Returned bodies are strings by default, bytes with `binary=True`, and expose `.status_code`, `.headers`, `.url`, `.text`, `.content`, and `.json()` for convenience. `browser_fetch(...)` and the batch helpers return error records by default so one bad endpoint does not waste the whole extraction chunk; pass `return_error=False` or `return_errors=False` only when a hard failure is intended. If direct HTTP hits bot or login protection, retry with `browser_fetch(...)`, site-specific headers/cookies, or the configured Browser Use fetch proxy.
-- Batch recipe after discovering stable links or endpoints:
-
-```python
-# browser_summary:
-# {
-#   "fetch_progress": {
-#     "kind": "extracted",
-#     "message": "Fetched ${$.ok_count}/${$.total} independent URLs"
-#   },
-#   "records": {
-#     "kind": "extracted",
-#     "message": "Extracted ${$.length} records from fetched pages"
-#   }
-# }
-
-urls = [...]
-responses = http_get_many(urls, timeout=12, max_workers=8)
-ok = [r for r in responses if not isinstance(r, dict) and getattr(r, "status_code", 0) < 400]
-emit_output({"total": len(responses), "ok_count": len(ok)}, label="fetch_progress")
-
-records = []
-for url, response in zip(urls, responses):
-    if isinstance(response, dict) and response.get("error"):
-        records.append({"url": url, "status": "error", "error": response["error"]})
-        continue
-    text = response.text
-    records.append({"url": url, "status": response.status_code, "title": text[:200]})
-
-emit_output(records, label="records")
-```
+- Use `http_get(...)` for one static page/API URL after the browser reveals a stable endpoint. Use `browser_fetch(...)` when the page's cookies, auth headers, or browser session are needed. Returned bodies are strings by default, bytes with `binary=True`, and expose `.status_code`, `.headers`, `.url`, `.text`, `.content`, and `.json()` for convenience. If direct HTTP hits bot or login protection, retry with `browser_fetch(...)`, site-specific headers/cookies, or the configured Browser Use fetch proxy. Do not replace source completion with blind bulk fetching; use small inspected chunks with progress, counts, missing fields, and source coverage.
 
 - Extract only fields needed for the task. Do not emit full profile text, full DOM text, cookies, localStorage, or entire app caches unless you are debugging and the smaller field-level extraction failed.
 - Save complete generated result files under `outputs_dir()` or relative paths in the current working directory. Files written there are collected as artifacts automatically; `copy_artifact(...)` is for files created elsewhere.
 - For large structured results, write the full JSON/CSV/text to a file. If the task asks for an exact inline final format, return that content with `done(result=...)` and optionally include `result_file=path`; otherwise finish with `done(result_file=path)`.
 - For loops over multiple pages/items, emit short progress every item or every 2 seconds, whichever comes first. Progress can be a short `print(...)` line or compact `emit_output(..., label="progress")`.
+- For audits after a large result, run a small independent sample/count/schema check, then repair the specific gaps it finds until the required rows/fields are complete or the run is nearly out of turns. Do not rerun the whole crawl or full detail scrape just because counts fluctuate or some pages are intermittently empty; target the missing items, and mark a gap as a genuine absence only after checking its correct source path.
 - For list/profile extraction, filter the candidate list before navigating when the list page already contains enough information, such as employee versus contractor. Do not visit rows that cannot affect the final answer.
-- Poll for record readiness, not for nullable answer fields. If the app cache or DOM record for a person exists but `birthday`, phone, address, or another optional field is missing/null, record that value as missing and continue instead of waiting for the optional field to appear.
-- For long extraction or verification loops, prefer bounded chunks with checkpoints written to files. Use one global deadline plus per-item micro timeouts; check the global deadline before every navigation, wait, and sleep. If a chunk fails with a usable-page diagnosis, shrink the next chunk and resume from the last checkpoint.
+- Poll until the record itself is ready before extracting fields. If a loaded record is missing a required field, inspect the correct source path before marking it absent; do not record required values as missing just because the first record view is null.
+- For long extraction or verification loops, prefer bounded chunks with checkpoints written to files. Use per-item micro timeouts and inspect progress after each chunk. If a chunk fails with a usable-page diagnosis, shrink the next chunk and resume from the last checkpoint.
 
 Signing in / sign-ups: before signing up with a new email, check whether you're already logged in (you often drive the user's own profile) or have a saved credential for the site (listed under "Saved credentials") — if so, use it. If there's no existing login, ask the user whether to sign in with their own account (they save it via `/secrets`) or have you create a disposable account (you generate a throwaway inbox with `email_address()` and read its verification emails yourself), and wait for their choice. For the disposable path, call `email_address()`, record whatever context you need before submitting (`current_datetime()["utc"]`, existing `message_id`s from `email_inbox()`, or both), fill the email field, submit, then inspect/poll `email_inbox(sent_after=...)` or compare `timestamp`/`message_id` yourself (newest-first; `preview` already holds the code; `email_message(message_id)` has the full `text`/`html` for magic links).
 

@@ -16,16 +16,11 @@
 //! recognize that the agent declared itself finished, and so the final `text`
 //! (the summary) is surfaced to the host.
 //!
-//! It does NOT itself force the turn loop to stop: the loop's termination signal
-//! is "the model produced a final assistant message with NO tool calls"
-//! ([`TurnRunOutcome::NoToolCalls`](crate::turn::loop::TurnRunOutcome)). A `done`
-//! call is a tool call, so it is dispatched, recorded, and the loop re-samples;
-//! the model then typically produces a final no-tool message and the loop stops.
-//! Wiring the loop to treat a successful `done` [`ExecOutput`] as terminal (a
-//! short-circuit) needs the loop's classifier (`turn/loop.rs` /
-//! `turn/fusion.rs`) to inspect the dispatched tool name/output — those files are
-//! outside this WP's owned set, so that deeper loop wiring is REPORTED, not
-//! implemented here.
+//! A successful `done` output is treated as terminal by the fused sampling loop.
+//! In eval mode (`BROWSER_USE_EVAL_DONE_AUDIT=1`) this handler performs a small
+//! completion audit first. If the final answer is obviously empty, placeholder
+//! heavy, or explicitly partial, it rejects the call so the loop gives the model
+//! one more repair turn instead of accepting a weak completion.
 //!
 //! # Parity grounding
 //!
@@ -49,6 +44,12 @@ use crate::tools::runtime::{
     Approvable, ExecOutput, SandboxAttempt, Sandboxable, ToolCtx, ToolError, ToolRuntime,
 };
 use crate::tools::sandbox::{SandboxPermissions, SandboxPreference};
+use serde_json::Value;
+use std::fs;
+use std::path::{Path, PathBuf};
+
+const EVAL_DONE_AUDIT_ENV: &str = "BROWSER_USE_EVAL_DONE_AUDIT";
+const DONE_AUDIT_TEXT_PREVIEW_BYTES: usize = 256 * 1024;
 
 /// The tool name surfaced to the model.
 ///
@@ -207,11 +208,15 @@ impl ToolRuntime<DoneRequest, ExecOutput> for DoneTool {
         &self,
         req: &DoneRequest,
         attempt: &SandboxAttempt<'_>,
-        _ctx: &ToolCtx,
+        ctx: &ToolCtx,
     ) -> Result<ExecOutput, ToolError> {
         // No sandbox is exercised (the tool does no I/O); acknowledge the attempt
         // to make the seam explicit, matching the other tools.
         let _ = attempt;
+
+        if eval_done_audit_enabled() {
+            audit_done_request(req, ctx).map_err(ToolError::Rejected)?;
+        }
 
         // Record the final summary into a deterministic, prefixed acknowledgement
         // the loop/host can recognize as the declared completion. The summary may
@@ -223,4 +228,245 @@ impl ToolRuntime<DoneRequest, ExecOutput> for DoneTool {
             stderr: String::new(),
         })
     }
+}
+
+fn eval_done_audit_enabled() -> bool {
+    std::env::var(EVAL_DONE_AUDIT_ENV)
+        .ok()
+        .is_some_and(|value| env_flag_enabled(&value))
+}
+
+fn env_flag_enabled(value: &str) -> bool {
+    let normalized = value.trim().to_ascii_lowercase();
+    !normalized.is_empty()
+        && !matches!(
+            normalized.as_str(),
+            "0" | "false" | "off" | "no" | "disabled"
+        )
+}
+
+pub(crate) fn audit_done_request(req: &DoneRequest, ctx: &ToolCtx) -> Result<(), String> {
+    let mut reasons = Vec::new();
+    let mut audit_text = req.summary();
+    let mut has_material_answer = !audit_text.trim().is_empty();
+
+    if let Some(result_file) = req
+        .result_file
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        match read_result_file_preview(result_file, ctx) {
+            Ok(preview) => {
+                has_material_answer = true;
+                if let Some(preview) = preview {
+                    reasons.extend(json_audit_reasons(&preview));
+                    if !audit_text.is_empty() {
+                        audit_text.push('\n');
+                    }
+                    audit_text.push_str(&preview);
+                }
+            }
+            Err(reason) => reasons.push(reason),
+        }
+    }
+
+    if !has_material_answer {
+        reasons.push("no final answer text or readable non-empty result_file".to_string());
+    }
+
+    reasons.extend(text_audit_reasons(&audit_text));
+    reasons.extend(json_audit_reasons(&audit_text));
+
+    if reasons.is_empty() {
+        Ok(())
+    } else {
+        Err(format!(
+            "done audit rejected the final answer: {}. Continue working, verify and fill the missing fields, then call done again. Only use an incomplete fallback if the run is genuinely out of turns.",
+            reasons.join("; ")
+        ))
+    }
+}
+
+fn read_result_file_preview(path: &str, ctx: &ToolCtx) -> Result<Option<String>, String> {
+    let resolved = resolve_result_file(path, ctx);
+    let metadata = fs::metadata(&resolved).map_err(|error| {
+        format!(
+            "result_file `{}` is not readable at {} ({error})",
+            path,
+            resolved.display()
+        )
+    })?;
+    if !metadata.is_file() {
+        return Err(format!(
+            "result_file `{}` is not a regular file ({})",
+            path,
+            resolved.display()
+        ));
+    }
+    if metadata.len() == 0 {
+        return Err(format!("result_file `{}` is empty", path));
+    }
+
+    let bytes = fs::read(&resolved).map_err(|error| {
+        format!(
+            "result_file `{}` could not be read at {} ({error})",
+            path,
+            resolved.display()
+        )
+    })?;
+    let cap = bytes.len().min(DONE_AUDIT_TEXT_PREVIEW_BYTES);
+    Ok(std::str::from_utf8(&bytes[..cap])
+        .ok()
+        .map(ToOwned::to_owned))
+}
+
+fn resolve_result_file(path: &str, ctx: &ToolCtx) -> PathBuf {
+    let requested = Path::new(path);
+    if requested.is_absolute() {
+        return requested.to_path_buf();
+    }
+
+    let cwd_path = ctx.cwd.join(requested);
+    if cwd_path.exists() {
+        return cwd_path;
+    }
+
+    let artifact_path = ctx.artifact_root.join(requested);
+    if artifact_path.exists() {
+        return artifact_path;
+    }
+
+    cwd_path
+}
+
+fn text_audit_reasons(text: &str) -> Vec<String> {
+    let normalized = text.to_ascii_lowercase();
+    let markers = [
+        ("partial_incomplete", "declares partial_incomplete"),
+        ("partial / incomplete", "declares partial/incomplete"),
+        ("partial/incomplete", "declares partial/incomplete"),
+        ("not completed", "declares not completed"),
+        ("not checked", "declares not checked"),
+        ("not extracted", "declares not extracted"),
+        ("could not verify", "declares unverified data"),
+        ("couldn't verify", "declares unverified data"),
+        ("could not access", "declares inaccessible source"),
+        ("couldn't access", "declares inaccessible source"),
+        ("unavailable due to", "declares unavailable data"),
+        ("source unavailable", "declares unavailable source"),
+        ("blocked by", "declares blocked source"),
+        ("unable to complete", "declares incomplete task"),
+        ("task is incomplete", "declares incomplete task"),
+    ];
+
+    markers
+        .iter()
+        .filter_map(|(needle, reason)| normalized.contains(needle).then(|| (*reason).to_string()))
+        .collect()
+}
+
+fn json_audit_reasons(text: &str) -> Vec<String> {
+    let Some(value) = parse_first_json_value(text) else {
+        return Vec::new();
+    };
+    let mut reasons = Vec::new();
+    if json_is_empty_result(&value) {
+        reasons.push("JSON result is empty".to_string());
+    }
+    let mut stats = JsonPlaceholderStats::default();
+    collect_json_placeholder_stats(&value, &mut stats);
+    if stats.total_scalar_fields >= 8
+        && stats.placeholder_fields * 100 >= stats.total_scalar_fields * 30
+    {
+        reasons.push(format!(
+            "JSON result has too many placeholder fields ({}/{})",
+            stats.placeholder_fields, stats.total_scalar_fields
+        ));
+    }
+    reasons
+}
+
+fn parse_first_json_value(text: &str) -> Option<Value> {
+    let trimmed = text.trim();
+    serde_json::from_str(trimmed).ok()
+}
+
+fn json_is_empty_result(value: &Value) -> bool {
+    match value {
+        Value::Array(items) => items.is_empty(),
+        Value::Object(map) => {
+            if map.is_empty() {
+                return true;
+            }
+            let array_values = map
+                .values()
+                .filter_map(|value| value.as_array())
+                .collect::<Vec<_>>();
+            !array_values.is_empty() && array_values.iter().all(|items| items.is_empty())
+        }
+        _ => false,
+    }
+}
+
+#[derive(Default)]
+struct JsonPlaceholderStats {
+    total_scalar_fields: usize,
+    placeholder_fields: usize,
+}
+
+fn collect_json_placeholder_stats(value: &Value, stats: &mut JsonPlaceholderStats) {
+    match value {
+        // A field explicitly set to null means the agent checked the source and
+        // recorded a genuine absence. Many tasks REQUIRE null/empty for
+        // unavailable fields, so count null toward the denominator but NOT as a
+        // placeholder. Counting it as a placeholder pushed the agent to delete
+        // required fields to satisfy the audit (real_v8 task 53 regression).
+        Value::Null => stats.total_scalar_fields += 1,
+        Value::Bool(_) | Value::Number(_) => stats.total_scalar_fields += 1,
+        Value::String(text) => {
+            stats.total_scalar_fields += 1;
+            if is_placeholder_string(text) {
+                stats.placeholder_fields += 1;
+            }
+        }
+        Value::Array(items) => {
+            for item in items {
+                collect_json_placeholder_stats(item, stats);
+            }
+        }
+        Value::Object(map) => {
+            for value in map.values() {
+                collect_json_placeholder_stats(value, stats);
+            }
+        }
+    }
+}
+
+fn is_placeholder_string(text: &str) -> bool {
+    let normalized = text.trim().to_ascii_lowercase();
+    // An empty string is a deliberate "checked, genuinely absent" sentinel, and
+    // many tasks explicitly MANDATE "" for missing values. Counting "" as a
+    // placeholder rejected spec-correct answers and coerced literal placeholder
+    // prose instead (real_v8 task 94). null is treated the same way.
+    if normalized.is_empty() {
+        return false;
+    }
+    matches!(
+        normalized.as_str(),
+        "unknown"
+            | "n/a"
+            | "na"
+            | "none"
+            | "null"
+            | "missing"
+            | "not found"
+            | "unavailable"
+            | "not available"
+            | "not listed"
+            | "not checked"
+            | "not extracted"
+            | "could not determine"
+    ) || normalized.starts_with("could not ")
+        || normalized.starts_with("unable to ")
 }

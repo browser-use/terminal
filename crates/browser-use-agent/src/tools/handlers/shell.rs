@@ -48,6 +48,7 @@ use crate::tools::unified_exec::{
 /// Matches codex `DEFAULT_EXEC_COMMAND_TIMEOUT_MS` (exec.rs:51) and legacy
 /// `DEFAULT_SHELL_COMMAND_TIMEOUT_MS` (command.rs:26).
 pub const DEFAULT_SHELL_COMMAND_TIMEOUT_MS: u64 = 10_000;
+pub const DEFAULT_EXEC_COMMAND_TIMEOUT_MS: u64 = 600_000;
 
 /// Exit code reported when a command is killed for exceeding its timeout.
 ///
@@ -312,6 +313,10 @@ pub struct ExecCommandRequest {
     /// Initial output collection window before returning a process id.
     #[serde(default)]
     pub yield_time_ms: Option<u64>,
+    /// Maximum wall time before the process tree is killed. Defaults to a
+    /// generous cap so one forgotten command cannot pin the whole run.
+    #[serde(default)]
+    pub timeout_ms: Option<u64>,
     /// Maximum model-visible output tokens.
     #[serde(default)]
     pub max_output_tokens: Option<usize>,
@@ -347,6 +352,10 @@ impl ExecCommandRequest {
 
     fn yield_time_ms(&self) -> u64 {
         self.yield_time_ms.unwrap_or(DEFAULT_EXEC_YIELD_TIME_MS)
+    }
+
+    fn timeout_ms(&self) -> u64 {
+        self.timeout_ms.unwrap_or(DEFAULT_EXEC_COMMAND_TIMEOUT_MS)
     }
 }
 
@@ -610,7 +619,7 @@ impl ToolRuntime<ExecCommandRequest, ExecOutput> for ExecCommandTool {
                 tty: req.tty,
                 yield_time_ms: req.yield_time_ms(),
                 max_output_tokens: req.max_output_tokens,
-                timeout_ms: None,
+                timeout_ms: Some(req.timeout_ms()),
                 kill_on_cancel: false,
                 call_id: ctx.call_id.clone(),
                 tool_name: ctx.tool_name.clone(),

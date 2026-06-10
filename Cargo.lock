@@ -267,6 +267,7 @@ dependencies = [
  "browser-use-secrets",
  "browser-use-store",
  "futures-util",
+ "libc",
  "portable-pty",
  "rand 0.9.4",
  "regex",
