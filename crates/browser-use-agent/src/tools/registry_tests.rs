@@ -28,9 +28,7 @@ use crate::tools::handlers::mcp::{
     McpCallResult, McpClient, McpTool, McpToolCallRequest, McpWireArgs,
 };
 use crate::tools::handlers::python::{PythonBackend, PythonRequest, PythonTool};
-use crate::tools::handlers::search::{
-    SearchBackend, SearchError, SearchTool, SEARCH_PARALLEL_SAFE,
-};
+use crate::tools::handlers::search::{SearchBackend, SearchError, SearchTool};
 use crate::tools::handlers::shell::{ShellRequest, ShellTool};
 use crate::tools::handlers::tool_search::{ToolSearchEntry, ToolSearchRequest, ToolSearchTool};
 use crate::tools::handlers::update_plan::{UpdatePlanRequest, UpdatePlanTool};
@@ -604,8 +602,8 @@ fn parallel_safe_flags_match_registration() {
     // Pure / read-only tools are parallel-safe.
     assert_eq!(reg.parallel_safe("tool_search"), Some(true));
     assert_eq!(reg.parallel_safe("web_search"), Some(true));
-    assert_eq!(reg.parallel_safe("search"), Some(SEARCH_PARALLEL_SAFE));
-    // Everything else is serial.
+    // Everything else is serial — including `search`, pinned serial below as
+    // the conservative scheduling default for a billed API call.
     for name in [
         "shell",
         "apply_patch",

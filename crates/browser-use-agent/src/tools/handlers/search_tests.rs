@@ -158,6 +158,26 @@ fn parse_results_handles_empty_and_missing_results() {
     assert!(parse_results("{}").unwrap().is_empty());
 }
 
+/// The formatted output instructs the model to navigate to result URLs, so
+/// only `http(s)://` destinations may surface; unsafe schemes are dropped.
+#[test]
+fn parse_results_drops_non_http_urls() {
+    let body = r##"{"results": [
+        {"title": "ok https", "url": "https://safe.example.com/", "content": "keep"},
+        {"title": "ok http", "url": "http://plain.example.com/", "content": "keep"},
+        {"title": "xss", "url": "javascript:alert(1)", "content": "drop"},
+        {"title": "data", "url": "data:text/html,hi", "content": "drop"},
+        {"title": "relative", "url": "/relative/path", "content": "drop"},
+        {"title": "empty", "url": "", "content": "drop"}
+    ]}"##;
+    let results = parse_results(body).unwrap();
+    let urls: Vec<&str> = results.iter().map(|r| r.url.as_str()).collect();
+    assert_eq!(
+        urls,
+        vec!["https://safe.example.com/", "http://plain.example.com/"]
+    );
+}
+
 #[test]
 fn parse_results_rejects_malformed_bodies() {
     for body in ["not json", "", r#"{"results": "nope"}"#, "[1,2,3]"] {
@@ -274,9 +294,9 @@ fn classify_response_names_auth_and_billing_errors() {
 
 #[test]
 fn classify_response_flags_other_errors_with_snippet() {
-    // 400 invalid query, 422 upstream rejected, 502/503 upstream down — all
+    // 400 invalid query, 429 rate limited, 502/503 upstream down — all
     // carry the status + body snippet.
-    for status in [400u16, 422, 502, 503] {
+    for status in [400u16, 429, 502, 503] {
         match classify_response(status, "boom") {
             Err(SearchError::Http {
                 status: got,

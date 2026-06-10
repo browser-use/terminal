@@ -351,11 +351,11 @@ fn prepare_tui_agent_run(
     notifier: Option<StoreNotifier>,
 ) -> Result<(RuntimeAgentExecutor, ProviderRunConfig)> {
     let store = Store::open_with_optional_notifier(&state_dir, notifier.clone())?;
-    let browser_use_cloud_api_key = if browser == BROWSER_USE_CLOUD {
-        browser_use_cloud_api_key(&store)?
-    } else {
-        None
-    };
+    // Load the stored cloud API key regardless of browser mode: besides the
+    // cloud browser, the Rust-side Browser Use API calls (e.g. the `search`
+    // tool against search.browser-use.com) read it from the environment. Only
+    // the Browser Use Cloud browser *requires* it.
+    let browser_use_cloud_api_key = browser_use_cloud_api_key(&store)?;
     if browser == BROWSER_USE_CLOUD && browser_use_cloud_api_key.is_none() {
         let error = "Browser Use Cloud selected, but BROWSER_USE_API_KEY is not set";
         let _ = store.append_event(
@@ -370,8 +370,14 @@ fn prepare_tui_agent_run(
         .filter(|value| !value.trim().is_empty())
     {
         // Browser runtime is Rust-owned now, so the cloud API key must also be
-        // visible to Rust-side Browser Use API calls, not only the legacy Python worker.
-        std::env::set_var(BROWSER_USE_CLOUD_API_KEY_ENV, api_key);
+        // visible to Rust-side Browser Use API calls (cloud browser, `search`
+        // tool), not only the legacy Python worker. An explicitly exported
+        // env key wins; the store only fills it in when the env is unset —
+        // matching the CLI (`run_session_via_engine_with_runtime_and_cancel`)
+        // and avoiding a per-run env write when one is not needed.
+        if std::env::var(BROWSER_USE_CLOUD_API_KEY_ENV).map_or(true, |v| v.trim().is_empty()) {
+            std::env::set_var(BROWSER_USE_CLOUD_API_KEY_ENV, api_key);
+        }
     }
     let mut config = ProviderRunConfig::new(backend.into(), model.clone())
         .with_options(tui_agent_options(

@@ -29,9 +29,10 @@
 //! * `200` → `{"results": [{"title"?, "url", "published_date"?, "content"}]}`;
 //!   `title` / `published_date` are omitted when the source lacks them, and
 //!   `content` is multi-line markdown (whitespace-normalized here).
-//! * Errors: `400` invalid query, `401` missing/invalid API key, `402`
-//!   insufficient balance, `422` upstream rejected the request, `502` upstream
-//!   failed, `503` auth/billing backend unavailable.
+//! * Errors: `400` invalid query (the service also sanitizes an
+//!   upstream-rejected query into this), `401` missing/invalid API key, `402`
+//!   insufficient balance, `429` rate limit exceeded (retry later), `502`
+//!   upstream failed, `503` auth/billing backend unavailable.
 //!
 //! # Network seam (testability)
 //!
@@ -138,7 +139,7 @@ pub enum SearchError {
     /// The project balance is exhausted (HTTP 402).
     #[error("insufficient browser-use balance (HTTP 402)")]
     InsufficientBalance,
-    /// Any other client/server error status (400, 422, 502, 503, …).
+    /// Any other client/server error status (400, 429, 502, 503, …).
     #[error("HTTP {status}: {snippet}")]
     Http {
         /// The HTTP status code.
@@ -242,8 +243,8 @@ impl SearchBackend for HttpSearchBackend {
 
 /// Classify an HTTP response per the service's documented statuses: `401` and
 /// `402` get named, actionable errors; any other `>= 400` (400 invalid query,
-/// 422 upstream rejected, 502 upstream failed, 503 auth backend down) carries
-/// the status plus the first 200 chars of the body; everything else is success.
+/// 429 rate limited, 502 upstream failed, 503 auth backend down) carries the
+/// status plus the first 200 chars of the body; everything else is success.
 pub fn classify_response(status: u16, body: &str) -> Result<(), SearchError> {
     match status {
         401 => Err(SearchError::Unauthorized),
@@ -424,9 +425,11 @@ struct SearchResultWire {
 /// Parse the search service's JSON response body into results.
 ///
 /// The wire `content` arrives as multi-line markdown; it is whitespace-
-/// normalized into the single-line `description`. Results without a `url` are
-/// dropped (the model cannot follow them). A body that is not the documented
-/// JSON shape is a [`SearchError::Decode`].
+/// normalized into the single-line `description`. Results without an
+/// `http(s)://` URL are dropped: a url-less result cannot be followed, and the
+/// formatted output tells the model to navigate to result URLs, so unsafe
+/// schemes (`javascript:`, `data:`, …) must never surface. A body that is not
+/// the documented JSON shape is a [`SearchError::Decode`].
 pub fn parse_results(body: &str) -> Result<Vec<SearchResult>, SearchError> {
     let wire: SearchResponseWire =
         serde_json::from_str(body).map_err(|err| SearchError::Decode(err.to_string()))?;
@@ -434,7 +437,10 @@ pub fn parse_results(body: &str) -> Result<Vec<SearchResult>, SearchError> {
     Ok(wire
         .results
         .into_iter()
-        .filter(|result| !result.url.trim().is_empty())
+        .filter(|result| {
+            let url = result.url.trim();
+            url.starts_with("https://") || url.starts_with("http://")
+        })
         .map(|result| SearchResult {
             title: normalize_whitespace(&result.title),
             url: result.url.trim().to_string(),
