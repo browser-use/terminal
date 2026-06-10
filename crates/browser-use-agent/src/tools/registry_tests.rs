@@ -1024,13 +1024,14 @@ fn definitions_carry_required_fields_and_names() {
 }
 
 #[test]
-fn done_definition_preserves_timebox_partial_result_guidance() {
+fn done_definition_requires_complete_result_with_step_exhaustion_fallback() {
     let done = definitions::done();
-    assert!(done.description.contains("best verified partial result"));
-    assert!(done.description.contains("external cancellation"));
+    assert!(done.description.contains("task is complete"));
+    assert!(done.description.contains("complete and verified"));
+    assert!(done.description.contains("remaining step budget"));
     assert!(done
         .description
-        .contains("unknown, unavailable, or incomplete fields"));
+        .contains("explicitly incomplete fallback result"));
 }
 
 #[test]

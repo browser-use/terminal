@@ -23,7 +23,7 @@ use std::collections::VecDeque;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
-use browser_use_llm::schema::{ContentPart, Message, MessageRole};
+use browser_use_llm::schema::{ContentPart, FinishReason, Message, MessageRole};
 use tokio_util::sync::CancellationToken;
 
 use crate::decision::{SamplingOutcome, TokenStatus};
@@ -245,11 +245,14 @@ fn follow_up(msg: &str) -> SamplingOutcome {
 
 /// A terminal outcome (no follow-up; the model is done).
 fn complete(msg: &str) -> SamplingOutcome {
+    // A completed turn in these tests models a successful done() call, which
+    // ends with a tool-use finish; a text-only (Stop/None) completion in a
+    // bounded run now triggers one call-done nudge first.
     SamplingOutcome {
         model_needs_follow_up: false,
         last_agent_message: Some(msg.to_string()),
         defers_mailbox_delivery_to_next_turn: true,
-        finish_reason: None,
+        finish_reason: Some(FinishReason::ToolUse),
     }
 }
 

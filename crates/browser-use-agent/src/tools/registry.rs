@@ -816,6 +816,10 @@ pub mod definitions {
                         "type": "integer",
                         "description": "How long to wait (in milliseconds) for output before yielding."
                     },
+                    "timeout_ms": {
+                        "type": "integer",
+                        "description": "Maximum wall time in milliseconds before the process tree is killed. Defaults to a generous failsafe cap."
+                    },
                     "max_output_tokens": {
                         "type": "integer",
                         "description": "Maximum number of tokens to return. Excess output will be truncated."
@@ -1116,7 +1120,7 @@ to the single frame that proves the task succeeded."
         ToolDefinition {
             name: "done".to_string(),
             description:
-                "Signal that the task is finished, carrying the user-facing final answer. If the wall-clock or step budget is nearly exhausted, call done with the best verified partial result instead of continuing until external cancellation; clearly mark unknown, unavailable, or incomplete fields and name the remaining gaps."
+                "Signal that the user-facing task is complete, carrying the final answer. Call done only after the requested result is complete and verified or persisted. If the remaining step budget is nearly exhausted and a complete answer is no longer possible, call done with an explicitly incomplete fallback result that names the missing requirements."
                     .to_string(),
             input_schema: json!({
                 "type": "object",

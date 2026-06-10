@@ -370,11 +370,11 @@ async fn context_window_exceeded_with_only_prompt_left_propagates() {
 }
 
 #[tokio::test]
-async fn empty_model_summary_yields_prefix_only_summary() {
-    // The model returns an empty summary => summary_text = PREFIX + "\n" + "".
-    // (The "(no summary available)" placeholder only applies when the WHOLE
-    // summary_text is empty, which it never is here because the prefix is present;
-    // codex compact.rs:516.)
+async fn empty_model_summary_yields_no_summary_available_fallback() {
+    // The model returns an empty summary => the SUFFIX falls back to
+    // "(no summary available)" BEFORE the prefix is prepended (codex
+    // compact.rs:516). Shipping PREFIX+"" gave the post-compaction model
+    // total amnesia (real_v8 task 24).
     let history = vec![user_item("a user message")];
     let sampler = ScriptedSampler::new(vec![Ok(String::new())]);
 
@@ -390,7 +390,10 @@ async fn empty_model_summary_yields_prefix_only_summary() {
 
     let last = item_text(compacted.items.last().unwrap());
     assert_eq!(last, compacted.summary_text);
-    assert_eq!(compacted.summary_text, format!("{SUMMARY_PREFIX}\n"));
+    assert_eq!(
+        compacted.summary_text,
+        format!("{SUMMARY_PREFIX}\n(no summary available)")
+    );
 }
 
 // ---- (5) end-to-end through the real TurnLoop -----------------------------

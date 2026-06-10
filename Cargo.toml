@@ -38,6 +38,7 @@ ignore = "0.4"
 rand = "0.9"
 iana-time-zone = "0.1"
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "webp"] }
+libc = "0.2"
 ratatui = { version = "0.30", default-features = false, features = ["crossterm_0_29"] }
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }
 regex = "1"

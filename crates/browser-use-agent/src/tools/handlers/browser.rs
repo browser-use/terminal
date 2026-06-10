@@ -66,9 +66,12 @@ pub const DEFAULT_BROWSER_SCRIPT_TIMEOUT_SECS: u64 = 300;
 
 /// Default observe poll window (ms) for [`BrowserAction::Observe`].
 ///
-/// Long browser_script runs should be observed in coarse windows so the agent
-/// does not burn many LLM turns polling the same run_id while work is ongoing.
-pub const DEFAULT_OBSERVE_TIMEOUT_MS: u64 = 30_000;
+/// Restored to the pre-regression (88-baseline) 1s default. The 30s default +
+/// 30s clamp-floor ("observe30") blocked each observe for up to 30s, burning the
+/// run-level task timebox on long-running scripts and leaving tasks unfinished
+/// (e.g. real_v8 tasks 1, 4 never emitted session.done). The run-level timebox,
+/// not coarse poll windows, is responsible for bounding total turns.
+pub const DEFAULT_OBSERVE_TIMEOUT_MS: u64 = 1_000;
 pub const MAX_OBSERVE_TIMEOUT_MS: u64 = 120_000;
 
 /// Appended to `browser_script` stdout when the response carries image parts.
@@ -79,15 +82,19 @@ pub const MAX_OBSERVE_TIMEOUT_MS: u64 = 120_000;
 pub const BROWSER_SCRIPT_CONTENT_STDOUT_PREFIX: &str = "\n__browser_script_content__:";
 /// Maximum bytes of browser-script text returned to the next model turn.
 ///
-/// Full browser-script output is persisted through durable events/artifacts; the
-/// inline model view is deliberately smaller because long eval tasks repeatedly
-/// carry every prior tool result in later prompts.
-pub const MAX_INLINE_BROWSER_SCRIPT_STDOUT_BYTES: usize = 4 * 1024;
+/// Matches the collected-output limit (SCRIPT_MAX_OUTPUT_CHARS = 120k): the
+/// CURRENT turn must see the full script output to write correct follow-up
+/// code (codex parity: fresh outputs are never capped; the context manager
+/// truncates tool outputs only as they age into history via the policy*1.2
+/// rule in context/mod.rs). The old 4KB cap forced blind guess-first coding
+/// (KeyError-class bug explosion 8->53 across the 88->81 eval regression).
+pub const MAX_INLINE_BROWSER_SCRIPT_STDOUT_BYTES: usize = 120 * 1024;
 
 const BROWSER_PREF_MODE: &str = "browser.preference.mode";
 const BROWSER_PREF_BROWSER: &str = "browser.preference.browser";
 const BROWSER_PREF_BROWSER_LABEL: &str = "browser.preference.browser_label";
 const BROWSER_PREF_PROFILE: &str = "browser.preference.profile";
+const EVAL_MAX_OBSERVE_TIMEOUT_ENV: &str = "BROWSER_USE_EVAL_MAX_OBSERVE_TIMEOUT_MS";
 const BROWSER_DOMAIN_PROFILE_PREFIX: &str = "browser.domain_profile.";
 const BROWSER_SCRIPT_MAX_IMAGE_DIMENSION: u32 = 8_000;
 const BROWSER_PREF_PROFILE_LABEL: &str = "browser.preference.profile_label";
@@ -201,10 +208,36 @@ impl BrowserRequest {
     }
 
     fn effective_observe_ms(&self) -> u64 {
-        self.observe_timeout_ms
+        let normal = self
+            .observe_timeout_ms
             .unwrap_or(DEFAULT_OBSERVE_TIMEOUT_MS)
-            .clamp(DEFAULT_OBSERVE_TIMEOUT_MS, MAX_OBSERVE_TIMEOUT_MS)
+            .clamp(DEFAULT_OBSERVE_TIMEOUT_MS, MAX_OBSERVE_TIMEOUT_MS);
+        match eval_max_observe_timeout_ms() {
+            Some(max_ms) => normal.min(max_ms.max(1_000)),
+            None => normal,
+        }
     }
+}
+
+fn eval_max_observe_timeout_ms() -> Option<u64> {
+    // Observe timing is controlled ONLY by its own env var. It used to also be
+    // implicitly capped at 30s whenever BROWSER_USE_EVAL_DONE_AUDIT was set —
+    // a hidden cross-subsystem coupling (a finalization flag silently changing
+    // polling behavior) that made eval runs hard to reason about.
+    std::env::var(EVAL_MAX_OBSERVE_TIMEOUT_ENV)
+        .ok()
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .filter(|value| *value > 0)
+}
+
+#[allow(dead_code)]
+fn env_flag_enabled(value: &str) -> bool {
+    let normalized = value.trim().to_ascii_lowercase();
+    !normalized.is_empty()
+        && !matches!(
+            normalized.as_str(),
+            "0" | "false" | "off" | "no" | "disabled"
+        )
 }
 
 /// Model-facing wire arguments for the browser tool.
@@ -2375,7 +2408,7 @@ fn cap_inline_browser_script_stdout(text: String) -> String {
     let elided = text.len() - end;
     let mut out = text[..end].to_string();
     out.push_str(&format!(
-        "\n... [browser_script stdout truncated, {elided} more bytes; full output persisted. Use a narrower browser_script extraction, the emitted summaries, or a saved artifact instead of re-reading broad page text.]"
+        "\n... [browser_script stdout truncated, {elided} more bytes; full output persisted to the run artifact. Read the saved artifact or re-extract the missing portion before relying on this output.]"
     ));
     out
 }
@@ -3175,5 +3208,26 @@ mod browser_mode_tests {
             Some("remote-cloud"),
         )
         .unwrap();
+    }
+
+    #[test]
+    fn stored_cloud_preference_rejects_managed_only_recovery() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path()).unwrap();
+        store.set_setting(BROWSER_PREF_MODE, "cloud").unwrap();
+
+        let err = resolve_browser_command_for_selected_mode(
+            Some(&store),
+            "browser recover restart-owned-browser",
+            None,
+            None,
+        )
+        .unwrap_err();
+
+        assert!(
+            err.to_string()
+                .contains("restart-owned-browser only applies to managed Chromium"),
+            "{err:#}"
+        );
     }
 }

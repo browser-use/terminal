@@ -1422,7 +1422,7 @@ async fn script_truncated_structured_output_preserves_summary_first() {
     );
     assert!(
         out.stdout
-            .contains("Use a narrower browser_script extraction"),
+            .contains("Read the saved artifact or re-extract the missing portion"),
         "stdout: {}",
         out.stdout
     );
@@ -1434,8 +1434,11 @@ async fn script_truncated_structured_output_preserves_summary_first() {
 }
 
 #[test]
-fn browser_script_stdout_cap_defaults_to_four_kib_for_eval_cost() {
-    assert_eq!(MAX_INLINE_BROWSER_SCRIPT_STDOUT_BYTES, 4 * 1024);
+fn browser_script_stdout_cap_matches_collected_output_limit() {
+    // The CURRENT turn must see full script output to write correct follow-up
+    // code; history growth is handled by the context manager (policy*1.2).
+    // The old 4KB cap caused blind guess-first coding (88->81 regression).
+    assert_eq!(MAX_INLINE_BROWSER_SCRIPT_STDOUT_BYTES, 120 * 1024);
 }
 
 #[tokio::test]
@@ -1594,10 +1597,9 @@ async fn observe_timeout_is_clamped_to_coarse_poll_window() {
     };
     let out = run_direct(&tool, &req).await.unwrap();
     assert_eq!(out.exit_code, 0);
-    assert_eq!(
-        backend.last_observe_timeout_ms(),
-        Some(DEFAULT_OBSERVE_TIMEOUT_MS)
-    );
+    // 5s sits inside the allowed [DEFAULT_OBSERVE_TIMEOUT_MS, MAX] window and
+    // passes through unchanged (the old 30s floor inflated short observes).
+    assert_eq!(backend.last_observe_timeout_ms(), Some(5_000));
 
     req.observe_timeout_ms = Some(180_000);
     let out = run_direct(&tool, &req).await.unwrap();

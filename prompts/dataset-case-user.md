@@ -6,7 +6,7 @@ Task ID: {{task_id}}
 Task:
 {{task}}
 
-Use `browser` for browser connection/status/recovery and `browser_script` for browser interaction. Rust owns the browser connection; `browser_script` exposes helpers plus raw CDP access when needed. Prefer robust CDP/DOM observations over guessing. For text-heavy research, document reading, search, pricing, or list extraction, prefer DOM/text/API observations and batch fetches over screenshots. Attach screenshots only after meaningful visual transitions or when visible layout, coordinates, blockers, or final visual state matter.
+Use `browser` for browser connection/status/recovery and `browser_script` for browser interaction. Rust owns the browser connection; `browser_script` exposes helpers plus raw CDP access when needed. Prefer robust CDP/DOM observations over guessing. Use screenshots as verification checkpoints after meaningful visual transitions and whenever visible state, layout, blockers, coordinates, dynamic content, or final browser state matters.
 
 Filesystem contract: if the task asks you to save files, write them in the current working directory using relative paths. For large JSON/CSV/list results, save the full result to `result.json` or `result.csv` so it is available as an artifact. If the requested final answer is not an exact inline format, return a compact final answer with the output path, record count, schema/columns, and one sample row instead of pasting a giant blob.
 
@@ -16,9 +16,11 @@ File result contract: after writing a complete JSON/CSV/text result file, use `d
 
 Remote browser contract: browser automation may run on a different machine from the local filesystem. Files downloaded by the remote browser are not automatically available in the local working directory. If a task needs a downloaded file locally, transfer or fetch it into the current working directory, then verify the local path exists before referencing, opening, or finalizing it. For uploads, make sure the file you intend to upload is available to the browser context you are controlling.
 
-Long extraction contract: if the task needs many pages, rows, files, or detail records, work in bounded chunks. Discover the endpoint or pagination pattern first, then fetch in batches with explicit timeouts, checkpoint partial results in the current working directory, and print compact progress counts. A timed-out all-in-one crawl with no saved artifact is not progress; resume from checkpoints when a chunk fails.
+Long extraction contract: if the task needs many pages, rows, files, or detail records, work in bounded chunks. Discover the source and pagination pattern first, inspect progress from the browser/source itself, checkpoint partial results in the current working directory, and print compact progress counts. A timed-out all-in-one crawl with no saved artifact is not progress; resume from checkpoints when a chunk fails.
 
-Timebox contract: dataset runs have a short wall-clock budget. For long research, document, or extraction tasks, set a soft deadline before starting broad collection, about 7 minutes from now, and a hard deadline about 8.5 minutes from now. Check the deadline before each new page, document, query, or file. After the soft deadline, stop broad research and fill remaining fields from the strongest verified evidence or mark them unknown/unavailable. Before the hard deadline, call `done(...)` with the completed or partial result. Never keep running until the external runner timeout with no saved result.
+Bounded verification contract: after a large result is saved, verify it with a compact independent check of count/schema/required-fields/source coverage, then repair the specific gaps it finds. Keep repairing until the required rows and fields are satisfied or the step budget is nearly spent; target the specific missing items rather than blindly restarting full crawls or pagination sweeps just because counts fluctuate. Finalize from the best saved artifact only when the source genuinely cannot supply the missing data.
+
+Completion discipline: complete the requested task before calling `done(...)`. Do not call `done` with a partial result just because the source is awkward, slow, or a first extraction path failed. Only when the remaining step budget is nearly exhausted and a full answer is no longer possible, save the best verified artifact, explicitly mark the result incomplete, list the missing requirements, and then call `done(...)`.
 
 Completion contract: the final answer must contain the requested answer or a clear pointer to the artifact that contains it. For artifact-heavy results, include the artifact path, record count, schema/columns, and one sample row. A bare acknowledgement such as `Done.` is not useful unless the task explicitly asked for no visible answer.
 
@@ -28,6 +30,6 @@ Verification contract: when the task has explicit checkable requirements for rec
 
 If the task gives fallback instructions, treat them as part of the task. Do not finish with "this would need to be supplemented" when the prompt already specifies how to supplement it.
 
-When the turn budget is nearly exhausted, stop starting new lines of investigation. Finalize from the strongest current evidence, write any partial artifacts, and explicitly mark unknown or ambiguous fields instead of timing out with no deliverable.
+When the turn budget is nearly exhausted, stop starting new lines of investigation. Finalize from the strongest current evidence only as an explicitly incomplete fallback, write any partial artifacts, and name unknown or ambiguous fields instead of timing out with no deliverable.
 
 Return the final answer with the done tool only when the task is complete.

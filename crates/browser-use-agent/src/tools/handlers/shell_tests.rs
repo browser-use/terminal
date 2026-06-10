@@ -96,6 +96,7 @@ async fn exec_command_returns_session_id_and_write_stdin_polls_to_exit() {
                 shell: None,
                 login: None,
                 yield_time_ms: Some(10),
+                timeout_ms: None,
                 max_output_tokens: None,
                 env: HashMap::new(),
                 tty: false,
@@ -131,6 +132,45 @@ async fn exec_command_returns_session_id_and_write_stdin_polls_to_exit() {
 }
 
 #[tokio::test]
+async fn exec_command_timeout_kills_process_group() {
+    let dir = tempfile::tempdir().unwrap();
+    let manager = UnifiedExecManager::deterministic_for_tests();
+    let exec = ExecCommandTool::new(manager);
+    let launch = none_launch();
+    let attempt = none_attempt(&launch);
+    let exec_ctx = ctx_for(dir.path(), "exec_command");
+    let marker = dir.path().join("late.txt");
+
+    let out = exec
+        .run(
+            &ExecCommandRequest {
+                cmd: Some("(sleep 1; printf bad > late.txt) & sleep 5".to_string()),
+                command: None,
+                workdir: None,
+                cwd: None,
+                shell: None,
+                login: None,
+                yield_time_ms: Some(1_000),
+                timeout_ms: Some(100),
+                max_output_tokens: None,
+                env: HashMap::new(),
+                tty: false,
+            },
+            &attempt,
+            &exec_ctx,
+        )
+        .await
+        .expect("exec_command returns timeout snapshot");
+
+    assert!(out.stdout.contains("Process exited with code 124"));
+    tokio::time::sleep(std::time::Duration::from_millis(1_200)).await;
+    assert!(
+        !marker.exists(),
+        "exec_command timeout should kill background children"
+    );
+}
+
+#[tokio::test]
 async fn write_stdin_rejects_non_tty_input() {
     let dir = tempfile::tempdir().unwrap();
     let manager = UnifiedExecManager::deterministic_for_tests();
@@ -151,6 +191,7 @@ async fn write_stdin_rejects_non_tty_input() {
                 shell: None,
                 login: None,
                 yield_time_ms: Some(10),
+                timeout_ms: None,
                 max_output_tokens: None,
                 env: HashMap::new(),
                 tty: false,
@@ -205,6 +246,7 @@ async fn tty_write_stdin_sends_input_and_returns_exit_metadata() {
                 shell: None,
                 login: None,
                 yield_time_ms: Some(10),
+                timeout_ms: None,
                 max_output_tokens: None,
                 env: HashMap::new(),
                 tty: true,
@@ -262,6 +304,7 @@ async fn exec_command_applies_codex_env_defaults() {
                 shell: None,
                 login: None,
                 yield_time_ms: Some(1_000),
+                timeout_ms: None,
                 max_output_tokens: None,
                 env,
                 tty: false,
@@ -300,6 +343,7 @@ async fn exec_command_interruption_preserves_live_session() {
                 shell: None,
                 login: None,
                 yield_time_ms: Some(5_000),
+                timeout_ms: None,
                 max_output_tokens: None,
                 env: HashMap::new(),
                 tty: false,
@@ -371,6 +415,7 @@ async fn exec_command_cancel_returns_live_session_snapshot() {
                 shell: None,
                 login: None,
                 yield_time_ms: Some(30_000),
+                timeout_ms: None,
                 max_output_tokens: None,
                 env: HashMap::new(),
                 tty: false,
@@ -429,6 +474,7 @@ async fn terminate_all_best_effort_kills_managed_processes() {
                 shell: None,
                 login: None,
                 yield_time_ms: Some(250),
+                timeout_ms: None,
                 max_output_tokens: None,
                 env: HashMap::new(),
                 tty: false,
@@ -469,6 +515,7 @@ async fn exec_command_max_output_tokens_truncates_model_output() {
                 shell: None,
                 login: None,
                 yield_time_ms: Some(1_000),
+                timeout_ms: None,
                 max_output_tokens: Some(2),
                 env: HashMap::new(),
                 tty: false,
