@@ -252,7 +252,7 @@ dependencies = [
 
 [[package]]
 name = "browser-use-agent"
-version = "0.1.4"
+version = "0.1.7"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -284,7 +284,7 @@ dependencies = [
 
 [[package]]
 name = "browser-use-browser"
-version = "0.1.4"
+version = "0.1.7"
 dependencies = [
  "anyhow",
  "base64",
@@ -300,7 +300,7 @@ dependencies = [
 
 [[package]]
 name = "browser-use-cli"
-version = "0.1.4"
+version = "0.1.7"
 dependencies = [
  "anyhow",
  "browser-use-agent",
@@ -324,7 +324,7 @@ dependencies = [
 
 [[package]]
 name = "browser-use-llm"
-version = "0.1.4"
+version = "0.1.7"
 dependencies = [
  "base64",
  "bytes",
@@ -339,7 +339,7 @@ dependencies = [
 
 [[package]]
 name = "browser-use-protocol"
-version = "0.1.4"
+version = "0.1.7"
 dependencies = [
  "serde",
  "serde_json",
@@ -347,7 +347,7 @@ dependencies = [
 
 [[package]]
 name = "browser-use-providers"
-version = "0.1.4"
+version = "0.1.7"
 dependencies = [
  "anyhow",
  "base64",
@@ -367,7 +367,7 @@ dependencies = [
 
 [[package]]
 name = "browser-use-python-worker"
-version = "0.1.4"
+version = "0.1.7"
 dependencies = [
  "anyhow",
  "libc",
@@ -378,7 +378,7 @@ dependencies = [
 
 [[package]]
 name = "browser-use-runtime"
-version = "0.1.4"
+version = "0.1.7"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -397,7 +397,7 @@ dependencies = [
 
 [[package]]
 name = "browser-use-secrets"
-version = "0.1.4"
+version = "0.1.7"
 dependencies = [
  "aes-gcm",
  "anyhow",
@@ -412,7 +412,7 @@ dependencies = [
 
 [[package]]
 name = "browser-use-store"
-version = "0.1.4"
+version = "0.1.7"
 dependencies = [
  "anyhow",
  "browser-use-protocol",
@@ -425,7 +425,7 @@ dependencies = [
 
 [[package]]
 name = "browser-use-tui"
-version = "0.1.4"
+version = "0.1.7"
 dependencies = [
  "anyhow",
  "arboard",

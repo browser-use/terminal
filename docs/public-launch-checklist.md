@@ -18,7 +18,7 @@ browser-use
 ```
 
 - [ ] Confirm every launch alias opens the terminal: `browser`, `browser-use`, `browser-use-terminal`, and `but`.
-- [ ] Confirm installed launch aliases automatically update before opening the TUI when a newer release exists.
+- [ ] Confirm installed launch aliases check for a newer release before opening the TUI and show Update now / Skip choices.
 
 - [ ] Run update against the real release path:
 

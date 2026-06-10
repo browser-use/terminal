@@ -81,6 +81,12 @@ pub(crate) struct RecommendedModel {
     pub(crate) provider_model: &'static str,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct ProviderDefaultModel {
+    pub(crate) display: &'static str,
+    pub(crate) provider_model: &'static str,
+}
+
 pub(crate) const RECOMMENDED_MODELS: &[RecommendedModel] = &[
     RecommendedModel {
         display: "GPT-5.5",
@@ -91,6 +97,11 @@ pub(crate) const RECOMMENDED_MODELS: &[RecommendedModel] = &[
         display: "Claude Opus 4.8",
         account: ACCOUNT_ANTHROPIC,
         provider_model: "claude-opus-4-8",
+    },
+    RecommendedModel {
+        display: "Claude Fable 5",
+        account: ACCOUNT_ANTHROPIC,
+        provider_model: "claude-fable-5",
     },
     RecommendedModel {
         display: "Gemini 3.1 Pro",
@@ -111,6 +122,37 @@ pub(crate) fn recommended_models_for_codex_availability(
         }
     }
     models
+}
+
+pub(crate) fn provider_default_model(account: &str) -> Option<ProviderDefaultModel> {
+    Some(match account {
+        ACCOUNT_CODEX | ACCOUNT_OPENAI => ProviderDefaultModel {
+            display: "GPT-5.5",
+            provider_model: "gpt-5.5",
+        },
+        ACCOUNT_ANTHROPIC => ProviderDefaultModel {
+            display: "Claude Opus 4.8",
+            provider_model: "claude-opus-4-8",
+        },
+        ACCOUNT_OPENROUTER => ProviderDefaultModel {
+            display: "Gemini 3.1 Pro",
+            provider_model: "google/gemini-3.1-pro-preview",
+        },
+        ACCOUNT_DEEPSEEK => ProviderDefaultModel {
+            display: "DeepSeek V4 Pro",
+            provider_model: "deepseek-v4-pro",
+        },
+        _ => return None,
+    })
+}
+
+pub(crate) fn provider_default_model_choice(account: &'static str) -> Option<ModelChoice> {
+    let default = provider_default_model(account)?;
+    Some(model_choice_for(
+        account,
+        default.provider_model,
+        default.display,
+    ))
 }
 
 pub(crate) const ACCOUNT_CODEX: &str = "Codex login";
@@ -309,6 +351,14 @@ fn static_external_model_choices() -> Vec<ModelChoice> {
             account: ACCOUNT_ANTHROPIC,
             backend: AgentBackend::Anthropic,
             provider_model: "claude-opus-4-8".to_string(),
+            descriptor: "needs key".to_string(),
+            group: ModelChoiceGroup::BringYourOwnKey,
+        },
+        ModelChoice {
+            display: "Claude Fable 5".to_string(),
+            account: ACCOUNT_ANTHROPIC,
+            backend: AgentBackend::Anthropic,
+            provider_model: "claude-fable-5".to_string(),
             descriptor: "needs key".to_string(),
             group: ModelChoiceGroup::BringYourOwnKey,
         },
@@ -640,5 +690,22 @@ mod tests {
         assert_eq!(models[0].display, "GPT-5.5");
         assert_eq!(models[0].account, ACCOUNT_CODEX);
         assert_eq!(models[0].provider_model, "gpt-5.5");
+    }
+
+    #[test]
+    fn provider_defaults_cover_first_run_accounts() {
+        for (account, provider_model) in [
+            (ACCOUNT_CODEX, "gpt-5.5"),
+            (ACCOUNT_OPENAI, "gpt-5.5"),
+            (ACCOUNT_ANTHROPIC, "claude-opus-4-8"),
+            (ACCOUNT_OPENROUTER, "google/gemini-3.1-pro-preview"),
+            (ACCOUNT_DEEPSEEK, "deepseek-v4-pro"),
+        ] {
+            let default = provider_default_model(account).expect("provider default");
+            assert_eq!(default.provider_model, provider_model);
+            let choice = provider_default_model_choice(account).expect("default choice");
+            assert_eq!(choice.account, account);
+            assert_eq!(choice.provider_model, provider_model);
+        }
     }
 }

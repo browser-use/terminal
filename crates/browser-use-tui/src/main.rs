@@ -130,10 +130,10 @@ use settings::{
     bundled_openrouter_model_ids, display_and_provider_model_for_input,
     display_model_for_provider_model, fallback_model_choices, is_claude_code_account,
     model_choices_for_config, provider_model_choices, provider_model_for_display,
-    recommended_models_for_codex_availability, AgentBackend, ModelChoice, RecommendedModel,
-    ACCOUNT_ANTHROPIC, ACCOUNT_CODEX, ACCOUNT_DEEPSEEK, ACCOUNT_OPENAI, ACCOUNT_OPENROUTER,
-    AUTH_CHOICES, BROWSER_LOCAL_CHROME, BROWSER_USE_CLOUD, BROWSER_USE_CLOUD_API_KEY_ENV,
-    BROWSER_USE_CLOUD_API_KEY_SETTING,
+    recommended_models_for_codex_availability, AgentBackend, ModelChoice, ProviderDefaultModel,
+    RecommendedModel, ACCOUNT_ANTHROPIC, ACCOUNT_CODEX, ACCOUNT_DEEPSEEK, ACCOUNT_OPENAI,
+    ACCOUNT_OPENROUTER, AUTH_CHOICES, BROWSER_LOCAL_CHROME, BROWSER_USE_CLOUD,
+    BROWSER_USE_CLOUD_API_KEY_ENV, BROWSER_USE_CLOUD_API_KEY_SETTING,
 };
 
 const DOUBLE_ESCAPE_STOP_WINDOW: Duration = Duration::from_millis(1500);
@@ -156,6 +156,7 @@ const TYPEWRITER_ERASE_INTERVAL_MS: u64 = 8;
 /// Must be <= the fastest cadence (erase) so fast erasing isn't quantized to a
 /// slower poll rate.
 const TYPEWRITER_TICK_INTERVAL: Duration = Duration::from_millis(8);
+const SETUP_CTA_BLINK_INTERVAL: Duration = Duration::from_millis(520);
 
 /// Synthetic assistant nudge shown when user submits a task with no API key.
 const NO_KEY_NUDGE_TEXT: &str = "It looks like you don't have an API key set up yet. \
@@ -178,6 +179,7 @@ const REEXEC_SESSION_ENV: &str = "BUT_REEXEC_SESSION_ID";
 const BROWSER_USE_CLOUD_API_KEY_ID_SETTING: &str = "auth.browser_use_cloud.api_key_id";
 const BROWSER_USE_CLOUD_API_KEY_SOURCE_SETTING: &str = "auth.browser_use_cloud.api_key_source";
 const BROWSER_USE_CLOUD_API_KEY_PROJECT_SETTING: &str = "auth.browser_use_cloud.project_id";
+const BROWSER_USE_CLOUD_API_KEY_PROJECT_NAME_SETTING: &str = "auth.browser_use_cloud.project_name";
 const BROWSER_USE_CLOUD_API_KEY_EXPIRES_SETTING: &str = "auth.browser_use_cloud.expires_at";
 const BROWSER_USE_CLOUD_API_KEY_SCOPES_SETTING: &str = "auth.browser_use_cloud.scopes";
 const BROWSER_PREFERENCE_MODE_SETTING: &str = "browser.preference.mode";
@@ -362,6 +364,7 @@ enum ModelSearchEntry {
 struct ProviderRow {
     label: String,
     account: &'static str,
+    default_model: ProviderDefaultModel,
 }
 
 /// The OpenAI auth methods shown in the sub-dialogue.
@@ -489,8 +492,19 @@ struct BrowserUseCloudCredential {
     api_key: String,
     api_key_id: String,
     project_id: String,
+    project_name: Option<String>,
     expires_at: Option<String>,
     scopes: Vec<String>,
+}
+
+fn browser_use_cloud_connected_message(credential: &BrowserUseCloudCredential) -> String {
+    credential
+        .project_name
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(|project_name| format!("Connected to Browser Use Cloud project {project_name}."))
+        .unwrap_or_else(|| "Connected to Browser Use Cloud.".to_string())
 }
 
 #[derive(Debug)]
@@ -1385,6 +1399,8 @@ struct App {
     surface: Surface,
     selected_row: usize,
     setup_complete: bool,
+    setup_started: bool,
+    setup_cta_caret_visible: bool,
     account: String,
     model: String,
     model_configured: bool,
@@ -2181,6 +2197,27 @@ fn model_source_for_account(account: &str) -> Option<ModelSource> {
     })
 }
 
+const ANTHROPIC_FABLE_MODEL_ID: &str = "claude-fable-5";
+
+fn append_local_provider_models(source: ModelSource, models: &mut Vec<ProviderModel>) -> bool {
+    if source != ModelSource::Anthropic
+        || models
+            .iter()
+            .any(|model| model.id == ANTHROPIC_FABLE_MODEL_ID)
+    {
+        return false;
+    }
+
+    models.push(ProviderModel {
+        id: ANTHROPIC_FABLE_MODEL_ID.to_string(),
+        name: Some("Claude Fable 5".to_string()),
+        vision: false,
+        supports_tools: None,
+    });
+    models.sort_by(|left, right| left.id.cmp(&right.id));
+    true
+}
+
 fn default_provider_model_for_backend(
     backend: AgentBackend,
     current_dir: &Path,
@@ -2458,6 +2495,8 @@ impl App {
             surface,
             selected_row,
             setup_complete,
+            setup_started: false,
+            setup_cta_caret_visible: true,
             account,
             model,
             model_configured,
@@ -2694,7 +2733,7 @@ impl App {
                             self.show_setup_result(
                                 SetupResultKind::Success,
                                 account,
-                                "Connected with Codex auth.".to_string(),
+                                "Connected with Codex OAuth.".to_string(),
                             );
                         }
                         Err(error) => {
@@ -2727,6 +2766,12 @@ impl App {
                     authorization,
                     browser_open_error,
                 } => {
+                    self.track_onboarding_event(
+                        "bu:tui onboarding cloud auth browser opened",
+                        serde_json::json!({
+                            "browser_open_error": browser_open_error.is_some(),
+                        }),
+                    );
                     if let Some(flow) = self.browser_use_cloud_login.as_mut() {
                         flow.authorization = Some(authorization);
                         flow.browser_open_error = browser_open_error;
@@ -2744,6 +2789,12 @@ impl App {
                             self.complete_browser_use_cloud_device_auth(&credential)?;
                         }
                         Err(error) => {
+                            self.track_onboarding_event(
+                                "bu:tui onboarding cloud auth failed",
+                                serde_json::json!({
+                                    "failure_kind": "authorization_failed",
+                                }),
+                            );
                             self.show_setup_result(
                                 SetupResultKind::Failure,
                                 account,
@@ -2871,6 +2922,12 @@ impl App {
                             self.cookie_sync.status = CookieSyncStatus::Failed(format!(
                                 "Cookie sync completed, but the Cloud profile could not be saved: {error:#}"
                             ));
+                            self.track_onboarding_event(
+                                "bu:tui cookie sync failed",
+                                serde_json::json!({
+                                    "failure_kind": "profile_save_failed",
+                                }),
+                            );
                             return;
                         }
                     }
@@ -2878,9 +2935,47 @@ impl App {
                         cookie_sync_result_status(&value).unwrap_or_else(|| {
                             CookieSyncStatus::Failed("Unexpected cookie sync response.".to_string())
                         });
+                    match &self.cookie_sync.status {
+                        CookieSyncStatus::Completed(_) => {
+                            self.track_onboarding_event(
+                                "bu:tui cookie sync completed",
+                                cookie_sync_result_analytics(&value),
+                            );
+                        }
+                        CookieSyncStatus::NeedsAuth => {
+                            self.track_onboarding_event(
+                                "bu:tui cookie sync failed",
+                                serde_json::json!({
+                                    "failure_kind": "needs_auth",
+                                    "reported_status": "needs-auth",
+                                }),
+                            );
+                        }
+                        CookieSyncStatus::Failed(_) => {
+                            self.track_onboarding_event(
+                                "bu:tui cookie sync failed",
+                                serde_json::json!({
+                                    "failure_kind": "failed_status",
+                                    "reported_status": value
+                                        .get("status")
+                                        .and_then(serde_json::Value::as_str)
+                                        .unwrap_or("unknown"),
+                                }),
+                            );
+                        }
+                        CookieSyncStatus::LoadingProfiles
+                        | CookieSyncStatus::Ready
+                        | CookieSyncStatus::Syncing => {}
+                    }
                 }
             },
             Err(error) => {
+                self.track_onboarding_event(
+                    "bu:tui cookie sync failed",
+                    serde_json::json!({
+                        "failure_kind": cookie_sync_error_kind(&error),
+                    }),
+                );
                 self.cookie_sync.status = CookieSyncStatus::Failed(error);
             }
         }
@@ -2891,10 +2986,27 @@ impl App {
             Some("needs-auth") => {
                 self.cookie_sync.status = CookieSyncStatus::NeedsAuth;
                 self.cookie_sync.profiles.clear();
+                self.track_onboarding_event(
+                    "bu:tui cookie sync profile load failed",
+                    serde_json::json!({
+                        "failure_kind": "needs_auth",
+                        "reported_status": "needs-auth",
+                    }),
+                );
             }
             Some("needs-user-action") | Some("ok") => {
                 self.cookie_sync.profiles = cookie_sync_profiles_from_value(&value);
                 self.cookie_sync.status = CookieSyncStatus::Ready;
+                self.track_onboarding_event(
+                    "bu:tui cookie sync profile load completed",
+                    serde_json::json!({
+                        "profiles_count": self.cookie_sync.profiles.len(),
+                        "reported_status": value
+                            .get("status")
+                            .and_then(serde_json::Value::as_str)
+                            .unwrap_or("ok"),
+                    }),
+                );
             }
             Some("failed") => {
                 let error = value
@@ -2903,10 +3015,27 @@ impl App {
                     .unwrap_or("Cookie sync profile scan failed")
                     .to_string();
                 self.cookie_sync.status = CookieSyncStatus::Failed(error);
+                self.track_onboarding_event(
+                    "bu:tui cookie sync profile load failed",
+                    serde_json::json!({
+                        "failure_kind": "failed_status",
+                        "reported_status": "failed",
+                    }),
+                );
             }
             _ => {
                 self.cookie_sync.status =
                     CookieSyncStatus::Failed("Unexpected cookie sync response.".to_string());
+                self.track_onboarding_event(
+                    "bu:tui cookie sync profile load failed",
+                    serde_json::json!({
+                        "failure_kind": "unexpected_response",
+                        "reported_status": value
+                            .get("status")
+                            .and_then(serde_json::Value::as_str)
+                            .unwrap_or("missing"),
+                    }),
+                );
             }
         }
     }
@@ -3707,6 +3836,9 @@ impl App {
 
     fn open_surface(&mut self, surface: Surface) {
         self.close_slash_palette();
+        if surface == Surface::Setup {
+            self.setup_started = true;
+        }
         self.surface = surface;
         // Open the model picker on the currently active model
         self.selected_row = match surface {
@@ -3778,18 +3910,26 @@ impl App {
             ProviderRow {
                 label: "OpenAI".to_string(),
                 account: ACCOUNT_OPENAI,
+                default_model: settings::provider_default_model(ACCOUNT_OPENAI)
+                    .expect("OpenAI provider default model"),
             },
             ProviderRow {
                 label: "Anthropic".to_string(),
                 account: ACCOUNT_ANTHROPIC,
+                default_model: settings::provider_default_model(ACCOUNT_ANTHROPIC)
+                    .expect("Anthropic provider default model"),
             },
             ProviderRow {
                 label: "OpenRouter".to_string(),
                 account: ACCOUNT_OPENROUTER,
+                default_model: settings::provider_default_model(ACCOUNT_OPENROUTER)
+                    .expect("OpenRouter provider default model"),
             },
             ProviderRow {
                 label: "DeepSeek".to_string(),
                 account: ACCOUNT_DEEPSEEK,
+                default_model: settings::provider_default_model(ACCOUNT_DEEPSEEK)
+                    .expect("DeepSeek provider default model"),
             },
         ]
     }
@@ -4136,8 +4276,12 @@ impl App {
             return;
         }
         if let Some(dir) = browser_use_terminal_home_dir() {
-            if let Some((models, _fresh)) = load_cached_provider_models(&dir, source) {
+            if let Some((mut models, fresh)) = load_cached_provider_models(&dir, source) {
+                let appended = append_local_provider_models(source, &mut models);
                 if !models.is_empty() {
+                    if fresh && appended {
+                        let _ = save_cached_provider_models(&dir, source, &models);
+                    }
                     self.provider_models = models;
                     return;
                 }
@@ -4174,7 +4318,8 @@ impl App {
         let credential = self.get_provider_credential(account);
         let (tx, rx) = mpsc::channel();
         std::thread::spawn(move || {
-            if let Ok(models) = fetch_provider_models(source, credential) {
+            if let Ok(mut models) = fetch_provider_models(source, credential) {
+                append_local_provider_models(source, &mut models);
                 let _ = tx.send((source, models));
             }
         });
@@ -4547,7 +4692,8 @@ impl App {
         // resolve files the user references and to scope prompt history
         let cwd = std::env::current_dir()?;
         let session = self.store.create_session_in_artifact_root(None)?;
-        self.append_session_model_selection(&session.id, &self.current_model_selection())?;
+        let selection = self.current_model_selection();
+        self.append_session_model_selection(&session.id, &selection)?;
         self.append_current_session_runtime_settings(&session.id)?;
         // Record the user's task as the standard input event (preserved for retry).
         let input_record = self.store.append_event(
@@ -4565,6 +4711,7 @@ impl App {
             input_record.seq,
             &submission.text,
             product_analytics::BLOCKED_REASON_NO_AUTH,
+            analytics_model_for_selection(&selection),
         );
         // Inject the nudge as a non-terminal assistant-style message so the
         // transcript renders it without marking the session completed/done.
@@ -4729,6 +4876,7 @@ impl App {
             AppCommand::SaveAuth(secret) => self.save_auth(secret)?,
             AppCommand::SaveTelemetry(secret) => self.save_telemetry(secret)?,
             AppCommand::OpenFeedback => {
+                self.track_feedback_opened();
                 self.feedback = FeedbackState::default();
                 self.open_surface(Surface::Feedback);
             }
@@ -4766,6 +4914,7 @@ impl App {
             product_analytics::MESSAGE_KIND_INITIAL,
             input_record.seq,
             &submission.text,
+            analytics_model_for_selection(&selection),
         );
         self.prompt_history.record_submission(&submission.text);
         self.maybe_append_message_history(&session.id, &submission.text, &cwd, &options);
@@ -4809,6 +4958,8 @@ impl App {
             .store
             .load_session(&session_id)?
             .with_context(|| format!("unknown session id: {session_id}"))?;
+        let analytics_selection = self.session_model_selection_or_current(&session_id)?;
+        let analytics_model = analytics_model_for_selection(&analytics_selection);
         let options = self.configured_agent_options().ok();
         if let Some(options) = options.as_ref() {
             let _ = self.refresh_prompt_history_for(Path::new(&session.cwd), options);
@@ -4855,6 +5006,7 @@ impl App {
                         product_analytics::MESSAGE_KIND_FOLLOWUP,
                         followup_record.seq,
                         &submission.text,
+                        analytics_model,
                     );
                     self.prompt_history.record_submission(&submission.text);
                     if let Some(options) = options.as_ref() {
@@ -4893,6 +5045,7 @@ impl App {
                         product_analytics::MESSAGE_KIND_FOLLOWUP,
                         fallback_record.seq,
                         &submission.text,
+                        analytics_model,
                     );
                     self.prompt_history.record_submission(&submission.text);
                     if let Some(options) = options.as_ref() {
@@ -4926,6 +5079,7 @@ impl App {
             product_analytics::MESSAGE_KIND_FOLLOWUP,
             followup_record.seq,
             &submission.text,
+            analytics_model,
         );
         self.prompt_history.record_submission(&submission.text);
         if let Some(options) = options.as_ref() {
@@ -4968,6 +5122,7 @@ impl App {
             product_analytics::MESSAGE_KIND_FOLLOWUP,
             followup_record.seq,
             &submission.text,
+            analytics_model_for_selection(&self.session_model_selection_or_current(&session_id)?),
         );
         self.prompt_history.record_submission(&submission.text);
         if let Ok(Some(options)) = self.configured_agent_options().map(Some) {
@@ -5548,6 +5703,14 @@ impl App {
             }
             KeyEvent {
                 code: KeyCode::Esc, ..
+            } if self.is_first_run_setup_visible()? && self.setup_started => {
+                self.escape_stop_until = None;
+                self.setup_started = false;
+                self.setup_cta_caret_visible = true;
+                self.selected_row = 0;
+            }
+            KeyEvent {
+                code: KeyCode::Esc, ..
             } if self.surface == Surface::Main => self.handle_main_escape()?,
             // History: first Esc clears the live filter; a second Esc (with the
             // filter already empty) closes the popup like every other surface.
@@ -6001,6 +6164,18 @@ impl App {
             && self.surface == Surface::CookieSync
     }
 
+    fn should_animate_setup_cta(&self) -> bool {
+        !self.setup_complete
+            && !self.setup_started
+            && self.surface == Surface::Main
+            && self.selected_session_id.is_none()
+            && self.composer.is_empty()
+    }
+
+    fn tick_setup_cta(&mut self) {
+        self.setup_cta_caret_visible = !self.setup_cta_caret_visible;
+    }
+
     /// True when the centered welcome screen is showing — drives the
     /// animation-tick redraw so the BU logo can spin while idle.
     fn is_welcome_surface(&self) -> bool {
@@ -6263,6 +6438,17 @@ impl App {
     }
 
     fn execute_first_run_setup_selection(&mut self) -> Result<()> {
+        if !self.setup_started {
+            self.setup_started = true;
+            self.selected_row = 0;
+            self.track_onboarding_event(
+                "bu:tui onboarding provider list opened",
+                serde_json::json!({
+                    "source": "welcome_cta",
+                }),
+            );
+            return Ok(());
+        }
         let choices = self.setup_account_choices()?;
         let Some(account) = choices
             .get(self.selected_row.min(choices.len().saturating_sub(1)))
@@ -6271,6 +6457,13 @@ impl App {
             return Ok(());
         };
         let account = account.to_string();
+        self.track_onboarding_event(
+            "bu:tui onboarding provider selected",
+            serde_json::json!({
+                "selected_provider": account_kind(&account),
+                "selected_provider_kind": analytics_provider_kind_for_account(&account),
+            }),
+        );
         self.setup_pending_account = Some(account);
         self.setup_result = None;
         self.open_surface(Surface::SetupConfirm);
@@ -6295,7 +6488,7 @@ impl App {
                 self.show_setup_result(
                     SetupResultKind::Success,
                     account,
-                    "Connected with Codex auth.".to_string(),
+                    "Connected with Codex OAuth.".to_string(),
                 );
             } else {
                 self.start_codex_auth(account)?;
@@ -6386,10 +6579,24 @@ impl App {
     }
 
     fn start_setup_cloud_onboarding(&mut self) -> Result<()> {
+        let has_existing_cloud_key = self.browser_use_cloud_key_ready()?;
+        self.track_onboarding_event(
+            "bu:tui onboarding cloud selected",
+            serde_json::json!({
+                "has_existing_cloud_key": has_existing_cloud_key,
+            }),
+        );
         self.pending_setup_after_cookie_sync = true;
         self.pending_cookie_sync_after_auth = true;
-        if self.browser_use_cloud_key_ready()? {
+        if has_existing_cloud_key {
             self.select_browser_use_cloud()?;
+            self.track_onboarding_event(
+                "bu:tui onboarding cloud auth succeeded",
+                serde_json::json!({
+                    "method": "existing_key",
+                    "return_to_cookie_sync": true,
+                }),
+            );
             self.show_setup_cloud_success();
             return Ok(());
         }
@@ -6397,11 +6604,17 @@ impl App {
     }
 
     fn decline_setup_cloud_onboarding(&mut self) -> Result<()> {
+        self.track_onboarding_event(
+            "bu:tui onboarding cloud skipped",
+            serde_json::json!({
+                "reason": "user_selected_local_chrome",
+            }),
+        );
         self.pending_setup_after_cookie_sync = false;
         self.pending_cookie_sync_after_auth = false;
         self.select_local_chrome()?;
         self.status_notice = None;
-        self.open_setup_model_selection()
+        self.finish_first_run_setup_with_default_model(None)
     }
 
     fn start_codex_auth(&mut self, account: String) -> Result<()> {
@@ -6420,6 +6633,12 @@ impl App {
     }
 
     fn show_setup_cloud_success(&mut self) {
+        self.track_onboarding_event(
+            "bu:tui onboarding cookie sync offered",
+            serde_json::json!({
+                "has_cloud_key": true,
+            }),
+        );
         self.setup_result = None;
         self.setup_pending_account = None;
         self.status_notice = None;
@@ -6427,6 +6646,10 @@ impl App {
     }
 
     fn continue_after_setup_cloud_success(&mut self) -> Result<()> {
+        self.track_onboarding_event(
+            "bu:tui onboarding cookie sync selected",
+            serde_json::json!({}),
+        );
         self.open_cookie_sync()
     }
 
@@ -6438,11 +6661,21 @@ impl App {
     }
 
     fn skip_setup_cookie_sync_after_cloud_auth(&mut self) -> Result<()> {
+        self.track_onboarding_event(
+            "bu:tui onboarding cookie sync skipped",
+            serde_json::json!({
+                "reason": "user_selected_skip",
+            }),
+        );
         self.pending_cookie_sync_after_auth = false;
         if self.pending_setup_after_cookie_sync {
             self.pending_setup_after_cookie_sync = false;
             self.status_notice = None;
-            return self.open_setup_model_selection();
+            if !self.setup_complete {
+                return self.finish_first_run_setup_with_default_model(None);
+            }
+            self.close_surface();
+            return Ok(());
         }
         self.status_notice = None;
         self.close_surface();
@@ -6452,13 +6685,18 @@ impl App {
     fn continue_after_setup_success(&mut self, account: String) -> Result<()> {
         self.setup_result = None;
         self.setup_pending_account = None;
+        if account == BROWSER_USE_CLOUD && self.setup_complete {
+            self.status_notice = Some("Browser Use Cloud connected.".to_string());
+            self.close_surface();
+            return Ok(());
+        }
         self.account = account;
         if let Some(choice) = self.pending_model_after_auth.take() {
             return self.save_model_with_choice(choice);
         }
         if !self.setup_complete {
             self.status_notice = None;
-            self.open_surface(Surface::SetupCloud);
+            self.open_setup_cloud_offer("after_provider_auth");
             return Ok(());
         }
         self.advance_after_auth()
@@ -6468,6 +6706,20 @@ impl App {
         self.pending_model_search_after_auth = false;
         let account = self.account.clone();
         self.open_provider_model_search(&account)
+    }
+
+    fn finish_first_run_setup_with_default_model(&mut self, notice: Option<String>) -> Result<()> {
+        let Some(account) = account_static(&self.account) else {
+            return self.open_setup_model_selection();
+        };
+        let Some(choice) = settings::provider_default_model_choice(account) else {
+            return self.open_setup_model_selection();
+        };
+        self.save_model_with_choice(choice)?;
+        if self.setup_complete {
+            self.status_notice = notice;
+        }
+        Ok(())
     }
 
     /// If a nudge session is waiting for auth, start its agent and navigate to
@@ -7351,7 +7603,10 @@ impl App {
         // Home-screen feedback has no run context, so leave it null instead of
         // recording the default selection.
         let model = if session_id.is_some() {
-            let sel = self.current_model_selection();
+            let sel = session_id
+                .as_deref()
+                .and_then(|id| self.session_model_selection_or_current(id).ok())
+                .unwrap_or_else(|| self.current_model_selection());
             if sel.provider_model.is_empty() {
                 None
             } else {
@@ -7377,6 +7632,12 @@ impl App {
             "model": model,
             "install_id": install_id,
         });
+        self.track_feedback_submitted(
+            category,
+            include_logs,
+            description.is_some(),
+            session_id.as_deref(),
+        );
 
         let (tx, rx) = tokio::sync::mpsc::channel(1);
         self.feedback_rx = Some(rx);
@@ -7492,7 +7753,10 @@ impl App {
     }
 
     fn default_model_for_account(&self, account: &str) -> Option<usize> {
-        self.models_for_account(account).into_iter().next()
+        let default = settings::provider_default_model(account)?;
+        self.model_choices.iter().position(|choice| {
+            choice.account == account && choice.provider_model == default.provider_model
+        })
     }
 
     fn advance_after_auth(&mut self) -> Result<()> {
@@ -7502,7 +7766,7 @@ impl App {
         // front.
         if !self.setup_complete {
             self.status_notice = None;
-            self.open_surface(Surface::SetupCloud);
+            self.open_setup_cloud_offer("after_provider_auth");
             return Ok(());
         }
         if self.pending_model_search_after_auth {
@@ -7511,6 +7775,14 @@ impl App {
             return self.open_provider_model_search(&account);
         }
         if let Some(index) = self.default_model_for_account(&self.account) {
+            return self.save_model(index);
+        }
+        if let Some(account) = account_static(&self.account) {
+            if let Some(choice) = settings::provider_default_model_choice(account) {
+                return self.save_model_with_choice(choice);
+            }
+        }
+        if let Some(index) = self.models_for_account(&self.account).into_iter().next() {
             return self.save_model(index);
         }
         self.selected_row = 0;
@@ -8246,15 +8518,16 @@ impl App {
         self.default_profile.browsers.clone()
     }
 
-    fn browser_select_local_browser_count(&self) -> usize {
+    #[cfg(test)]
+    fn browser_select_cloud_index(&self) -> usize {
         self.browser_select_rows()
-            .into_iter()
-            .take_while(|row| !matches!(row, BrowserSelectRow::Cloud))
-            .count()
+            .iter()
+            .position(|row| matches!(row, BrowserSelectRow::Cloud))
+            .unwrap_or(0)
     }
 
     pub(crate) fn browser_select_rows(&self) -> Vec<BrowserSelectRow> {
-        let mut rows = Vec::new();
+        let mut rows = vec![BrowserSelectRow::Cloud];
         match &self.default_profile.status {
             DefaultProfileStatus::Ready => {
                 for browser in self.browser_select_local_browsers() {
@@ -8268,7 +8541,6 @@ impl App {
             }
             DefaultProfileStatus::Loading | DefaultProfileStatus::Failed(_) => {}
         }
-        rows.push(BrowserSelectRow::Cloud);
         rows
     }
 
@@ -8450,9 +8722,21 @@ impl App {
         self.api_key_account = None;
         self.composer.clear();
         self.browser_use_cloud_login = None;
+        self.track_onboarding_event(
+            "bu:tui onboarding cloud auth started",
+            serde_json::json!({
+                "return_to_cookie_sync": self.pending_cookie_sync_after_auth,
+            }),
+        );
         let flow = match start_browser_use_cloud_login_flow(account.clone()) {
             Ok(flow) => flow,
             Err(error) => {
+                self.track_onboarding_event(
+                    "bu:tui onboarding cloud auth failed",
+                    serde_json::json!({
+                        "failure_kind": "start_failed",
+                    }),
+                );
                 self.show_setup_result(
                     SetupResultKind::Failure,
                     account,
@@ -8670,6 +8954,18 @@ impl App {
                 BROWSER_USE_CLOUD_API_KEY_PROJECT_SETTING,
                 &credential.project_id,
             )?;
+            if let Some(project_name) = credential
+                .project_name
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+            {
+                self.store
+                    .set_setting(BROWSER_USE_CLOUD_API_KEY_PROJECT_NAME_SETTING, project_name)?;
+            } else {
+                self.store
+                    .delete_setting(BROWSER_USE_CLOUD_API_KEY_PROJECT_NAME_SETTING)?;
+            }
             if let Some(expires_at) = credential.expires_at.as_deref() {
                 self.store
                     .set_setting(BROWSER_USE_CLOUD_API_KEY_EXPIRES_SETTING, expires_at)?;
@@ -8689,6 +8985,8 @@ impl App {
             self.store
                 .delete_setting(BROWSER_USE_CLOUD_API_KEY_PROJECT_SETTING)?;
             self.store
+                .delete_setting(BROWSER_USE_CLOUD_API_KEY_PROJECT_NAME_SETTING)?;
+            self.store
                 .delete_setting(BROWSER_USE_CLOUD_API_KEY_EXPIRES_SETTING)?;
             self.store
                 .delete_setting(BROWSER_USE_CLOUD_API_KEY_SCOPES_SETTING)?;
@@ -8705,6 +9003,20 @@ impl App {
         self.select_browser_use_cloud()?;
         self.api_key_account = None;
         self.pending_cookie_sync_after_auth = false;
+        self.track_onboarding_event(
+            "bu:tui onboarding cloud auth succeeded",
+            serde_json::json!({
+                "method": "device_login",
+                "return_to_cookie_sync": return_to_cookie_sync,
+                "project_present": !credential.project_id.trim().is_empty(),
+                "project_name_present": credential
+                    .project_name
+                    .as_deref()
+                    .map(str::trim)
+                    .is_some_and(|value| !value.is_empty()),
+                "scopes_count": credential.scopes.len(),
+            }),
+        );
         if return_to_cookie_sync {
             self.show_setup_cloud_success();
             return Ok(());
@@ -8712,10 +9024,7 @@ impl App {
         self.show_setup_result(
             SetupResultKind::Success,
             BROWSER_USE_CLOUD.to_string(),
-            format!(
-                "Connected Browser Use Cloud project {}.",
-                credential.project_id
-            ),
+            browser_use_cloud_connected_message(credential),
         );
         self.maybe_resume_pending_nudge_session()?;
         Ok(())
@@ -8730,6 +9039,9 @@ impl App {
     }
 
     fn setup_row_count(&self) -> usize {
+        if !self.setup_started {
+            return 1;
+        }
         self.setup_account_choices()
             .map(|choices| choices.len())
             .unwrap_or_else(|_| AUTH_CHOICES.len().saturating_sub(1))
@@ -8805,6 +9117,7 @@ impl App {
     fn open_cookie_sync(&mut self) -> Result<()> {
         self.open_surface(Surface::CookieSync);
         self.status_notice = None;
+        self.track_onboarding_event("bu:tui cookie sync opened", serde_json::json!({}));
         self.start_cookie_sync_profile_load()
     }
 
@@ -8941,21 +9254,15 @@ impl App {
         if self.browser != settings::BROWSER_LOCAL_CHROME {
             return self.browser.clone();
         }
-        match (
-            self.browser_local_label.as_deref(),
-            self.browser_profile_label.as_deref(),
-        ) {
-            (Some(browser), Some(profile)) => format!(
-                "{} · {} · {}",
-                self.browser,
-                browser,
-                concise_profile_label(profile)
-            ),
-            (Some(browser), None) => format!("{} · {}", self.browser, browser),
-            (None, Some(profile)) => {
-                format!("{} · {}", self.browser, concise_profile_label(profile))
-            }
-            (None, None) => self.browser.clone(),
+        let profile = self
+            .browser_profile_label
+            .as_deref()
+            .map(concise_profile_label)
+            .filter(|label| !label.is_empty());
+        if let Some(profile) = profile {
+            format!("{} · {}", self.browser, profile)
+        } else {
+            self.browser.clone()
         }
     }
 
@@ -9008,8 +9315,19 @@ impl App {
             self.cookie_sync.profiles.clear();
             self.cookie_sync.selected_profile_label = None;
             self.cookie_sync.rx = None;
+            self.track_onboarding_event(
+                "bu:tui cookie sync profile load failed",
+                serde_json::json!({
+                    "failure_kind": "needs_auth",
+                    "reported_status": "missing_api_key",
+                }),
+            );
             return Ok(());
         };
+        self.track_onboarding_event(
+            "bu:tui cookie sync profile load started",
+            serde_json::json!({}),
+        );
         self.cookie_sync.status = CookieSyncStatus::LoadingProfiles;
         self.cookie_sync.profiles.clear();
         self.cookie_sync.selected_profile_label = None;
@@ -9038,7 +9356,12 @@ impl App {
             self.pending_setup_after_cookie_sync = false;
             self.pending_cookie_sync_after_auth = false;
             self.status_notice = notice;
-            return self.open_setup_model_selection();
+            if !self.setup_complete {
+                let notice = self.status_notice.take();
+                return self.finish_first_run_setup_with_default_model(notice);
+            }
+            self.close_surface();
+            return Ok(());
         }
         self.close_surface();
         Ok(())
@@ -9061,14 +9384,33 @@ impl App {
         else {
             self.cookie_sync.status =
                 CookieSyncStatus::Failed("No local Chromium profiles found.".to_string());
+            self.track_onboarding_event(
+                "bu:tui cookie sync failed",
+                serde_json::json!({
+                    "failure_kind": "no_profiles",
+                }),
+            );
             return Ok(());
         };
         let Some(api_key) = self.browser_use_cloud_api_key_value()? else {
             self.cookie_sync.status = CookieSyncStatus::NeedsAuth;
+            self.track_onboarding_event(
+                "bu:tui cookie sync failed",
+                serde_json::json!({
+                    "failure_kind": "needs_auth",
+                }),
+            );
             return Ok(());
         };
         self.cookie_sync.status = CookieSyncStatus::Syncing;
         self.cookie_sync.selected_profile_label = Some(profile.display_name.clone());
+        self.track_onboarding_event(
+            "bu:tui cookie sync started",
+            serde_json::json!({
+                "selected_profile_browser": profile_browser_kind(&profile.browser_name),
+                "profiles_count": self.cookie_sync.profiles.len(),
+            }),
+        );
         let command = format!(
             "browser profile sync --profile {} --all-cookies",
             browser_shell_quote_arg(&profile.id)
@@ -9104,21 +9446,59 @@ impl App {
         Ok(())
     }
 
+    fn open_setup_cloud_offer(&mut self, source: &'static str) {
+        let has_existing_cloud_key = self.browser_use_cloud_key_ready().unwrap_or(false);
+        self.track_onboarding_event(
+            "bu:tui onboarding cloud offered",
+            serde_json::json!({
+                "source": source,
+                "has_existing_cloud_key": has_existing_cloud_key,
+            }),
+        );
+        self.open_surface(Surface::SetupCloud);
+    }
+
+    fn track_onboarding_event(&self, event: &'static str, extra: serde_json::Value) {
+        if cfg!(test) {
+            return;
+        }
+        let selection = self.current_model_selection();
+        let mut properties = serde_json::json!({
+            "surface": "tui",
+            "setup_flow": !self.setup_complete || self.pending_setup_after_cookie_sync,
+            "setup_complete": self.setup_complete,
+            "provider_kind": analytics_provider_kind_for_account(&self.account),
+            "provider": account_kind(&self.account),
+            "browser_kind": browser_choice_kind(&self.browser),
+        });
+        product_analytics::append_model_analytics(
+            &mut properties,
+            analytics_model_for_selection(&selection),
+        );
+        merge_json_object(&mut properties, extra);
+        product_analytics::capture_async(&self.store, event, properties);
+    }
+
     fn complete_setup(&mut self) -> Result<()> {
         self.setup_complete = true;
+        self.setup_started = false;
+        self.setup_cta_caret_visible = true;
         self.store.set_setting("setup.complete", "1")?;
         if cfg!(test) {
             return Ok(());
         }
-        product_analytics::capture_async(
-            &self.store,
-            "bu:tui setup completed",
-            serde_json::json!({
-                "surface": "tui",
-                "provider_kind": account_kind(&self.account),
-                "browser_kind": browser_choice_kind(&self.browser),
-            }),
+        let selection = self.current_model_selection();
+        let mut properties = serde_json::json!({
+            "surface": "tui",
+            "provider_kind": analytics_provider_kind_for_account(&self.account),
+            "provider": account_kind(&self.account),
+            "browser_kind": browser_choice_kind(&self.browser),
+        });
+        product_analytics::append_model_analytics(
+            &mut properties,
+            analytics_model_for_selection(&selection),
         );
+        product_analytics::capture_async(&self.store, "bu:tui setup completed", properties);
         Ok(())
     }
 
@@ -9126,31 +9506,48 @@ impl App {
         if cfg!(test) {
             return;
         }
-        product_analytics::capture_async(
-            &self.store,
-            "bu:tui app opened",
-            serde_json::json!({
-                "surface": "tui",
-                "provider_kind": account_kind(&self.account),
-                "browser_kind": browser_choice_kind(&self.browser),
-                "setup_complete": self.setup_complete,
-            }),
+        let selection = self.current_model_selection();
+        let mut properties = serde_json::json!({
+            "surface": "tui",
+            "provider_kind": analytics_provider_kind_for_account(&self.account),
+            "provider": account_kind(&self.account),
+            "browser_kind": browser_choice_kind(&self.browser),
+            "setup_complete": self.setup_complete,
+        });
+        product_analytics::append_model_analytics(
+            &mut properties,
+            analytics_model_for_selection(&selection),
         );
+        product_analytics::capture_async(&self.store, "bu:tui app opened", properties);
+        if !self.setup_complete {
+            product_analytics::capture_async(
+                &self.store,
+                "bu:tui onboarding started",
+                serde_json::json!({
+                    "surface": "tui",
+                    "provider_kind": analytics_provider_kind_for_account(&self.account),
+                    "provider": account_kind(&self.account),
+                    "browser_kind": browser_choice_kind(&self.browser),
+                }),
+            );
+        }
     }
 
     fn track_model_selected(&self) {
         if cfg!(test) {
             return;
         }
-        product_analytics::capture_async(
-            &self.store,
-            "bu:tui model selected",
-            serde_json::json!({
-                "surface": "tui",
-                "provider_kind": account_kind(&self.account),
-                "model": self.provider_model,
-            }),
+        let selection = self.current_model_selection();
+        let mut properties = serde_json::json!({
+            "surface": "tui",
+            "provider_kind": analytics_provider_kind_for_account(&self.account),
+            "provider": account_kind(&self.account),
+        });
+        product_analytics::append_model_analytics(
+            &mut properties,
+            analytics_model_for_selection(&selection),
         );
+        product_analytics::capture_async(&self.store, "bu:tui model selected", properties);
     }
 
     fn track_browser_selected(&self) {
@@ -9176,9 +9573,53 @@ impl App {
             "bu:tui auth provider selected",
             serde_json::json!({
                 "surface": "tui",
-                "provider_kind": account_kind(account),
+                "provider_kind": analytics_provider_kind_for_account(account),
+                "provider": account_kind(account),
             }),
         );
+    }
+
+    fn track_feedback_opened(&self) {
+        if cfg!(test) {
+            return;
+        }
+        product_analytics::capture_async(
+            &self.store,
+            "bu:tui feedback opened",
+            serde_json::json!({
+                "surface": "tui",
+                "has_session": self.selected_session_id.is_some(),
+            }),
+        );
+    }
+
+    fn track_feedback_submitted(
+        &self,
+        category: FeedbackCategory,
+        include_logs: bool,
+        has_description: bool,
+        session_id: Option<&str>,
+    ) {
+        if cfg!(test) {
+            return;
+        }
+        let mut properties = serde_json::json!({
+            "surface": "tui",
+            "category": category.api_value(),
+            "include_logs": include_logs,
+            "has_description": has_description,
+            "has_session": session_id.is_some(),
+        });
+        if let Some(selection) = session_id
+            .and_then(|id| self.session_model_selection_or_current(id).ok())
+            .or_else(|| session_id.map(|_| self.current_model_selection()))
+        {
+            product_analytics::append_model_analytics(
+                &mut properties,
+                analytics_model_for_selection(&selection),
+            );
+        }
+        product_analytics::capture_async(&self.store, "bu:tui feedback submitted", properties);
     }
 
     fn persist_runtime_settings(&self) -> Result<()> {
@@ -9804,11 +10245,10 @@ fn cookie_sync_profiles_from_value(value: &serde_json::Value) -> Vec<CookieSyncP
 
 fn concise_profile_label(label: &str) -> String {
     let trimmed = label.trim();
-    let without_browser = trimmed.strip_prefix("Google Chrome - ").unwrap_or(trimmed);
-    without_browser
+    trimmed
         .rsplit_once(':')
         .map(|(_, profile)| profile)
-        .unwrap_or(without_browser)
+        .unwrap_or(trimmed)
         .trim()
         .to_string()
 }
@@ -9975,6 +10415,41 @@ fn cookie_sync_result_status(value: &serde_json::Value) -> Option<CookieSyncStat
     }
 }
 
+fn cookie_sync_result_analytics(value: &serde_json::Value) -> serde_json::Value {
+    serde_json::json!({
+        "reported_status": value
+            .get("status")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("unknown"),
+        "synced": value
+            .get("synced")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false),
+        "synced_cookie_count": value
+            .get("synced_cookie_count")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(0),
+        "cloud_profile_present": value.get("cloud_profile").is_some(),
+        "local_profile_present": value.get("profile").is_some(),
+    })
+}
+
+fn cookie_sync_error_kind(error: &str) -> &'static str {
+    let normalized = error.to_ascii_lowercase();
+    if normalized.contains("api key")
+        || normalized.contains("auth")
+        || normalized.contains("unauthorized")
+    {
+        "needs_auth"
+    } else if normalized.contains("profile") && normalized.contains("found") {
+        "no_profiles"
+    } else if normalized.contains("unexpected") || normalized.contains("json") {
+        "unexpected_response"
+    } else {
+        "command_failed"
+    }
+}
+
 fn cookie_sync_success_message(value: &serde_json::Value) -> String {
     let profile = value
         .get("profile")
@@ -10090,12 +10565,57 @@ fn account_kind(account: &str) -> &'static str {
     }
 }
 
+fn analytics_provider_kind_for_account(account: &str) -> &'static str {
+    match account {
+        ACCOUNT_CODEX => "subscription",
+        ACCOUNT_OPENAI | ACCOUNT_OPENROUTER | ACCOUNT_DEEPSEEK | ACCOUNT_ANTHROPIC
+        | BROWSER_USE_CLOUD => "api_key",
+        account if is_claude_code_account(account) => "oauth",
+        _ => "other",
+    }
+}
+
+fn analytics_model_for_selection(
+    selection: &SessionModelSelection,
+) -> product_analytics::ModelAnalytics<'_> {
+    product_analytics::ModelAnalytics {
+        provider_kind: Some(analytics_provider_kind_for_account(&selection.account)),
+        provider: Some(account_kind(&selection.account)),
+        model: Some(&selection.provider_model),
+    }
+}
+
+fn merge_json_object(target: &mut serde_json::Value, extra: serde_json::Value) {
+    let Some(target) = target.as_object_mut() else {
+        return;
+    };
+    let Some(extra) = extra.as_object() else {
+        return;
+    };
+    for (key, value) in extra {
+        target.insert(key.clone(), value.clone());
+    }
+}
+
 fn browser_choice_kind(browser: &str) -> &'static str {
     match browser {
         BROWSER_LOCAL_CHROME => "local",
         "Headless Chromium" => "headless",
         "Managed Chromium" => "managed",
         BROWSER_USE_CLOUD => "cloud",
+        _ => "other",
+    }
+}
+
+fn profile_browser_kind(browser: &str) -> &'static str {
+    match browser.trim().to_ascii_lowercase().as_str() {
+        "google chrome" => "google_chrome",
+        "chromium" => "chromium",
+        "microsoft edge"
+        | "microsoft edge beta"
+        | "microsoft edge dev"
+        | "microsoft edge canary" => "microsoft_edge",
+        "brave" => "brave",
         _ => "other",
     }
 }
@@ -10406,6 +10926,7 @@ struct BrowserUseCloudTokenResponse {
     api_key: String,
     api_key_id: String,
     project_id: String,
+    project_name: Option<String>,
     expires_at: Option<String>,
     scopes: Vec<String>,
 }
@@ -10617,6 +11138,7 @@ fn run_browser_use_cloud_login(
             api_key: token.api_key,
             api_key_id: token.api_key_id,
             project_id: token.project_id,
+            project_name: token.project_name,
             expires_at: token.expires_at,
             scopes: token.scopes,
         });
@@ -11052,6 +11574,7 @@ fn run_terminal(mut app: App) -> Result<()> {
         let mut last_anim_tick = Instant::now();
         let mut last_live_spinner_tick = Instant::now();
         let mut last_typewriter_tick = Instant::now();
+        let mut last_setup_cta_blink_tick = Instant::now();
         let mut pending_resize_at: Option<Instant> = None;
         loop {
             if reload_requested
@@ -11111,6 +11634,9 @@ fn run_terminal(mut app: App) -> Result<()> {
             if app.is_home_examples_active() {
                 poll_interval = poll_interval.min(TYPEWRITER_TICK_INTERVAL);
             }
+            if app.should_animate_setup_cta() {
+                poll_interval = poll_interval.min(SETUP_CTA_BLINK_INTERVAL);
+            }
             if app.should_animate_feedback_thanks() {
                 poll_interval = poll_interval.min(Duration::from_millis(FEEDBACK_THANKS_FRAME_MS));
             }
@@ -11143,6 +11669,13 @@ fn run_terminal(mut app: App) -> Result<()> {
                         draw_needed = true;
                     }
                     last_typewriter_tick = Instant::now();
+                }
+                if app.should_animate_setup_cta()
+                    && last_setup_cta_blink_tick.elapsed() >= SETUP_CTA_BLINK_INTERVAL
+                {
+                    app.tick_setup_cta();
+                    draw_needed = true;
+                    last_setup_cta_blink_tick = Instant::now();
                 }
                 // Handle the shared waving-character animation. Feedback
                 // thanks auto-dismisses; Cloud setup success waits for input.
@@ -14365,15 +14898,19 @@ mod redesign_tests {
         let mut app = App::new(args(&temp))?;
         let screen = render_dump(&mut app)?;
         assert!(screen.contains("Welcome to Browser Use Terminal"));
-        assert!(screen.contains("Choose a provider below."));
-        assert!(screen.contains("PROVIDERS"));
+        assert!(screen.contains("Rust-based command line for running"));
+        assert!(screen.contains("Get started"));
+        assert!(!screen.contains("Choose a provider below."));
+        assert!(!screen.contains("Next: choose a provider."));
+        assert!(!screen.contains("default model"));
+        assert!(!screen.contains("Providers"));
         assert!(!screen.contains("CHOOSE PROVIDER"));
         assert!(app
             .setup_account_choices()?
             .contains(&settings::ACCOUNT_CODEX));
-        assert!(screen.contains("Continue with Codex login"));
+        assert!(!screen.contains("Continue with Codex login"));
         assert!(!screen.contains("Claude Code subscription"));
-        assert!(screen.contains("OpenRouter API key"));
+        assert!(!screen.contains("OpenRouter API key"));
         assert!(screen.contains("click me!"));
         assert!(!screen.contains("click logo"));
         assert!(!screen.contains("CHOOSE MODEL"));
@@ -14387,8 +14924,30 @@ mod redesign_tests {
         assert!(!app.handle_key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE))?);
         assert!(app.composer.is_empty());
         let screen = render_dump(&mut app)?;
-        assert!(screen.contains("PROVIDERS"));
+        assert!(screen.contains("Get started"));
+        assert!(!screen.contains("Providers"));
         assert!(!screen.contains("Tell the browser what to do"));
+
+        assert!(!app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))?);
+        let screen = render_dump(&mut app)?;
+        assert!(screen.contains("Providers"));
+        assert!(!screen.contains("Choose your provider"));
+        assert!(!screen.contains("click me!"));
+        assert!(!screen.contains("Browser Use"));
+        assert!(app.welcome_logo_rect.get().is_none());
+        assert!(!screen.contains("Browser Use will pick its default model first"));
+        assert!(screen.contains("Continue with Codex login"));
+        assert!(!screen.contains("Claude Code subscription"));
+        assert!(screen.contains("OpenRouter API key"));
+        assert!(!screen.contains("Tell the browser what to do"));
+        assert!(!app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))?);
+        let screen = render_dump(&mut app)?;
+        assert!(screen.contains("Get started"));
+        assert!(!screen.contains("Providers"));
+        assert!(!app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))?);
+        let screen = render_dump(&mut app)?;
+        assert!(screen.contains("Providers"));
+        assert!(screen.contains("Continue with Codex login"));
         app.store
             .set_setting("auth.codex.access_token", "codex-test-token")?;
         app.store
@@ -14421,7 +14980,7 @@ mod redesign_tests {
         assert!(!app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))?);
         assert_eq!(app.surface, Surface::SetupResult);
         let screen = render_dump(&mut app)?;
-        assert!(screen.contains("Connected with Codex auth."));
+        assert!(screen.contains("Connected with Codex OAuth."));
         assert!(!app.setup_complete);
 
         assert!(!app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))?);
@@ -14437,16 +14996,10 @@ mod redesign_tests {
 
         app.selected_row = 1;
         assert!(!app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))?);
-        assert_eq!(app.surface, Surface::ModelSearch);
-        assert!(!app.setup_complete);
-        assert_eq!(app.selected_provider, Some(settings::ACCOUNT_CODEX));
-        assert_eq!(app.browser, BROWSER_LOCAL_CHROME);
-
-        app.save_provider_model("gpt-5.5".to_string())?;
         assert_eq!(app.surface, Surface::Main);
         assert!(app.setup_complete);
         assert_eq!(app.account, "Codex login");
-        assert_eq!(app.model, "gpt-5.5");
+        assert_eq!(app.model, "GPT-5.5");
         assert_eq!(app.provider_model, "gpt-5.5");
         assert_eq!(app.browser, BROWSER_LOCAL_CHROME);
         assert_eq!(
@@ -14496,7 +15049,13 @@ mod redesign_tests {
         assert!(app.is_first_run_setup_visible()?);
 
         let screen = render_dump(&mut app)?;
-        assert!(screen.contains("PROVIDERS"));
+        assert!(screen.contains("Get started"));
+        assert!(!screen.contains("Providers"));
+        assert!(!screen.contains("Tell the browser what to do"));
+
+        assert!(!app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))?);
+        let screen = render_dump(&mut app)?;
+        assert!(screen.contains("Providers"));
         assert!(screen.contains("Codex login"));
         assert!(!screen.contains("Tell the browser what to do"));
         Ok(())
@@ -14641,15 +15200,13 @@ mod redesign_tests {
             app.store.set_setting("setup.complete", "1")?;
 
             let _screen = render_dump(&mut app)?;
-            // NOTE: the ready/welcome screen no longer carries the
-            // "Browser Use Cloud needs key" warning. That warning still
-            // shows on the BrowserSelect surface (asserted below); the
-            // welcome screen redesign needs a follow-up surface for it.
+            assert!(!app.browser_use_cloud_key_ready()?);
 
             app.open_surface(Surface::BrowserSelect);
             let screen = render_dump(&mut app)?;
             assert!(screen.contains("Browser Use Cloud"));
-            assert!(screen.contains("needs Browser Use key"));
+            assert!(screen.contains("[FREE] recommended"));
+            assert!(!screen.contains("needs Browser Use key"));
             Ok(())
         })();
         if let Some(value) = saved {
@@ -14798,7 +15355,7 @@ mod redesign_tests {
             )?;
             app.selected_session_id = Some(session.id.clone());
             app.open_surface(Surface::BrowserSelect);
-            app.selected_row = app.browser_select_local_browser_count();
+            app.selected_row = app.browser_select_cloud_index();
 
             assert!(!app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))?);
             assert_eq!(app.surface, Surface::SetupResult);
@@ -14852,7 +15409,7 @@ mod redesign_tests {
             },
         ];
 
-        app.save_browser(0)?;
+        app.save_browser(1)?;
 
         assert_eq!(app.browser, BROWSER_LOCAL_CHROME);
         assert_eq!(
@@ -14885,11 +15442,11 @@ mod redesign_tests {
         app.default_profile.browsers = vec!["Chromium".to_string()];
         app.store.set_setting("browser.preference.mode", "local")?;
 
-        app.save_browser(0)?;
-        assert!(app.browser_select_chromium_expanded);
-        assert_eq!(app.selected_row, 1);
-
         app.save_browser(1)?;
+        assert!(app.browser_select_chromium_expanded);
+        assert_eq!(app.selected_row, 2);
+
+        app.save_browser(2)?;
         assert_eq!(app.browser, "Managed Chromium");
         assert_eq!(app.status_notice, None);
         assert_eq!(
@@ -14897,7 +15454,7 @@ mod redesign_tests {
             Some("managed-headed")
         );
 
-        app.save_browser(2)?;
+        app.save_browser(3)?;
         assert_eq!(app.browser, "Headless Chromium");
         assert_eq!(app.status_notice, None);
         assert_eq!(
@@ -14926,12 +15483,12 @@ mod redesign_tests {
             profile_name: "Default".to_string(),
         }];
 
-        app.save_browser(0)?;
+        app.save_browser(1)?;
         assert!(app.browser_select_chromium_expanded);
-        assert_eq!(app.selected_row, 1);
+        assert_eq!(app.selected_row, 2);
 
-        app.selected_row = 0;
-        app.save_browser(0)?;
+        app.selected_row = 1;
+        app.save_browser(1)?;
 
         assert_eq!(app.browser, BROWSER_LOCAL_CHROME);
         assert_eq!(
@@ -14989,7 +15546,7 @@ mod redesign_tests {
     }
 
     #[test]
-    fn browser_select_starts_on_current_and_labels_recommended() -> Result<()> {
+    fn browser_select_starts_on_current_and_labels_cloud_recommended() -> Result<()> {
         let temp = tempfile::tempdir()?;
         let mut app = ready_app(&temp)?;
         app.surface = Surface::BrowserSelect;
@@ -15001,9 +15558,14 @@ mod redesign_tests {
 
         app.sync_browser_select_cursor_to_current();
 
-        assert_eq!(app.selected_row, 1);
+        assert_eq!(app.selected_row, 2);
         let screen = render_dump(&mut app)?;
-        assert!(screen.contains("Google Chrome  recommended"));
+        let remote_index = screen.find("REMOTE").context("remote heading")?;
+        let local_index = screen.find("LOCAL").context("local heading")?;
+        assert!(remote_index < local_index);
+        assert!(screen.contains("Browser Use Cloud  [FREE] recommended"));
+        assert!(!screen.contains("Google Chrome  recommended"));
+        assert!(!screen.contains("BROWSERS"));
         assert!(!screen.contains("current"));
         Ok(())
     }
@@ -15022,7 +15584,7 @@ mod redesign_tests {
         app.store
             .set_setting("browser.preference.profile_label", "Default")?;
 
-        app.save_browser(1)?;
+        app.save_browser(2)?;
 
         assert_eq!(app.browser, BROWSER_LOCAL_CHROME);
         assert_eq!(app.browser_local_label.as_deref(), Some("Brave"));
@@ -15244,7 +15806,7 @@ mod redesign_tests {
             app.model_configured = true;
             app.store.set_setting("setup.complete", "1")?;
             app.open_surface(Surface::BrowserSelect);
-            app.selected_row = app.browser_select_local_browser_count();
+            app.selected_row = app.browser_select_cloud_index();
 
             app.start_auth_entry(BROWSER_USE_CLOUD.to_string());
             assert_eq!(app.surface, Surface::ApiKey);
@@ -15322,6 +15884,7 @@ mod redesign_tests {
                     api_key: "bu-device-key".to_string(),
                     api_key_id: "key_123".to_string(),
                     project_id: "project_123".to_string(),
+                    project_name: None,
                     expires_at: Some("2026-09-01T00:00:00Z".to_string()),
                     scopes: vec!["*:*:*".to_string()],
                 },
@@ -15351,6 +15914,10 @@ mod redesign_tests {
                 app.setup_result.as_ref().map(|result| &result.kind),
                 Some(&SetupResultKind::Success)
             );
+            let screen = render_dump(&mut app)?;
+            assert!(screen.contains("Connected to Browser Use Cloud."));
+            assert!(!screen.contains("project_123"));
+            assert!(!screen.contains("Continue keeps your current model."));
             let events = app.store.events_for_session(&session.id)?;
             assert!(events
                 .iter()
@@ -15428,6 +15995,7 @@ mod redesign_tests {
                     api_key: "bu-device-key".to_string(),
                     api_key_id: "key_123".to_string(),
                     project_id: "project_123".to_string(),
+                    project_name: None,
                     expires_at: None,
                     scopes: vec!["v3:browsers:create".to_string()],
                 },
@@ -15480,6 +16048,7 @@ mod redesign_tests {
                     api_key: "bu-device-key".to_string(),
                     api_key_id: "key_123".to_string(),
                     project_id: "project_123".to_string(),
+                    project_name: None,
                     expires_at: None,
                     scopes: vec!["v3:browsers:create".to_string()],
                 },
@@ -15504,7 +16073,7 @@ mod redesign_tests {
     }
 
     #[test]
-    fn browser_use_cloud_onboarding_skip_cookie_sync_opens_model_selection() -> Result<()> {
+    fn browser_use_cloud_onboarding_skip_cookie_sync_completes_with_default_model() -> Result<()> {
         let saved = std::env::var("BROWSER_USE_API_KEY").ok();
         unsafe {
             std::env::remove_var("BROWSER_USE_API_KEY");
@@ -15531,6 +16100,7 @@ mod redesign_tests {
                     api_key: "bu-device-key".to_string(),
                     api_key_id: "key_123".to_string(),
                     project_id: "project_123".to_string(),
+                    project_name: None,
                     expires_at: None,
                     scopes: vec!["v3:browsers:create".to_string()],
                 },
@@ -15541,16 +16111,13 @@ mod redesign_tests {
             app.selected_row = 1;
             assert!(!app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))?);
 
-            assert_eq!(app.surface, Surface::ModelSearch);
-            assert!(!app.setup_complete);
+            assert_eq!(app.surface, Surface::Main);
+            assert!(app.setup_complete);
             assert!(!app.pending_setup_after_cookie_sync);
             assert_eq!(app.browser, BROWSER_USE_CLOUD);
-            assert_eq!(app.selected_provider, Some(settings::ACCOUNT_OPENAI));
-
-            let screen = render_dump(&mut app)?;
-            assert!(screen.contains("Model"));
-            assert!(!screen.contains("PROVIDERS"));
-            assert!(!screen.contains("Continue with Codex login"));
+            assert_eq!(app.account, settings::ACCOUNT_OPENAI);
+            assert_eq!(app.model, "GPT-5.5");
+            assert_eq!(app.provider_model, "gpt-5.5");
             Ok(())
         })();
         if let Some(value) = saved {
@@ -15562,7 +16129,113 @@ mod redesign_tests {
     }
 
     #[test]
-    fn onboarding_cookie_sync_opens_model_selection_after_cloud_profile() -> Result<()> {
+    fn completed_setup_cloud_auth_from_browser_does_not_open_model_selection() -> Result<()> {
+        let saved = std::env::var("BROWSER_USE_API_KEY").ok();
+        unsafe {
+            std::env::remove_var("BROWSER_USE_API_KEY");
+        }
+        let result = (|| -> Result<()> {
+            let temp = tempfile::tempdir()?;
+            let mut app = ready_app(&temp)?;
+            let original_account = app.account.clone();
+            app.open_surface(Surface::BrowserSelect);
+            app.selected_row = app.browser_select_cloud_index();
+
+            assert!(!app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))?);
+            assert_eq!(app.surface, Surface::SetupResult);
+            assert_eq!(
+                app.setup_result.as_ref().map(|result| &result.kind),
+                Some(&SetupResultKind::Pending)
+            );
+
+            let tx = app
+                .browser_use_cloud_login
+                .as_ref()
+                .and_then(|flow| flow.event_tx_guard.as_ref())
+                .context("test cloud login event sender")?
+                .clone();
+            tx.send(BrowserUseCloudLoginEvent::Finished(Ok(
+                BrowserUseCloudCredential {
+                    api_key: "bu-device-key".to_string(),
+                    api_key_id: "key_123".to_string(),
+                    project_id: "project_123".to_string(),
+                    project_name: Some("Reagan Workspace".to_string()),
+                    expires_at: None,
+                    scopes: vec!["v3:browsers:create".to_string()],
+                },
+            )))?;
+            assert!(app.drain_browser_use_cloud_login_notifications()?);
+            assert_eq!(app.surface, Surface::SetupResult);
+            assert_eq!(
+                app.setup_result.as_ref().map(|result| &result.kind),
+                Some(&SetupResultKind::Success)
+            );
+            let screen = render_dump(&mut app)?;
+            assert!(screen.contains("Connected to Browser Use Cloud project Reagan Workspace."));
+            assert!(!screen.contains("project_123"));
+            assert!(!screen.contains("Continue keeps your current model."));
+            assert!(!screen.lines().any(|line| line.trim() == BROWSER_USE_CLOUD));
+
+            assert!(!app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))?);
+
+            assert_eq!(app.surface, Surface::Main);
+            assert!(app.setup_complete);
+            assert_eq!(app.account, original_account);
+            assert_eq!(app.browser, BROWSER_USE_CLOUD);
+            assert_eq!(app.selected_provider, None);
+            Ok(())
+        })();
+        if let Some(value) = saved {
+            unsafe {
+                std::env::set_var("BROWSER_USE_API_KEY", value);
+            }
+        }
+        result
+    }
+
+    #[test]
+    fn completed_setup_cookie_sync_does_not_resume_onboarding_model_selection() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let mut app = ready_app(&temp)?;
+        app.account = settings::ACCOUNT_ANTHROPIC.to_string();
+        app.model = "Claude Opus 4.8".to_string();
+        app.provider_model = "claude-opus-4-8".to_string();
+        app.browser = BROWSER_USE_CLOUD.to_string();
+        app.store
+            .set_setting(BROWSER_PREFERENCE_MODE_SETTING, "cloud")?;
+        app.pending_setup_after_cookie_sync = true;
+        app.open_surface(Surface::CookieSync);
+
+        app.apply_cookie_sync_event(CookieSyncEvent {
+            kind: CookieSyncCommandKind::SyncProfile,
+            result: Ok(serde_json::json!({
+                "status": "ok",
+                "synced": true,
+                "synced_cookie_count": 3,
+                "cloud_profile": {
+                    "id": "cloud_profile_123",
+                    "name": "Google Chrome - Reagan"
+                }
+            })),
+        });
+        assert!(matches!(
+            app.cookie_sync.status,
+            CookieSyncStatus::Completed(_)
+        ));
+
+        app.execute_surface_selection()?;
+
+        assert_eq!(app.surface, Surface::Main);
+        assert!(app.setup_complete);
+        assert!(!app.pending_setup_after_cookie_sync);
+        assert_eq!(app.account, settings::ACCOUNT_ANTHROPIC);
+        assert_eq!(app.provider_model, "claude-opus-4-8");
+        assert_eq!(app.selected_provider, None);
+        Ok(())
+    }
+
+    #[test]
+    fn onboarding_cookie_sync_completes_with_default_model_after_cloud_profile() -> Result<()> {
         let temp = tempfile::tempdir()?;
         let mut app = App::new(args(&temp))?;
         app.account = settings::ACCOUNT_OPENAI.to_string();
@@ -15609,17 +16282,13 @@ mod redesign_tests {
 
         app.execute_surface_selection()?;
 
-        assert_eq!(app.surface, Surface::ModelSearch);
-        assert!(!app.setup_complete);
-        assert!(!app.pending_setup_after_cookie_sync);
-        assert_eq!(app.browser, BROWSER_USE_CLOUD);
-        assert_eq!(app.selected_provider, Some(settings::ACCOUNT_OPENAI));
-
-        app.save_provider_model("gpt-5.5".to_string())?;
         assert_eq!(app.surface, Surface::Main);
         assert!(app.setup_complete);
+        assert!(!app.pending_setup_after_cookie_sync);
+        assert_eq!(app.browser, BROWSER_USE_CLOUD);
         assert_eq!(app.account, settings::ACCOUNT_OPENAI);
-        assert_eq!(app.model, "gpt-5.5");
+        assert_eq!(app.model, "GPT-5.5");
+        assert_eq!(app.provider_model, "gpt-5.5");
         Ok(())
     }
 
@@ -15645,7 +16314,7 @@ mod redesign_tests {
         assert!(screen.contains("Import local browser cookies to Browser Use Cloud"));
         assert!(screen.contains("LOCAL PROFILES"));
         assert!(screen.contains("Google Chrome - Reagan"));
-        assert!(!screen.contains("PROVIDERS"));
+        assert!(!screen.contains("Providers"));
         assert!(!screen.contains("Continue with Codex"));
         Ok(())
     }
@@ -15695,18 +16364,12 @@ mod redesign_tests {
         assert!(!app.setup_complete);
         app.selected_row = 1;
         app.execute_surface_selection()?;
-        assert_eq!(app.surface, Surface::ModelSearch);
-        assert!(!app.setup_complete);
-        assert_eq!(app.browser, BROWSER_LOCAL_CHROME);
-        let default_model = app
-            .default_model_for_account(settings::ACCOUNT_OPENROUTER)
-            .context("default OpenRouter model")?;
-        app.save_model(default_model)?;
         assert_eq!(app.surface, Surface::Main);
         assert!(app.setup_complete);
+        assert_eq!(app.browser, BROWSER_LOCAL_CHROME);
         assert_eq!(app.account, settings::ACCOUNT_OPENROUTER);
-        assert_eq!(app.model, "GPT-5.5");
-        assert_eq!(app.provider_model, "openai/gpt-5.5");
+        assert_eq!(app.model, "Gemini 3.1 Pro");
+        assert_eq!(app.provider_model, "google/gemini-3.1-pro-preview");
         assert_eq!(app.agent_backend, AgentBackend::Openrouter);
         Ok(())
     }
@@ -17326,8 +17989,8 @@ wire_api = "responses"
             Some("codex-refresh".to_string())
         );
         let screen = render_dump(&mut app)?;
-        assert!(screen.contains("Connected with Codex auth."));
-        assert!(screen.contains("Continue to Browser Use Cloud setup."));
+        assert!(screen.contains("Connected with Codex OAuth."));
+        assert!(!screen.contains("Continue to Browser Use Cloud setup."));
         assert!(screen.contains("> Continue"));
 
         assert!(!app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))?);
@@ -17337,20 +18000,9 @@ wire_api = "responses"
 
         app.selected_row = 1;
         app.execute_surface_selection()?;
-        assert_eq!(app.surface, Surface::ModelSearch);
-        assert!(!app.setup_complete);
-        assert_eq!(app.browser, BROWSER_LOCAL_CHROME);
-        assert_eq!(app.selected_provider, Some(settings::ACCOUNT_CODEX));
-        assert_eq!(
-            app.model_search_rows(),
-            vec!["gpt-5.5", "gpt-5.4", "gpt-5.4-mini",]
-        );
-        assert!(!app.model_search_has_filter_input());
-
-        app.save_provider_model("gpt-5.5".to_string())?;
         assert_eq!(app.surface, Surface::Main);
         assert!(app.setup_complete);
-        assert_eq!(app.model, "gpt-5.5");
+        assert_eq!(app.model, "GPT-5.5");
         assert_eq!(app.provider_model, "gpt-5.5");
         assert_eq!(app.browser, BROWSER_LOCAL_CHROME);
         Ok(())
@@ -17495,15 +18147,30 @@ wire_api = "responses"
         assert!(rows
             .iter()
             .any(|row| { row.label == "OpenAI" && row.account == settings::ACCOUNT_OPENAI }));
+        assert!(rows.iter().any(|row| {
+            row.account == settings::ACCOUNT_OPENAI && row.default_model.provider_model == "gpt-5.5"
+        }));
         assert!(rows
             .iter()
             .any(|row| { row.label == "Anthropic" && row.account == settings::ACCOUNT_ANTHROPIC }));
         assert!(rows.iter().any(|row| {
+            row.account == settings::ACCOUNT_ANTHROPIC
+                && row.default_model.provider_model == "claude-opus-4-8"
+        }));
+        assert!(rows.iter().any(|row| {
             row.label == "OpenRouter" && row.account == settings::ACCOUNT_OPENROUTER
+        }));
+        assert!(rows.iter().any(|row| {
+            row.account == settings::ACCOUNT_OPENROUTER
+                && row.default_model.provider_model == "google/gemini-3.1-pro-preview"
         }));
         assert!(rows
             .iter()
             .any(|row| { row.label == "DeepSeek" && row.account == settings::ACCOUNT_DEEPSEEK }));
+        assert!(rows.iter().any(|row| {
+            row.account == settings::ACCOUNT_DEEPSEEK
+                && row.default_model.provider_model == "deepseek-v4-pro"
+        }));
         assert!(!rows.iter().any(|row| row.label.contains("API key")));
         Ok(())
     }
@@ -18083,6 +18750,13 @@ wire_api = "responses"
     fn setup_api_key_flow_keeps_key_entry_in_modal_then_confirms_saved() -> Result<()> {
         let temp = tempfile::tempdir()?;
         let mut app = App::new(args(&temp))?;
+        let screen = render_dump(&mut app)?;
+        assert!(screen.contains("Get started"));
+        assert!(!screen.contains("Providers"));
+
+        assert!(!app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))?);
+        let screen = render_dump(&mut app)?;
+        assert!(screen.contains("Providers"));
         app.selected_row = app
             .setup_account_choices()?
             .iter()
@@ -18093,7 +18767,8 @@ wire_api = "responses"
         assert_eq!(app.surface, Surface::SetupConfirm);
         let screen = render_dump(&mut app)?;
         assert!(screen.contains("Use OpenAI API key?"));
-        assert!(screen.contains("API key modal"));
+        assert!(screen.contains("Enter your provider API key."));
+        assert!(screen.contains("Browser Use saves it locally."));
 
         assert!(!app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))?);
         assert_eq!(app.surface, Surface::ApiKey);
@@ -18120,15 +18795,9 @@ wire_api = "responses"
 
         app.selected_row = 1;
         app.execute_surface_selection()?;
-        assert_eq!(app.surface, Surface::ModelSearch);
-        assert!(!app.setup_complete);
-        assert_eq!(app.browser, BROWSER_LOCAL_CHROME);
-        assert_eq!(app.selected_provider, Some(settings::ACCOUNT_OPENAI));
-
-        app.save_provider_model("gpt-5.5".to_string())?;
         assert_eq!(app.surface, Surface::Main);
         assert!(app.setup_complete);
-        assert_eq!(app.model, "gpt-5.5");
+        assert_eq!(app.model, "GPT-5.5");
         assert_eq!(app.provider_model, "gpt-5.5");
         assert_eq!(app.browser, BROWSER_LOCAL_CHROME);
         Ok(())
@@ -18387,7 +19056,7 @@ wire_api = "responses"
             browser_name: "Google Chrome".to_string(),
             profile_name: "Default".to_string(),
         }];
-        app.save_browser(0)?;
+        app.save_browser(1)?;
         let state = app.workbench_state()?;
         assert_eq!(state.browser.backend, BROWSER_LOCAL_CHROME);
         assert_eq!(state.browser.live_url, None);

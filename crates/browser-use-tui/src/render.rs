@@ -369,7 +369,7 @@ fn render_main(
         (lines, reserve_live_status_row)
     } else {
         let lines = match product_state {
-            ProductState::SetupNeeded => setup_lines(app, body_width as usize),
+            ProductState::SetupNeeded => setup_lines(app, body_width as usize, max_body_h as usize),
             ProductState::Ready => ready_lines(app, state, body_width, max_body_h),
             ProductState::Running
             | ProductState::Result
@@ -434,7 +434,10 @@ fn render_main(
                 app.status_notice.is_some(),
                 cloud_home_banner_lines(app, body_width).map_or(0, |lines| lines.len()),
             )),
-            ProductState::SetupNeeded => Some(setup_logo_screen_rect(body_content_rect)),
+            ProductState::SetupNeeded if !app.setup_started => {
+                Some(setup_logo_screen_rect(body_content_rect, app.setup_started))
+            }
+            ProductState::SetupNeeded => None,
             ProductState::Running
             | ProductState::Result
             | ProductState::Failed
@@ -587,8 +590,8 @@ fn composer_pane_height(app: &App, _product_state: ProductState, width: u16) -> 
     )
     .len()
     .min(PENDING_FOLLOWUP_PREVIEW_MAX_LINES) as u16;
-    // top border + input rows + bottom border + status row beneath.
-    preview_lines + visual_input_lines + 3
+    // top border + input rows + bottom border + spacer + status row beneath.
+    preview_lines + visual_input_lines + 4
 }
 
 /// Visual rows the input area inside the fused composer should occupy.
@@ -1199,29 +1202,53 @@ fn render_command_palette_box(
     let footer_chunk = chunks[3];
     let items = app.slash_palette_items();
 
+    let mut hidden_above = 0usize;
+    let mut hidden_below = 0usize;
     if items.is_empty() {
         Paragraph::new(Line::from(Span::styled("  No commands match.", muted())))
             .render(body_chunk, buffer);
     } else {
         let rows = slash_palette_rows(app, body_chunk.width as usize);
-        let mut visible = rows;
         let body_h = body_chunk.height as usize;
-        if body_h > 0 && app.selected_row >= body_h {
-            let skip = app.selected_row + 1 - body_h;
-            visible = visible.into_iter().skip(skip).collect();
-        }
+        let skip = if body_h > 0 && app.selected_row >= body_h {
+            app.selected_row + 1 - body_h
+        } else {
+            0
+        };
+        hidden_above = skip;
+        hidden_below = rows.len().saturating_sub(skip + body_h);
+        let visible: Vec<Line<'static>> = rows.into_iter().skip(skip).collect();
+        // No wrap: each item must stay on one line so the skip-based
+        // scrolling above keeps the selected row visible on short screens.
         Paragraph::new(visible)
             .style(Style::default().fg(text()))
-            .wrap(Wrap { trim: false })
             .render(body_chunk, buffer);
     }
 
-    Paragraph::new(Line::from(Span::styled(
-        " ↑↓ navigate · ⏎ select · esc close",
-        muted(),
-    )))
-    .alignment(Alignment::Right)
-    .render(footer_chunk, buffer);
+    // Footer: nav hints flush right; when rows are scrolled out of view,
+    // a "↑ N · ↓ N more" count sits on the left so the overflow is visible.
+    let nav_hint = "↑↓ navigate · ⏎ select · esc close";
+    let mut more_parts = Vec::new();
+    if hidden_above > 0 {
+        more_parts.push(format!("↑ {hidden_above}"));
+    }
+    if hidden_below > 0 {
+        more_parts.push(format!("↓ {hidden_below}"));
+    }
+    let footer = if more_parts.is_empty() {
+        Paragraph::new(Line::from(Span::styled(format!(" {nav_hint}"), muted())))
+            .alignment(Alignment::Right)
+    } else {
+        let more_hint = format!(" {} more", more_parts.join(" · "));
+        let pad = (footer_chunk.width as usize)
+            .saturating_sub(more_hint.chars().count() + nav_hint.chars().count());
+        Paragraph::new(Line::from(vec![
+            Span::styled(more_hint, muted()),
+            Span::raw(" ".repeat(pad)),
+            Span::styled(nav_hint, muted()),
+        ]))
+    };
+    footer.render(footer_chunk, buffer);
     cursor
 }
 
@@ -1422,9 +1449,9 @@ fn render_surface(
         .split(area);
     frame.render_widget(Paragraph::new(header), chunks[0]);
     let body_area = content_area(chunks[1]);
-    if surface == Surface::Setup {
+    if surface == Surface::Setup && !app.setup_started {
         app.welcome_logo_rect
-            .set(Some(setup_logo_screen_rect(body_area)));
+            .set(Some(setup_logo_screen_rect(body_area, app.setup_started)));
     } else {
         app.welcome_logo_rect.set(None);
     }
@@ -1448,7 +1475,8 @@ fn render_surface(
 /// Title and one-line description for a dropdown/settings surface header.
 fn surface_heading(app: &App, surface: Surface) -> (String, &'static str) {
     match surface {
-        Surface::Setup => ("Setup".to_string(), "Choose how to run Browser Use"),
+        Surface::Setup if app.setup_started => ("Setup".to_string(), "Providers"),
+        Surface::Setup => ("Setup".to_string(), "Welcome to Browser Use Terminal"),
         Surface::SetupConfirm => ("Setup".to_string(), "Confirm provider"),
         Surface::SetupResult => ("Setup".to_string(), "Connection result"),
         Surface::SetupCloud => ("Setup".to_string(), "Choose your browser backend"),
@@ -1595,7 +1623,7 @@ fn surface_lines(
     height: usize,
 ) -> Vec<Line<'static>> {
     match surface {
-        Surface::Setup => setup_lines(app, width),
+        Surface::Setup => setup_lines(app, width, height),
         Surface::SetupConfirm => setup_confirm_lines(app),
         Surface::SetupResult => setup_result_lines(app, width),
         Surface::SetupCloud => setup_cloud_lines(app),
@@ -1688,7 +1716,16 @@ fn render_composer(
     let input_inner_w = area.width.saturating_sub(4).max(1);
     let input_h = composer_visual_input_lines(app, input_inner_w);
     let box_h = input_h.saturating_add(2).min(area.height);
-    let status_h: u16 = if area.height > box_h { 1 } else { 0 };
+    let status_gap_h: u16 = if area.height > box_h.saturating_add(1) {
+        1
+    } else {
+        0
+    };
+    let status_h: u16 = if area.height > box_h.saturating_add(status_gap_h) {
+        1
+    } else {
+        0
+    };
 
     let box_area = Rect {
         x: area.x,
@@ -1752,7 +1789,7 @@ fn render_composer(
     if status_h > 0 {
         let status_area = Rect {
             x: area.x,
-            y: box_area.y + box_area.height,
+            y: box_area.y + box_area.height + status_gap_h,
             width: area.width,
             height: status_h,
         };
@@ -1958,7 +1995,9 @@ fn slash_palette_rows(app: &App, width: usize) -> Vec<Line<'static>> {
             let marker = if is_selected { "› " } else { "  " };
             let cmd_style = if is_selected { accent() } else { text_style() };
             let desc_style = if is_selected { text_style() } else { muted() };
-            let desc_max = width.saturating_sub(cmd_col + 4).max(4);
+            // Budget: 2 (highlight_selectable_row indent) + 2 (marker) +
+            // cmd_col + 2 (gap) must leave room for the description.
+            let desc_max = width.saturating_sub(cmd_col + 6).max(4);
             let description = truncate(slash_palette_item_description(app, item), desc_max);
             highlight_selectable_row(
                 vec![
@@ -2186,25 +2225,110 @@ fn render_footer(
 
 const SETUP_LOGO_W: usize = 18;
 const SETUP_LOGO_H: usize = 7;
+const SETUP_WELCOME_LOGO_MAX_H: usize = 13;
 const SETUP_LOGO_GAP: usize = 8;
 const SETUP_RIGHT_W: usize = 58;
 const SETUP_CLICK_LABEL: &str = "click me!";
 const SETUP_CLICK_PREFIX_W: usize = 11;
-const SETUP_INTRO_MAX_W: usize = 74;
-const SETUP_INTRO: &str = "Welcome to Browser Use Terminal, a Rust-based command line for running browser agents. Choose a provider below.";
+const SETUP_WELCOME_INTRO_MAX_W: usize = 74;
+const SETUP_WELCOME_INTRO: &str =
+    "Welcome to Browser Use Terminal, a Rust-based command line for running browser agents.";
 
-fn setup_lines(app: &App, width: usize) -> Vec<Line<'static>> {
+#[derive(Clone, Copy)]
+struct SetupLogoGeometry {
+    width: usize,
+    height: usize,
+    radius: f32,
+    stroke: f32,
+}
+
+fn setup_logo_geometry(width: usize, height: usize, setup_started: bool) -> SetupLogoGeometry {
+    if setup_started {
+        return SetupLogoGeometry {
+            width: SETUP_LOGO_W.min(width.max(1)),
+            height: SETUP_LOGO_H,
+            radius: 11.0,
+            stroke: 1.1,
+        };
+    }
+
+    let target_h = match height {
+        40.. => SETUP_WELCOME_LOGO_MAX_H,
+        32.. => 12,
+        26.. => 10,
+        22.. => 9,
+        _ => SETUP_LOGO_H,
+    };
+    let max_h_for_width = width.saturating_mul(2).checked_div(5).unwrap_or(0).max(4);
+    let logo_h = target_h
+        .min(max_h_for_width)
+        .min(height.saturating_sub(5).max(4));
+    let logo_w = ((logo_h * 5).saturating_add(1) / 2).min(width.max(1));
+    let scale = logo_w as f32 / SETUP_LOGO_W as f32;
+
+    SetupLogoGeometry {
+        width: logo_w,
+        height: logo_h,
+        radius: 11.0 * scale,
+        stroke: 1.1 * scale,
+    }
+}
+
+fn setup_welcome_intro_lines(width: usize) -> Vec<Line<'static>> {
+    let wrap_width = width.min(SETUP_WELCOME_INTRO_MAX_W).max(1);
+    wrap_setup_text(SETUP_WELCOME_INTRO, wrap_width)
+        .into_iter()
+        .map(|line| centered_line(&line, width, muted()))
+        .collect()
+}
+
+fn wrap_setup_text(text: &str, width: usize) -> Vec<String> {
     let mut lines = Vec::new();
+    let mut current = String::new();
+
+    for word in text.split_whitespace() {
+        let word_len = word.chars().count();
+        let next_len = if current.is_empty() {
+            word_len
+        } else {
+            current.chars().count() + 1 + word_len
+        };
+        if !current.is_empty() && next_len > width {
+            lines.push(std::mem::take(&mut current));
+        }
+        if !current.is_empty() {
+            current.push(' ');
+        }
+        current.push_str(word);
+    }
+
+    if !current.is_empty() {
+        lines.push(current);
+    }
+    lines
+}
+
+fn setup_welcome_block_height(width: usize, logo: SetupLogoGeometry) -> usize {
+    logo.height + 6 + setup_welcome_intro_lines(width).len()
+}
+
+fn setup_lines(app: &App, width: usize, height: usize) -> Vec<Line<'static>> {
+    if app.setup_started {
+        return setup_account_lines(app);
+    }
+
+    let logo = setup_logo_geometry(width, height, app.setup_started);
+    let mut content = Vec::new();
 
     let logo_rows = crate::welcome::render_braille_logo(
-        SETUP_LOGO_W,
-        SETUP_LOGO_H,
-        11.0,
-        1.1,
+        logo.width,
+        logo.height,
+        logo.radius,
+        logo.stroke,
         app.welcome_anim.rx,
         app.welcome_anim.ry,
     );
-    let right_lines = setup_account_lines(app);
+    let right_lines = setup_welcome_lines(app, width);
     let side_by_side = setup_logo_is_side_by_side(width);
 
     if side_by_side {
@@ -2215,12 +2339,12 @@ fn setup_lines(app: &App, width: usize) -> Vec<Line<'static>> {
             .map(|row| Line::from(Span::styled(row, text_style())))
             .collect::<Vec<_>>();
         left_lines.push(Line::from(""));
-        left_lines.push(centered_line_in_width("Browser Use", SETUP_LOGO_W, bold()));
-        left_lines.push(centered_line_in_width("Terminal", SETUP_LOGO_W, muted()));
+        left_lines.push(centered_line_in_width("Browser Use", logo.width, bold()));
+        left_lines.push(centered_line_in_width("Terminal", logo.width, muted()));
 
         let row_count = left_lines.len().max(right_lines.len());
         for idx in 0..row_count {
-            let show_click = idx == SETUP_LOGO_H / 2 && left_pad >= SETUP_CLICK_PREFIX_W;
+            let show_click = idx == logo.height / 2 && left_pad >= SETUP_CLICK_PREFIX_W;
             let mut spans = if show_click {
                 vec![Span::raw(
                     " ".repeat(left_pad.saturating_sub(SETUP_CLICK_PREFIX_W)),
@@ -2241,21 +2365,22 @@ fn setup_lines(app: &App, width: usize) -> Vec<Line<'static>> {
                 .get(idx)
                 .map(line_width)
                 .unwrap_or_default()
-                .min(SETUP_LOGO_W);
-            let gap_width = SETUP_LOGO_W
+                .min(logo.width);
+            let gap_width = logo
+                .width
                 .saturating_sub(used_left)
                 .saturating_add(SETUP_LOGO_GAP);
             spans.push(Span::raw(" ".repeat(gap_width)));
             if let Some(right) = right_lines.get(idx) {
                 spans.extend(right.spans.clone());
             }
-            lines.push(Line::from(spans));
+            content.push(Line::from(spans));
         }
     } else {
-        if setup_stacked_logo_has_side_label(width) {
-            let logo_pad = width.saturating_sub(SETUP_LOGO_W) / 2;
+        if width >= logo.width {
+            let logo_pad = width.saturating_sub(logo.width) / 2;
             for (idx, row) in logo_rows.into_iter().enumerate() {
-                let show_click = idx == SETUP_LOGO_H / 2 && logo_pad >= SETUP_CLICK_PREFIX_W;
+                let show_click = idx == logo.height / 2 && logo_pad >= SETUP_CLICK_PREFIX_W;
                 let mut spans = if show_click {
                     vec![Span::raw(
                         " ".repeat(logo_pad.saturating_sub(SETUP_CLICK_PREFIX_W)),
@@ -2270,54 +2395,60 @@ fn setup_lines(app: &App, width: usize) -> Vec<Line<'static>> {
                     ]);
                 }
                 spans.push(Span::styled(row, text_style()));
-                lines.push(Line::from(spans));
+                content.push(Line::from(spans));
             }
         } else {
-            let logo_pad = " ".repeat(width.saturating_sub(SETUP_LOGO_W) / 2);
+            let logo_pad = " ".repeat(width.saturating_sub(logo.width) / 2);
             for row in logo_rows {
-                lines.push(Line::from(Span::styled(
+                content.push(Line::from(Span::styled(
                     format!("{logo_pad}{row}"),
                     text_style(),
                 )));
             }
         }
-        lines.push(Line::from(""));
-        lines.push(centered_line("Browser Use", width, bold()));
-        lines.push(centered_line("Terminal", width, muted()));
-        lines.push(Line::from(""));
-        lines.extend(setup_intro_lines(width));
-        lines.push(Line::from(""));
-        lines.extend(right_lines);
+        content.push(Line::from(""));
+        content.push(centered_line("Browser Use", width, bold()));
+        content.push(centered_line("Terminal", width, muted()));
+        content.push(Line::from(""));
+        if !app.setup_started {
+            content.extend(setup_welcome_intro_lines(width));
+            content.push(Line::from(""));
+        }
+        content.extend(right_lines);
     }
 
+    if app.setup_started {
+        return content;
+    }
+
+    let top_pad = height.saturating_sub(content.len()) / 2;
+    let mut lines = Vec::with_capacity(height.max(content.len()));
+    for _ in 0..top_pad {
+        lines.push(Line::from(""));
+    }
+    lines.extend(content);
+    let bottom_pad = height.saturating_sub(lines.len());
+    for _ in 0..bottom_pad {
+        lines.push(Line::from(""));
+    }
     lines
 }
 
-fn setup_intro_lines(width: usize) -> Vec<Line<'static>> {
-    let wrap_width = width.min(SETUP_INTRO_MAX_W).max(1);
-    let mut rows = Vec::new();
-    let mut current = String::new();
-
-    for word in SETUP_INTRO.split_whitespace() {
-        let next_len = if current.is_empty() {
-            word.chars().count()
+fn setup_welcome_lines(app: &App, width: usize) -> Vec<Line<'static>> {
+    let label = if app.selected_row == 0 && app.setup_cta_caret_visible {
+        "> Get started [enter]"
+    } else {
+        "  Get started [enter]"
+    };
+    vec![centered_line(
+        label,
+        width,
+        if app.selected_row == 0 {
+            done()
         } else {
-            current.chars().count() + 1 + word.chars().count()
-        };
-        if !current.is_empty() && next_len > wrap_width {
-            rows.push(centered_line(&current, width, muted()));
-            current.clear();
-        }
-        if !current.is_empty() {
-            current.push(' ');
-        }
-        current.push_str(word);
-    }
-    if !current.is_empty() {
-        rows.push(centered_line(&current, width, muted()));
-    }
-
-    rows
+            text_style()
+        },
+    )]
 }
 
 fn setup_logo_is_side_by_side(_width: usize) -> bool {
@@ -2328,32 +2459,31 @@ fn setup_side_by_side_width() -> usize {
     SETUP_LOGO_W + SETUP_LOGO_GAP + SETUP_RIGHT_W
 }
 
-fn setup_stacked_logo_has_side_label(width: usize) -> bool {
-    width >= SETUP_LOGO_W
-}
-
-fn setup_logo_screen_rect(body_rect: Rect) -> Rect {
+fn setup_logo_screen_rect(body_rect: Rect, setup_started: bool) -> Rect {
     let width = body_rect.width as usize;
+    let height = body_rect.height as usize;
+    let logo = setup_logo_geometry(width, height, setup_started);
     let x_offset = if setup_logo_is_side_by_side(width) {
         let total_w = setup_side_by_side_width().min(width);
         width.saturating_sub(total_w) / 2
-    } else if setup_stacked_logo_has_side_label(width) {
-        width.saturating_sub(SETUP_LOGO_W) / 2
     } else {
-        width.saturating_sub(SETUP_LOGO_W) / 2
+        width.saturating_sub(logo.width) / 2
+    };
+    let y_offset = if setup_started {
+        0
+    } else {
+        height.saturating_sub(setup_welcome_block_height(width, logo)) / 2
     };
     Rect {
         x: body_rect.x.saturating_add(x_offset as u16),
-        y: body_rect.y,
-        width: SETUP_LOGO_W as u16,
-        height: (SETUP_LOGO_H as u16).min(body_rect.height),
+        y: body_rect.y.saturating_add(y_offset as u16),
+        width: logo.width as u16,
+        height: (logo.height as u16).min(body_rect.height),
     }
 }
 
 fn setup_account_lines(app: &App) -> Vec<Line<'static>> {
     let mut lines = Vec::new();
-    lines.push(Line::from(Span::styled("PROVIDERS", muted())));
-    lines.push(Line::from(""));
 
     for (idx, account) in app
         .setup_account_choices()
@@ -2415,25 +2545,30 @@ fn setup_confirm_lines(app: &App) -> Vec<Line<'static>> {
     };
     let mut lines = vec![Line::from(Span::styled(title, bold())), Line::from("")];
     if account == ACCOUNT_CODEX {
-        lines.extend([
-            Line::from("  A local Codex login is already available."),
-            Line::from("  Continue to Browser Use Cloud setup."),
-            Line::from("  No API key is required."),
-        ]);
+        if app.account_ready(account).unwrap_or(false) {
+            lines.extend([
+                Line::from("  Codex OAuth is already connected."),
+                Line::from("  Continue with the default model."),
+            ]);
+        } else {
+            lines.extend([
+                Line::from("  Open Codex OAuth in your browser."),
+                Line::from("  Browser Use waits here for the callback."),
+            ]);
+        }
     } else if is_claude_code_account(account) {
         if app.account_ready(account).unwrap_or(false) {
             lines.push(Line::from("  Claude Code login found."));
         } else {
             lines.extend([
-                Line::from("  Opens Anthropic OAuth sign-in in your browser."),
-                Line::from("  Browser Use waits here for the localhost callback."),
-                Line::from("  No API key or second terminal is required."),
+                Line::from("  Open Anthropic OAuth in your browser."),
+                Line::from("  Browser Use waits here for the callback."),
             ]);
         }
     } else {
         lines.extend([
-            Line::from("  Your key will be entered in the API key modal."),
-            Line::from("  We confirm that the key was saved locally."),
+            Line::from("  Enter your provider API key."),
+            Line::from("  Browser Use saves it locally."),
         ]);
     }
     let primary_label =
@@ -2497,6 +2632,8 @@ fn setup_result_lines(app: &App, width: usize) -> Vec<Line<'static>> {
     };
     let is_success = result.kind == SetupResultKind::Success;
     let is_pending = result.kind == SetupResultKind::Pending;
+    let compact_cloud_success =
+        is_success && result.account == BROWSER_USE_CLOUD && app.setup_complete;
     let mut lines = vec![
         Line::from(Span::styled(
             result.message.clone(),
@@ -2509,21 +2646,15 @@ fn setup_result_lines(app: &App, width: usize) -> Vec<Line<'static>> {
             },
         )),
         Line::from(""),
-        Line::from(format!("  {}", result.account)),
     ];
+    if !compact_cloud_success {
+        lines.push(Line::from(format!("  {}", result.account)));
+    }
     if is_success {
-        let next_message = if app.pending_model_after_auth.is_some() {
-            "  Continue applies the selected model."
-        } else if app.setup_complete {
-            "  Continue keeps your current model."
-        } else {
-            "  Continue to Browser Use Cloud setup."
-        };
-        lines.extend([
-            Line::from(Span::styled(next_message, muted())),
-            Line::from(""),
-            selected("Continue", 0, app.selected_row),
-        ]);
+        if !compact_cloud_success {
+            lines.push(Line::from(""));
+        }
+        lines.push(selected("Continue", 0, app.selected_row));
     } else if is_pending {
         if result.account == ACCOUNT_CODEX {
             if let Some(seconds) = app.codex_login_elapsed_seconds() {
@@ -2845,7 +2976,10 @@ fn provider_lines(app: &App) -> Vec<Line<'static>> {
         // recommended pick (avoids double-marking top + bottom).
         let is_current = current_recommended.is_none() && app.provider_row_is_current(row);
         lines.push(selectable_row(
-            &format!("{:<24} {status}", row.label),
+            &format!(
+                "{:<12} {:<18} {status}",
+                row.label, row.default_model.display
+            ),
             base + idx,
             app.selected_row,
             is_current,
@@ -3121,13 +3255,25 @@ fn browser_select_lines(app: &App, width: usize) -> Vec<Line<'static>> {
         Line::from(Span::styled("CHOOSE BROWSER", muted())),
         Line::from(""),
     ];
-    lines.push(Line::from(Span::styled("BROWSERS", muted())));
+    let rows = app.browser_select_rows();
+    let cloud_index = rows
+        .iter()
+        .position(|row| matches!(row, BrowserSelectRow::Cloud))
+        .unwrap_or(0);
+    lines.push(Line::from(Span::styled("REMOTE", muted())));
+    lines.push(browser_select_row_line(
+        BROWSER_USE_CLOUD,
+        Some("[FREE] recommended"),
+        cloud_index,
+        app.selected_row,
+        app.browser == BROWSER_USE_CLOUD,
+    ));
+    lines.extend([Line::from(""), Line::from(Span::styled("LOCAL", muted()))]);
     match &app.default_profile.status {
         DefaultProfileStatus::Loading => {
             lines.push(Line::from("  Scanning local browsers..."));
         }
         DefaultProfileStatus::Ready => {
-            let rows = app.browser_select_rows();
             if rows
                 .iter()
                 .all(|row| matches!(row, BrowserSelectRow::Cloud))
@@ -3138,14 +3284,9 @@ fn browser_select_lines(app: &App, width: usize) -> Vec<Line<'static>> {
                     match row {
                         BrowserSelectRow::Local(browser) => {
                             let is_current = browser_select_local_row_is_current(app, browser);
-                            let metadata = if browser.eq_ignore_ascii_case("Google Chrome") {
-                                Some("recommended")
-                            } else {
-                                None
-                            };
                             lines.push(browser_select_row_line(
                                 &truncate(browser, body_width),
-                                metadata,
+                                None,
                                 idx,
                                 app.selected_row,
                                 is_current,
@@ -3178,20 +3319,6 @@ fn browser_select_lines(app: &App, width: usize) -> Vec<Line<'static>> {
             push_wrapped_cookie_sync_message(&mut lines, error, body_width);
         }
     }
-    let non_local_start = app.browser_select_local_browser_count();
-    let cloud_description = if !app.browser_use_cloud_key_ready().unwrap_or(false) {
-        "needs Browser Use key"
-    } else {
-        "remote browser with live view"
-    };
-    lines.extend([Line::from(""), Line::from(Span::styled("REMOTE", muted()))]);
-    lines.push(browser_select_row_line(
-        BROWSER_USE_CLOUD,
-        Some(cloud_description),
-        non_local_start,
-        app.selected_row,
-        app.browser == BROWSER_USE_CLOUD,
-    ));
     lines
 }
 
