@@ -24,6 +24,7 @@ browser
 - supports headless Chromium and Browser Use cloud for clean or remote runs
 - lets you watch, steer, stop, retry, and resume tasks
 - keeps local history, screenshots, artifacts, and follow-ups
+- sees and heals its own helper code: the agent writes what's missing during execution, and the harness improves itself every run
 - uses a new LLM harness built to be 2x cheaper and 2x faster than Browser Harness
 
 ## How It Works

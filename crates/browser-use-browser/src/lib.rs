@@ -1483,6 +1483,12 @@ fn spawn_browser_script_with_session_registry(
 
     let agent_workspace_dir = agent_workspace_dir_for(artifact_dir.as_ref());
     let domain_skill_roots = domain_skill_roots_for(&agent_workspace_dir);
+    // Best-effort: a failure to materialize falls back to the embedded source.
+    let harness_source_path = materialize_harness_source(
+        &harness_source_dir_for(&agent_workspace_dir),
+        BROWSER_SCRIPT_HELPERS,
+    )
+    .ok();
     let run_id = new_browser_script_run_id();
     let stream_path = artifact_dir
         .as_ref()
@@ -1495,6 +1501,7 @@ fn spawn_browser_script_with_session_registry(
         cwd.as_ref(),
         artifact_dir.as_ref(),
         &agent_workspace_dir,
+        harness_source_path.as_deref(),
         &domain_skill_roots,
         &stream_path,
         &frames_dir,
@@ -2057,6 +2064,47 @@ fn agent_workspace_dir_for(artifact_dir: &Path) -> PathBuf {
     home_dir()
         .map(|home| home.join(".browser-use-terminal").join("agent-workspace"))
         .unwrap_or_else(|| PathBuf::from(".browser-use-terminal").join("agent-workspace"))
+}
+
+fn harness_source_dir_for(agent_workspace_dir: &Path) -> PathBuf {
+    agent_workspace_dir
+        .parent()
+        .map(|state_dir| state_dir.join("harness"))
+        .unwrap_or_else(|| agent_workspace_dir.join("harness"))
+}
+
+/// Materialize the embedded browser_script helper source as an editable file on
+/// disk, mirroring browser-harness's editable clone: the agent can read the
+/// harness's own code, and edits take effect on the next browser_script call.
+/// A pristine sidecar records the embedded version last written, so a binary
+/// update refreshes an unmodified copy but never clobbers an agent-healed one
+/// (the browser-harness `--update` refuses on a dirty worktree).
+fn materialize_harness_source(dir: &Path, embedded: &str) -> Result<PathBuf> {
+    let path = dir.join("browser_script_helpers.py");
+    let pristine = dir.join(".browser_script_helpers.pristine");
+    fs::create_dir_all(dir)
+        .with_context(|| format!("create harness source dir {}", dir.display()))?;
+    let on_disk = fs::read_to_string(&path).ok();
+    let last_pristine = fs::read_to_string(&pristine).ok();
+    let modified = match (&on_disk, &last_pristine) {
+        (None, _) => false,
+        (Some(current), Some(last)) => current != last,
+        (Some(current), None) => current != embedded,
+    };
+    if !modified {
+        if on_disk.as_deref() != Some(embedded) {
+            let tmp = dir.join(".browser_script_helpers.py.tmp");
+            fs::write(&tmp, embedded)
+                .with_context(|| format!("write harness source {}", tmp.display()))?;
+            fs::rename(&tmp, &path)
+                .with_context(|| format!("install harness source {}", path.display()))?;
+        }
+        if last_pristine.as_deref() != Some(embedded) {
+            fs::write(&pristine, embedded)
+                .with_context(|| format!("write harness pristine record {}", pristine.display()))?;
+        }
+    }
+    Ok(path)
 }
 
 fn domain_skill_roots_for(agent_workspace_dir: &Path) -> Vec<PathBuf> {
@@ -8482,6 +8530,7 @@ fn browser_script_prelude(
     cwd: &Path,
     artifact_dir: &Path,
     agent_workspace_dir: &Path,
+    harness_source_path: Option<&Path>,
     domain_skill_roots: &[PathBuf],
     stream_path: &Path,
     frames_dir: &Path,
@@ -8489,6 +8538,9 @@ fn browser_script_prelude(
 ) -> Result<String> {
     let encoded_code = general_purpose::STANDARD.encode(user_code.as_bytes());
     let encoded_helpers = general_purpose::STANDARD.encode(BROWSER_SCRIPT_HELPERS.as_bytes());
+    let harness_source = harness_source_path
+        .map(|path| path.display().to_string())
+        .unwrap_or_default();
     let domain_skill_roots_json = serde_json::to_string(
         &domain_skill_roots
             .iter()
@@ -8505,6 +8557,7 @@ ARTIFACT_DIR = pathlib.Path({artifact_dir:?}).expanduser().resolve()
 STREAM_PATH = pathlib.Path({stream_path:?}).expanduser().resolve()
 FRAMES_DIR = pathlib.Path({frames_dir:?}).expanduser().resolve()
 AGENT_WORKSPACE_DIR = pathlib.Path({agent_workspace_dir:?}).expanduser().resolve()
+HARNESS_SOURCE_PATH = pathlib.Path({harness_source:?}).expanduser() if {harness_source:?} else None
 DOMAIN_SKILL_ROOTS = json.loads({domain_skill_roots_json:?})
 ARTIFACT_DIR.mkdir(parents=True, exist_ok=True)
 STREAM_PATH.parent.mkdir(parents=True, exist_ok=True)
@@ -8843,6 +8896,16 @@ def _bridge(payload):
     return response.get("result")
 
 def _load_browser_script_helpers():
+    # Mirrors browser-harness's editable clone: the helper source on disk is the
+    # one that runs, so edits take effect on the next browser_script call and
+    # tracebacks point at a file the agent can read. Embedded copy is the fallback.
+    if HARNESS_SOURCE_PATH is not None:
+        try:
+            source = HARNESS_SOURCE_PATH.read_text(encoding="utf-8")
+            exec(compile(source, str(HARNESS_SOURCE_PATH), "exec"), globals())
+            return
+        except Exception:
+            pass
     source = base64.b64decode({encoded_helpers:?}).decode()
     exec(compile(source, "<browser_script_helpers>", "exec"), globals())
 
@@ -8916,7 +8979,13 @@ def session_metadata():
         "artifact_root": str(ARTIFACT_DIR),
         "outputs_dir": str(OUTPUTS_DIR),
         "agent_workspace": str(pathlib.Path(agent_workspace())),
+        "harness_source": harness_source_path(),
     }}
+
+def harness_source_path():
+    if HARNESS_SOURCE_PATH is not None and HARNESS_SOURCE_PATH.exists():
+        return str(HARNESS_SOURCE_PATH)
+    return None
 
 def agent_workspace():
     configured = os.environ.get("BH_AGENT_WORKSPACE")
@@ -11719,6 +11788,84 @@ print(json.dumps(skills))
 
         assert!(output.ok, "{:?}\n{}", output.error, output.text);
         assert!(output.text.contains("before inventing selectors"));
+    }
+
+    #[test]
+    fn browser_script_harness_source_is_materialized_and_readable() {
+        let temp = tempfile::tempdir().unwrap();
+        let output = run_browser_script(
+            "script-harness-source",
+            temp.path(),
+            temp.path().join("artifacts"),
+            r#"
+path = harness_source_path()
+assert path, "harness source path missing"
+source = pathlib.Path(path).read_text(encoding="utf-8")
+assert "def goto_url" in source, "helper source not readable"
+assert session_metadata()["harness_source"] == path
+import inspect
+assert "def goto_url" in inspect.getsource(goto_url), "tracebacks/getsource must resolve to the on-disk file"
+print("harness source ok")
+"#,
+            10,
+        )
+        .unwrap();
+
+        assert!(output.ok, "{:?}\n{}", output.error, output.text);
+        assert!(output.text.contains("harness source ok"));
+        let materialized = temp.path().join("harness/browser_script_helpers.py");
+        assert!(materialized.exists(), "harness source not materialized");
+    }
+
+    #[test]
+    fn browser_script_healed_harness_source_takes_effect_and_survives() {
+        let temp = tempfile::tempdir().unwrap();
+        let first = run_browser_script(
+            "script-harness-heal",
+            temp.path(),
+            temp.path().join("artifacts"),
+            "print(harness_source_path())",
+            10,
+        )
+        .unwrap();
+        assert!(first.ok, "{:?}\n{}", first.error, first.text);
+
+        let path = temp.path().join("harness/browser_script_helpers.py");
+        let mut source = fs::read_to_string(&path).unwrap();
+        source.push_str("\n\ndef healed_marker():\n    return \"healed\"\n");
+        fs::write(&path, &source).unwrap();
+
+        let output = run_browser_script(
+            "script-harness-heal",
+            temp.path(),
+            temp.path().join("artifacts"),
+            "print(healed_marker())",
+            10,
+        )
+        .unwrap();
+        assert!(output.ok, "{:?}\n{}", output.error, output.text);
+        assert!(output.text.contains("healed"));
+        // The healed copy must not be clobbered by the respawn.
+        assert!(fs::read_to_string(&path).unwrap().contains("healed_marker"));
+    }
+
+    #[test]
+    fn materialize_harness_source_refreshes_pristine_keeps_modified() {
+        let temp = tempfile::tempdir().unwrap();
+        let dir = temp.path().join("harness");
+        let path = materialize_harness_source(&dir, "v1").unwrap();
+        assert_eq!(fs::read_to_string(&path).unwrap(), "v1");
+        // An unmodified copy refreshes when a new embedded version ships.
+        materialize_harness_source(&dir, "v2").unwrap();
+        assert_eq!(fs::read_to_string(&path).unwrap(), "v2");
+        // An agent-healed copy is never clobbered.
+        fs::write(&path, "v2 healed").unwrap();
+        materialize_harness_source(&dir, "v3").unwrap();
+        assert_eq!(fs::read_to_string(&path).unwrap(), "v2 healed");
+        // Reverting to the pristine copy re-enables refresh.
+        fs::write(&path, "v2").unwrap();
+        materialize_harness_source(&dir, "v4").unwrap();
+        assert_eq!(fs::read_to_string(&path).unwrap(), "v4");
     }
 
     #[test]

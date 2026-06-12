@@ -11,6 +11,7 @@ Important execution model:
 - To listen to a running script, call this tool with `action="observe"`, the `run_id`, and optionally `observe_timeout_ms`. Prefer coarse waits (30000-120000 ms) for long navigation/extraction; do not burn many turns polling with short waits. To stop a run, call `action="cancel"` with the `run_id`; partial images/artifacts emitted before cancellation are preserved.
 - A failed call may include a short diagnosis. Read it first: if it says the browser is still connected or the same page is usable, continue from the same page instead of reconnecting.
 - Helpers are preimported; no imports needed for normal browser work. CDP is the source of truth — if a helper is incomplete, use `cdp(...)` directly.
+- The harness can see its own code: the full helper source lives on disk at `harness_source_path()` (also in `session_metadata()["harness_source"]`), and helper tracebacks reference that file — read it when a helper misbehaves or you need its exact behavior. Heal a broken or missing helper by writing the smallest replacement into `agent_workspace()/agent_helpers.py`; agent helpers load after the core source on every call, so your definition takes precedence and the next call uses the new code immediately.
 - Keep browser actions sequential and deliberate. Do not import Playwright, Selenium, or Pyppeteer.
 
 Preimported helpers:
@@ -62,6 +63,7 @@ session_metadata()
 audit_artifact(data=None, **requirements)
 load_agent_helpers()
 agent_workspace()
+harness_source_path()
 domain_skills_for_url(url_or_domain, include_content=False)
 last_domain_skills(include_content=False)
 ```
