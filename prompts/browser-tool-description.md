@@ -2,98 +2,53 @@ Browser runtime control tool.
 
 This tool is the browser control plane. It manages which browser is connected, who owns it, how CDP is attached, what recovery is safe, and what the current runtime knows. It does not click, type, scrape, screenshot, run page JavaScript, or inspect pixels. Use `browser_script` for page interaction.
 
-The input is a single CLI-like command string. You may include the leading word `browser`, but it is optional:
-
-```text
-browser status --json
-browser preference --json
-browser preference use local
-browser profile suggest --domain example.com --json
-browser profile remember --domain example.com --profile google-chrome:Profile 2
-browser domain skills --domain example.com --json
-browser connect
-browser connect local
-browser local list --json
-browser local open --profile google-chrome:Profile 2
-browser local setup
-browser local setup --profile google-chrome:Profile 2
-browser connect managed --headed
-browser remote profiles --json
-browser remote start --profile-id <cloud-profile-id>
-browser recover reconnect-websocket
-browser script runs --json
-browser script cancel <run_id>
-```
+The input is a single CLI-like command string. The leading word `browser` is optional. See the full command reference under "Commands:" below.
 
 Mental model:
 
-- `browser` owns runtime/control/debug.
-- `browser_script` owns page interaction/data extraction.
-- Rust holds the CDP websocket, current target id, current session id, ownership, and connection generation.
-- Python in `browser_script` is fresh per call; Python variables do not persist.
+- `browser` owns runtime/control/debug; `browser_script` owns page interaction/data extraction.
+- Rust holds the CDP websocket, current target id, current session id, ownership, and connection generation. Python in `browser_script` is fresh per call; variables do not persist.
 - Nothing reloads, relaunches, closes, or switches tabs silently. If IDs may change, this tool reports that and you choose the next action.
-- `browser status --json` may include `last_issue`, a compact diagnosis from the most recent browser/browser_script failure. Use its `next_step`, `browser_usable`, and `page_usable` fields before deciding to reconnect.
-- `browser status --json` also lists active `browser_script` runs. Use the `browser_script` tool with `action="observe"` to listen to them; use `browser script cancel <run_id>` only for cleanup or explicit cancellation.
+- `browser status --json` may include `last_issue`, a compact diagnosis from the most recent failure; check its `next_step`, `browser_usable`, and `page_usable` before deciding to reconnect. It also lists active `browser_script` runs — use `action="observe"` to listen to them; use `browser script cancel <run_id>` only for cleanup or explicit cancellation.
 
 Preferences:
 
-- `browser preference --json` shows the remembered browser mode/profile preferences.
-- `browser preference use local|cloud|managed-headless|managed-headed` changes what plain `browser connect` means.
-- `browser profile suggest --domain <regex> --json` lists remembered and local profile options for a site in Local Chrome mode, and cloud profiles whose cookie domains match the regex in Browser Use Cloud mode.
-- `browser profile remember --domain <domain> --profile <profile-id> [--mode local|cloud]` stores the profile to use next time for that domain.
-- `browser domain skills --domain <domain> --json` lists matching browser-harness domain skill files. Use `--include-content` when you need to read the playbook before navigation.
-- If a site likely needs login and no profile is remembered, run `browser profile suggest --domain <regex> --json` before connecting. In cloud mode, choose a profile whose matching cookie domains fit the target login domain, run `browser profile remember --mode cloud --profile <profile-id>`, then `browser connect`. Do not guess friendly cloud profile names like `Work`.
+- `preference use local|cloud|managed-headless|managed-headed` changes what plain `browser connect` means.
+- `profile suggest --domain <regex>` lists remembered/local profiles (Local Chrome mode) and cloud profiles whose cookie domains match the regex (Cloud mode). If a site likely needs login and no profile is remembered, run it before connecting; in cloud mode pick a profile whose cookie domains fit the login domain, `profile remember --mode cloud --profile <profile-id>`, then `browser connect`. Do not guess friendly cloud profile names like `Work`.
 - Do not silently attach to a different local profile when a profile is remembered.
+- `domain skills --domain <domain>` lists matching browser-harness domain skill files; use `--include-content` to read the playbook before navigation.
 - Tool commands returned in `next_step` are internal actions for you to run. Never tell the user to run `browser ...` commands manually.
 
 Local real browser:
 
-- `browser connect local` checks for a local Chromium-family browser exposing CDP and attaches only after the user enables remote debugging.
+- `browser connect local` attaches to a local Chromium-family browser exposing CDP, only after the user enables remote debugging.
 - Do not guess a browser family flag. The tool auto-detects Chrome, Chrome Canary, Chromium, Edge, Brave, Arc, Dia, Comet, and common forks through DevToolsActivePort.
-- If one candidate exists, it connects. If multiple candidates exist, ask the user which candidate to use, then run `browser connect local --candidate <id>`.
-- If Chrome blocks the connection with permission evidence such as 403 and `remote_debugging_enabled` is true, the checkbox is already enabled. Do not open the checkbox page. If the popup is not visible and `profile_recovery_command` is present, run it to open/focus the saved profile window, then ask the user to click Allow in Chrome's permission popup.
-- If the tool reports `state: "cdp-disabled"`, Chrome is open but not exposing CDP because the remote debugging checkbox is off. Call `browser local setup`; tell the user to enable the checkbox in Chrome, then reconnect.
-- If the port is closed or `DevToolsActivePort` is stale, Chrome is not exposing CDP right now. Do not tell the user remote debugging is disabled. If `profile_recovery_command` is present, run it to open the saved profile window, then retry `browser connect local`. Otherwise ask which local profile/browser to use.
+- One candidate connects automatically; with multiple, ask the user which, then `browser connect local --candidate <id>`.
+- If Chrome blocks with permission evidence such as 403 and `remote_debugging_enabled` is true, the checkbox is already enabled. Do not open the checkbox page. If the popup is not visible and `profile_recovery_command` is present, run it to open/focus the saved profile window, then ask the user to click Allow.
+- If `state: "cdp-disabled"`, Chrome is open but the remote debugging checkbox is off. Call `browser local setup`, tell the user to enable the checkbox, then reconnect.
+- If the port is closed or `DevToolsActivePort` is stale, Chrome is not exposing CDP. Do not tell the user remote debugging is disabled. If `profile_recovery_command` is present, run it then retry `browser connect local`; otherwise ask which local profile/browser to use.
 - Do not launch the user's real default Chrome profile with remote-debugging flags. Real logged-in profiles are attached while already open.
 
 Local profiles:
 
-- `browser local profiles --json` is built into Rust. It scans Chromium-family profile folders on disk and does not require any external CLI.
-- Use local profile listing when the user asks which local browser profiles exist or which profile likely contains a login.
-- Profiles have stable ids like `google-chrome:Default`; use that id for inspection when possible.
-- If a profile id or name contains spaces, quote it like `browser local profiles inspect 'google-chrome:Profile 2' --domains-only`.
-- `browser local profiles inspect <profile-id-or-name> --domains-only` copies the selected profile into a temporary browser profile, starts that temporary copy with CDP, and returns only cookie domain/count/expiry metadata.
-- Raw cookie values are never returned by default. Profile inspection is for choosing the right profile, not for dumping secrets.
+- `local profiles --json` (built into Rust, no external CLI) scans Chromium-family profile folders on disk. Use it when the user asks which local profiles exist or which likely contains a login. Profiles have stable ids like `google-chrome:Default`; quote ids/names with spaces, e.g. `local profiles inspect 'google-chrome:Profile 2' --domains-only`.
+- `local profiles inspect <id-or-name> --domains-only` copies the profile into a temp profile, starts it with CDP, and returns only cookie domain/count/expiry metadata. Raw cookie values are never returned by default; inspection is for choosing the right profile, not dumping secrets.
 
 Managed browser:
 
-- `browser connect managed` starts a Rust-owned browser with a temp profile by default.
-- Use `--headless` or `--headed`; default is headless.
-- Use `--profile <path>` only for an explicit non-default automation profile.
-- Rust may stop/restart this browser because Rust owns it. It is not the user's real logged-in Chrome.
+- `browser connect managed` starts a Rust-owned browser with a temp profile by default. `--headless`/`--headed` (default headless); `--profile <path>` only for an explicit non-default automation profile. Rust owns it and may stop/restart it; it is not the user's real logged-in Chrome.
 
 Remote browsers:
 
-- `browser connect remote-cdp --url <http-url>` attaches to an external DevTools HTTP endpoint.
-- `browser connect remote-cdp --ws <ws-url>` attaches to an external CDP websocket.
-- `browser remote start ...` creates a Browser Use cloud browser and connects to it. Remote start means start and connect; do not copy the returned CDP URL into another command.
-- For login-sensitive cloud work, prefer `browser connect` after storing a cloud profile preference, or pass `--profile-id <uuid>` explicitly. If `--profile-name` fails, do not continue in a clean cloud browser; list profiles with `browser remote profiles --json` and choose by ID/cookie domains.
-- `browser remote stop` only stops a Browser Use cloud browser created by this runtime.
-- `browser remote profiles --json` lists cloud profiles without raw cookie values.
+- `browser connect remote-cdp --url <http-url>` or `--ws <ws-url>` attaches to an external DevTools HTTP endpoint or CDP websocket.
+- `browser remote start ...` creates a Browser Use cloud browser and connects to it (start and connect; do not copy the returned CDP URL into another command).
+- For login-sensitive cloud work, prefer `browser connect` after storing a cloud profile preference, or pass `--profile-id <uuid>` explicitly. If `--profile-name` fails, do not continue in a clean cloud browser; list with `remote profiles --json` and choose by ID/cookie domains.
+- `remote stop` only stops a Browser Use cloud browser created by this runtime. `remote profiles --json` lists cloud profiles without raw cookie values.
 
-Doctor:
+Doctor and recovery:
 
-- `browser doctor` and `browser doctor --json` are read-only.
-- Doctor checks runtime state, local browser candidates, Rust local profile discovery, API key, CDP websocket health, current target health, and safe next steps.
-- Doctor never fixes state by itself. If a fix is available it prints an explicit command.
-
-Recovery:
-
-- `browser recover reconnect-websocket`: reconnects the CDP websocket to the same endpoint. It never reloads the page.
-- `browser recover reattach-same-target`: attaches a fresh CDP session to the same target id. If the target is gone, it reports available targets and does not silently switch.
-- `browser recover restart-runtime`: resets the Rust connection holder and reconnects to the same endpoint. It does not kill Chrome.
-- `browser recover restart-owned-browser`: restarts only Rust-owned managed browsers.
-- `browser recover stop-owned-remote`: stops only Rust-owned Browser Use cloud browsers.
+- `browser doctor [--json]` is read-only: it checks runtime state, local candidates, profile discovery, API key, websocket/target health, and safe next steps, but never fixes state itself — if a fix is available it prints an explicit command.
+- `recover reconnect-websocket` reconnects the CDP websocket to the same endpoint (never reloads the page). `recover reattach-same-target` attaches a fresh session to the same target id (reports available targets, never silently switches, if it is gone). `recover restart-runtime` resets the Rust connection holder and reconnects to the same endpoint (does not kill Chrome). `recover restart-owned-browser` restarts only Rust-owned managed browsers; `recover stop-owned-remote` stops only Rust-owned cloud browsers.
 
 Commands:
 
