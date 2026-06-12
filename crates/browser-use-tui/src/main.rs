@@ -9079,9 +9079,8 @@ impl App {
                 .or(state.browser.url.as_deref())
                 .map(ToOwned::to_owned)
         };
-        // No placeholder fallback here: handing "about:blank" to the OS opener
-        // is never useful, and on macOS LaunchServices can fuzzy-match junk
-        // strings to application names ("about*" uniquely resolves to
+        // No placeholder fallback here: on macOS LaunchServices, about:blank can fuzzy-match
+        // to application names (ex: "about" resolves to
         // /System/Library/CoreServices/Applications/About This Mac.app).
         let Some(target) = target else {
             self.browser_notice = Some("No browser URL to open yet.".to_string());
@@ -10711,12 +10710,10 @@ fi | sh -s -- --no-launch
         .with_context(|| format!("download and run installer script {url}"))
 }
 
-/// Validate a string before handing it to the OS URL opener (`/usr/bin/open`
-/// on macOS). Only http(s)/file URLs are externally openable; browser-internal
+/// Validate a string before handing it to the OS URL opener
+/// Only http(s)/file URLs are externally openable; browser-internal
 /// placeholders like `about:blank` or `chrome://...` must never reach
-/// LaunchServices — it cannot open them, and on macOS an unresolvable string
-/// can be fuzzy-matched as an application name ("about*" uniquely resolves to
-/// "About This Mac.app"), popping the About This Mac window mid-task.
+/// LaunchServices
 fn external_browser_target(target: &str) -> Result<&str> {
     let target = target.trim();
     if target.is_empty() {
@@ -19023,10 +19020,7 @@ wire_api = "responses"
 
     #[test]
     fn external_browser_target_rejects_browser_internal_placeholders() {
-        // Only externally openable URLs may reach the OS opener. Passing
-        // browser-internal placeholders like about:blank to `open` on macOS can
-        // fuzzy-match an application name instead ("about*" resolves uniquely
-        // to About This Mac.app), popping About This Mac during agent runs.
+        // Only externally openable URLs may reach the OS opener
         assert!(external_browser_target("about:blank").is_err());
         assert!(external_browser_target("chrome://inspect/#remote-debugging").is_err());
         assert!(external_browser_target("").is_err());
