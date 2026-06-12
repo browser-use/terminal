@@ -218,6 +218,14 @@ enum Command {
     Start {
         text: String,
     },
+    /// Run a browser task to completion with the configured default
+    /// provider/model (resolved like the TUI). Streams progress and exits when
+    /// the task finishes — the delegation entry point for external assistants.
+    Run {
+        text: String,
+        #[arg(long)]
+        model: Option<String>,
+    },
     RunFake {
         text: String,
         #[arg(long)]
@@ -337,6 +345,41 @@ enum Command {
     BrowserScript {
         task_id: String,
         code: String,
+    },
+    /// Browser management for external assistants
+    ///
+    /// `browser exec [CODE]` runs Python with browser helpers pre-imported
+    /// (reads stdin when CODE is omitted — heredoc-friendly) and prints the
+    /// script output plus `Screenshot saved to <path>` lines. Any other
+    /// arguments are forwarded to the browser control plane
+    /// (`status --json`, `connect local`, `doctor`, ...); run
+    /// `browser help` for the full command list. The browser auto-connects
+    /// using the remembered preference, and the browser itself persists across
+    /// invocations.
+    Browser {
+        /// Named workstream; isolates artifact dirs and event logs.
+        #[arg(long, default_value = "default")]
+        session: String,
+        /// Per-exec script timeout in seconds.
+        #[arg(long, default_value_t = 300)]
+        timeout: u64,
+        /// Print the full structured response as JSON.
+        #[arg(long)]
+        json: bool,
+        /// `exec [CODE]` or control-plane command words.
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
+    /// Internal: long-lived daemon backing the `browser` subcommand. Holds the
+    /// CDP connection so Chrome's per-connection permission prompt fires once,
+    /// not on every one-shot CLI invocation. Spawned automatically.
+    #[command(name = "browser-daemon", hide = true)]
+    BrowserDaemon,
+    /// Print or install the assistant-facing skill (SKILL.md) that teaches
+    /// coding assistants how to use the `browser` subcommand.
+    Skill {
+        #[command(subcommand)]
+        command: SkillCommand,
     },
     SyncCookies {
         #[arg(value_name = "LOCAL_PROFILE")]
@@ -746,6 +789,32 @@ enum SessionsCommand {
     },
 }
 
+#[derive(Debug, Subcommand)]
+enum SkillCommand {
+    /// Print the skill markdown to stdout.
+    Show,
+    /// Print the canonical install location for each assistant.
+    Paths,
+    /// Install the skill for coding assistants. With no argument, installs for
+    /// every assistant whose home directory exists.
+    Install {
+        #[arg(value_enum)]
+        assistant: Option<SkillAssistant>,
+    },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+enum SkillAssistant {
+    /// Claude Code (~/.claude/skills). OpenCode also discovers this location.
+    Claude,
+    /// Codex CLI ($CODEX_HOME or ~/.codex, under skills/).
+    Codex,
+    /// OpenCode (~/.config/opencode/skills).
+    Opencode,
+    /// The cross-assistant agents dir (~/.agents/skills).
+    Agents,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
 enum AuthAccount {
     Codex,
@@ -864,6 +933,15 @@ fn main() -> Result<()> {
     };
     match args.command {
         Command::Start { text } => start(&store, text),
+        Command::Run { text, model } => run_default(
+            &store,
+            text,
+            model,
+            config_profile.as_deref(),
+            &config_overrides,
+            collaboration_mode,
+            &runtime_options,
+        ),
         Command::RunFake { text, python_code } => run_fake(&store, text, python_code),
         Command::RunOpenai { text, model } => run_openai(
             &store,
@@ -1001,6 +1079,14 @@ fn main() -> Result<()> {
         Command::Events { task_id } => events(&store, &task_id),
         Command::Python { task_id, code } => python(&store, &task_id, code),
         Command::BrowserScript { task_id, code } => browser_script(&store, &task_id, code),
+        Command::Browser {
+            session,
+            timeout,
+            json,
+            args: browser_args,
+        } => browser_cli(store, &session, timeout, json, browser_args),
+        Command::BrowserDaemon => browser_external_daemon(store),
+        Command::Skill { command } => skill(command),
         Command::SyncCookies {
             profile,
             local_profile,
@@ -1267,6 +1353,7 @@ fn main() -> Result<()> {
 fn command_name(command: &Command) -> &'static str {
     match command {
         Command::Start { .. } => "start",
+        Command::Run { .. } => "run",
         Command::RunFake { .. } => "run_fake",
         Command::RunOpenai { .. } => "run_openai",
         Command::RunBrowserUse { .. } => "run_browser_use",
@@ -1292,6 +1379,9 @@ fn command_name(command: &Command) -> &'static str {
         Command::Events { .. } => "events",
         Command::Python { .. } => "python",
         Command::BrowserScript { .. } => "browser_script",
+        Command::Browser { .. } => "browser",
+        Command::BrowserDaemon => "browser_daemon",
+        Command::Skill { .. } => "skill",
         Command::SyncCookies { .. } => "sync_cookies",
         Command::UserShell { .. } => "user_shell",
         Command::Review { .. } => "review",
@@ -2314,6 +2404,143 @@ fn dataset_browser_mode(options: &DatasetRunOptions) -> String {
         .replace(['_', ' '], "-")
 }
 
+fn provider_backend_from_env_keys() -> Option<ProviderBackend> {
+    let has = |key: &str| std::env::var(key).is_ok_and(|value| !value.trim().is_empty());
+    if has("ANTHROPIC_API_KEY") {
+        Some(ProviderBackend::Anthropic)
+    } else if has("OPENAI_API_KEY") {
+        Some(ProviderBackend::Openai)
+    } else if has("BROWSER_USE_API_KEY") {
+        Some(ProviderBackend::BrowserUse)
+    } else if has("OPENROUTER_API_KEY") {
+        Some(ProviderBackend::Openrouter)
+    } else if has("DEEPSEEK_API_KEY") {
+        Some(ProviderBackend::Deepseek)
+    } else if has("GEMINI_API_KEY") || has("GOOGLE_API_KEY") {
+        Some(ProviderBackend::Google)
+    } else {
+        None
+    }
+}
+
+/// `browser-use-terminal run "<task>"`: provider-agnostic task run.
+///
+/// Resolves the provider from the user's config (what `/model` in the TUI
+/// persists), falling back to whichever provider API key is set in the
+/// environment, then dispatches to the matching `run-*` path. Unlike `start`
+/// (which only queues a session), this drives the task to completion.
+fn run_default(
+    store: &Store,
+    text: String,
+    model: Option<String>,
+    config_profile: Option<&str>,
+    raw_config_overrides: &[String],
+    collaboration_mode: CollaborationModeKind,
+    runtime_options: &CliRuntimeOptions,
+) -> Result<()> {
+    let overrides = parse_cli_config_overrides(raw_config_overrides)?;
+    let cwd = std::env::current_dir()?;
+    let configured =
+        configured_model_provider_id_for_cwd_with_options(&cwd, config_profile, &overrides)?;
+    let backend = match configured.as_deref().map(str::trim) {
+        Some(provider_id) if !provider_id.is_empty() => {
+            ProviderBackend::from_provider_id(provider_id).unwrap_or(ProviderBackend::Openai)
+        }
+        _ => provider_backend_from_env_keys().ok_or_else(|| {
+            anyhow::anyhow!(
+                "no model provider is configured. Configure one in the TUI (`browser`, then \
+                 /auth and /model), set a provider API key (ANTHROPIC_API_KEY, OPENAI_API_KEY, \
+                 OPENROUTER_API_KEY, DEEPSEEK_API_KEY, GEMINI_API_KEY, or BROWSER_USE_API_KEY), or use an \
+                 explicit command such as `browser-use-terminal run-anthropic \"<task>\"`."
+            )
+        })?,
+    };
+    match backend {
+        ProviderBackend::Openai => run_openai(
+            store,
+            text,
+            model,
+            config_profile,
+            raw_config_overrides,
+            collaboration_mode,
+            runtime_options,
+        ),
+        ProviderBackend::Anthropic
+        | ProviderBackend::Openrouter
+        | ProviderBackend::Deepseek
+        | ProviderBackend::Google
+        | ProviderBackend::BrowserUse
+        | ProviderBackend::Codex => {
+            let (model, _source) = resolve_cli_model_with_source(
+                backend,
+                model,
+                config_profile,
+                raw_config_overrides,
+            )?;
+            match backend {
+                ProviderBackend::Anthropic => run_anthropic(
+                    store,
+                    text,
+                    model,
+                    config_profile,
+                    raw_config_overrides,
+                    collaboration_mode,
+                    runtime_options,
+                ),
+                ProviderBackend::Openrouter => run_openrouter(
+                    store,
+                    text,
+                    model,
+                    config_profile,
+                    raw_config_overrides,
+                    collaboration_mode,
+                    runtime_options,
+                ),
+                ProviderBackend::Deepseek => run_deepseek(
+                    store,
+                    text,
+                    model,
+                    config_profile,
+                    raw_config_overrides,
+                    collaboration_mode,
+                    runtime_options,
+                ),
+                ProviderBackend::Google => run_google(
+                    store,
+                    text,
+                    model,
+                    config_profile,
+                    raw_config_overrides,
+                    collaboration_mode,
+                    runtime_options,
+                ),
+                ProviderBackend::BrowserUse => run_browser_use(
+                    store,
+                    text,
+                    model,
+                    config_profile,
+                    raw_config_overrides,
+                    collaboration_mode,
+                    runtime_options,
+                ),
+                ProviderBackend::Codex => run_codex(
+                    store,
+                    text,
+                    model,
+                    config_profile,
+                    raw_config_overrides,
+                    collaboration_mode,
+                    runtime_options,
+                ),
+                _ => unreachable!(),
+            }
+        }
+        ProviderBackend::Fake | ProviderBackend::None => {
+            bail!("no runnable model provider configured")
+        }
+    }
+}
+
 fn run_openai(
     store: &Store,
     text: String,
@@ -3175,7 +3402,21 @@ fn show(store: &Store, task_id: &str) -> Result<()> {
     let title = task_from_events(&events).unwrap_or_else(|| "untitled task".to_string());
     let browser = browser_summary_from_events(&events, "local chrome");
     println!("Task: {title}");
-    println!("Status: {}", task.status.as_str());
+    // A session created by `start` (or an SDK queue) has no agent attached yet;
+    // reporting it as plain "running" sends pollers into infinite loops.
+    let agent_started = events.iter().any(|event| {
+        !matches!(
+            event.event_type.as_str(),
+            "session.created" | "session.input"
+        )
+    });
+    if task.status.is_active() && !agent_started {
+        println!(
+            "Status: queued (no agent attached — drive it with `browser-use-terminal run \"<task>\"` next time, or `run-anthropic-session {task_id}` to run this one)"
+        );
+    } else {
+        println!("Status: {}", task.status.as_str());
+    }
     if let Some(url) = browser.url {
         println!("Browser: {url}");
     }
@@ -3314,6 +3555,845 @@ fn browser_script(store: &Store, task_id: &str, code: String) -> Result<()> {
             .error
             .unwrap_or_else(|| "browser_script failed".to_string())
     )
+}
+
+/// Assistant-facing skill document, embedded so installed binaries can write
+/// it without a repo checkout. Source of truth: `SKILL.md` at the repo root.
+const SKILL_MD: &str = include_str!("../../../SKILL.md");
+const SKILL_DIR_NAME: &str = "browser-use-terminal";
+const EXTERNAL_BROWSER_SESSION_PREFIX: &str = "browser-cli-";
+/// Screenshot downscale ceiling for the external CLI surface. Assistants view
+/// screenshots through their file-read tools, several of which resize or
+/// reject images above ~2000 px per side (Codex `view_image` caps at 2048).
+const EXTERNAL_SCREENSHOT_MAX_DIM: &str = "1800";
+
+/// One parsed `browser` CLI invocation: either Python to exec or a
+/// control-plane command string.
+enum ExternalBrowserAction {
+    Exec { code: String },
+    Command { command: String },
+}
+
+/// `browser-use-terminal browser ...`: browser management for external coding
+/// assistants. One-shot invocations run against a durable named session and
+/// route through a long-lived per-state-dir daemon that holds the CDP
+/// connection (so Chrome's per-connection permission prompt fires once, like
+/// the TUI), falling back to in-process execution if the daemon can't start.
+fn browser_cli(
+    store: Store,
+    session: &str,
+    timeout: u64,
+    json: bool,
+    args: Vec<String>,
+) -> Result<()> {
+    let session_name = sanitize_external_session_name(session)?;
+    let session_id = format!("{EXTERNAL_BROWSER_SESSION_PREFIX}{session_name}");
+    let cwd = std::env::current_dir().context("resolve current dir")?;
+    let state_dir = store.state_dir().to_path_buf();
+
+    let mut argv = args;
+    if argv.first().map(String::as_str) == Some("browser") {
+        argv.remove(0);
+    }
+    if argv.is_empty() {
+        argv.push("help".to_string());
+    }
+
+    // Daemon control operates on the daemon itself and must not side-effect a
+    // browser session row / artifact dir; intercept before the session ensure.
+    if argv.first().map(String::as_str) == Some("daemon") {
+        return browser_external_daemon_control(&state_dir, &argv);
+    }
+
+    let task = match store.load_session(&session_id)? {
+        Some(task) => task,
+        None => {
+            let artifact_root = store.state_dir().join("artifacts").join(&session_id);
+            store.create_session_with_id_and_artifact_root(
+                None,
+                &cwd,
+                artifact_root,
+                session_id.clone(),
+            )?
+        }
+    };
+    let artifact_dir = PathBuf::from(&task.artifact_root);
+
+    let action = if argv.first().map(String::as_str) == Some("exec") {
+        let code = if argv.len() == 1 || (argv.len() == 2 && argv[1] == "-") {
+            let mut buffer = String::new();
+            io::stdin()
+                .read_to_string(&mut buffer)
+                .context("read Python code from stdin")?;
+            buffer
+        } else {
+            argv[1..].join(" ")
+        };
+        if code.trim().is_empty() {
+            bail!("no Python code provided: pass it as an argument or on stdin (heredoc)");
+        }
+        ExternalBrowserAction::Exec { code }
+    } else {
+        ExternalBrowserAction::Command {
+            command: join_browser_command_words(&argv),
+        }
+    };
+
+    if external_browser_daemon_enabled() {
+        match ensure_external_browser_daemon(&state_dir) {
+            Ok(socket) => {
+                drop(store);
+                return browser_cli_via_daemon(
+                    &socket,
+                    &session_id,
+                    &cwd,
+                    &artifact_dir,
+                    timeout,
+                    json,
+                    action,
+                );
+            }
+            Err(error) => {
+                eprintln!(
+                    "warning: browser daemon unavailable ({error:#}); running in-process. \
+                     Local Chrome may re-prompt its debugging permission."
+                );
+            }
+        }
+    }
+    apply_external_browser_env_defaults(&state_dir);
+    let shared: SharedStore = Arc::new(Mutex::new(store));
+    browser_cli_in_process(
+        &shared,
+        &session_id,
+        &cwd,
+        &artifact_dir,
+        timeout,
+        json,
+        action,
+    )
+}
+
+/// Persistence + screenshot env defaults shared by the daemon and the
+/// in-process fallback: Rust-owned browsers must survive process exit so
+/// later invocations (or a restarted daemon) reattach instead of relaunching.
+fn apply_external_browser_env_defaults(state_dir: &Path) {
+    unsafe {
+        std::env::set_var("BROWSER_USE_TERMINAL_PERSIST_BROWSERS", "1");
+        if std::env::var_os("BU_EXTERNAL_BROWSER_STATE_DIR").is_none() {
+            std::env::set_var(
+                "BU_EXTERNAL_BROWSER_STATE_DIR",
+                state_dir.join("external-browser"),
+            );
+        }
+        if std::env::var_os("BU_BROWSER_SCREENSHOT_MAX_DIM").is_none()
+            && std::env::var_os("BROWSER_USE_SCREENSHOT_MAX_DIM").is_none()
+        {
+            std::env::set_var("BU_BROWSER_SCREENSHOT_MAX_DIM", EXTERNAL_SCREENSHOT_MAX_DIM);
+        }
+    }
+}
+
+fn external_browser_daemon_enabled() -> bool {
+    if !cfg!(unix) {
+        return false;
+    }
+    match std::env::var("BUT_BROWSER_EXTERNAL_DAEMON") {
+        Ok(value) => !matches!(
+            value.trim().to_ascii_lowercase().as_str(),
+            "0" | "false" | "no" | "off"
+        ),
+        Err(_) => true,
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn browser_cli_in_process(
+    shared: &SharedStore,
+    session_id: &str,
+    cwd: &Path,
+    artifact_dir: &Path,
+    timeout: u64,
+    json: bool,
+    action: ExternalBrowserAction,
+) -> Result<()> {
+    match action {
+        ExternalBrowserAction::Exec { code } => {
+            let outcome = browser_use_agent::tools::handlers::browser::run_external_browser_script(
+                shared,
+                session_id,
+                cwd,
+                artifact_dir,
+                &code,
+                timeout,
+            )?;
+            match outcome {
+                browser_use_agent::tools::handlers::browser::ExternalBrowserScriptOutcome::Blocked(
+                    content,
+                ) => print_external_blocked(&content),
+                browser_use_agent::tools::handlers::browser::ExternalBrowserScriptOutcome::Ran(
+                    out,
+                ) => print_external_exec_result(&out, json),
+            }
+        }
+        ExternalBrowserAction::Command { command } => {
+            let out = browser_use_agent::tools::handlers::browser::run_external_browser_command(
+                shared,
+                session_id,
+                cwd,
+                artifact_dir,
+                &command,
+            )?;
+            print_external_command_content(&out.content);
+            Ok(())
+        }
+    }
+}
+
+fn print_external_blocked(content: &Value) -> Result<()> {
+    println!("{}", serde_json::to_string_pretty(content)?);
+    bail!("browser needs user action before scripts can run (see JSON above)")
+}
+
+fn print_external_exec_result(
+    out: &browser_use_browser::BrowserScriptOutput,
+    json: bool,
+) -> Result<()> {
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::to_value(out)?)?
+        );
+    } else {
+        print_external_script_output(out);
+    }
+    if !out.ok {
+        bail!(
+            "{}",
+            out.error
+                .clone()
+                .unwrap_or_else(|| "browser_script failed".to_string())
+        );
+    }
+    Ok(())
+}
+
+fn print_external_command_content(content: &Value) {
+    match content {
+        Value::String(text) => println!("{text}"),
+        other => println!(
+            "{}",
+            serde_json::to_string_pretty(other).unwrap_or_else(|_| other.to_string())
+        ),
+    }
+}
+
+// ============================================================================
+// External browser daemon
+// ============================================================================
+//
+// The `browser` subcommand is invoked once per bash call by external
+// assistants, but a CDP attachment to the user's real Chrome must outlive any
+// single invocation: Chrome shows its debugging-permission popup per new
+// connection, and the in-process connection caches only help within one
+// process. So the CLI is a thin client over a per-state-dir unix-socket daemon
+// (browser-harness architecture) that hosts the browser session registries —
+// and therefore the live CDP websocket — across invocations.
+
+#[derive(Debug, Serialize, serde::Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+enum ExternalBrowserDaemonRequest {
+    Ping,
+    Shutdown,
+    Command {
+        session_id: String,
+        cwd: PathBuf,
+        artifact_dir: PathBuf,
+        command: String,
+    },
+    Exec {
+        session_id: String,
+        cwd: PathBuf,
+        artifact_dir: PathBuf,
+        code: String,
+        timeout_secs: u64,
+    },
+}
+
+#[derive(Debug, Default, Serialize, serde::Deserialize)]
+struct ExternalBrowserDaemonResponse {
+    ok: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    version: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    error: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    content: Option<Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    script: Option<browser_use_browser::BrowserScriptOutput>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    blocked: Option<Value>,
+}
+
+fn fnv1a_hash(bytes: &[u8]) -> u64 {
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for byte in bytes {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    hash
+}
+
+/// Socket lives in the temp dir (AF_UNIX paths are length-limited on macOS),
+/// keyed by the canonical state dir so isolated `--state-dir` runs get their
+/// own daemon. The log lives inside the state dir.
+fn external_daemon_socket_path(state_dir: &Path) -> PathBuf {
+    let canonical = fs::canonicalize(state_dir).unwrap_or_else(|_| state_dir.to_path_buf());
+    let hash = fnv1a_hash(canonical.to_string_lossy().as_bytes());
+    std::env::temp_dir().join(format!("but-browser-{hash:016x}.sock"))
+}
+
+fn external_daemon_log_path(state_dir: &Path) -> PathBuf {
+    state_dir.join("external-browser").join("daemon.log")
+}
+
+#[cfg(unix)]
+fn external_daemon_send(
+    socket: &Path,
+    request: &ExternalBrowserDaemonRequest,
+    read_timeout: Duration,
+) -> Result<ExternalBrowserDaemonResponse> {
+    use std::os::unix::net::UnixStream;
+    let stream = UnixStream::connect(socket)
+        .with_context(|| format!("connect browser daemon socket {}", socket.display()))?;
+    stream.set_write_timeout(Some(Duration::from_secs(10)))?;
+    stream.set_read_timeout(Some(read_timeout))?;
+    let mut payload = serde_json::to_vec(request)?;
+    payload.push(b'\n');
+    (&stream).write_all(&payload)?;
+    let mut line = String::new();
+    io::BufReader::new(&stream)
+        .read_line(&mut line)
+        .context("read browser daemon response")?;
+    serde_json::from_str(&line).context("parse browser daemon response")
+}
+
+#[cfg(not(unix))]
+fn external_daemon_send(
+    _socket: &Path,
+    _request: &ExternalBrowserDaemonRequest,
+    _read_timeout: Duration,
+) -> Result<ExternalBrowserDaemonResponse> {
+    bail!("the external browser daemon is only supported on unix")
+}
+
+/// Ping the daemon; spawn it if missing; restart it on version mismatch so a
+/// CLI update never talks to a stale daemon. Returns the socket path.
+fn ensure_external_browser_daemon(state_dir: &Path) -> Result<PathBuf> {
+    let socket = external_daemon_socket_path(state_dir);
+    let version = env!("CARGO_PKG_VERSION");
+    if let Ok(response) =
+        external_daemon_send(&socket, &ExternalBrowserDaemonRequest::Ping, PING_TIMEOUT)
+    {
+        if response.ok && response.version.as_deref() == Some(version) {
+            return Ok(socket);
+        }
+        let _ = external_daemon_send(
+            &socket,
+            &ExternalBrowserDaemonRequest::Shutdown,
+            PING_TIMEOUT,
+        );
+        let gone_deadline = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < gone_deadline {
+            if external_daemon_send(&socket, &ExternalBrowserDaemonRequest::Ping, PING_TIMEOUT)
+                .is_err()
+            {
+                break;
+            }
+            thread::sleep(Duration::from_millis(100));
+        }
+    }
+    let _ = fs::remove_file(&socket);
+
+    let log_path = external_daemon_log_path(state_dir);
+    if let Some(parent) = log_path.parent() {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("create daemon log dir {}", parent.display()))?;
+    }
+    let log = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&log_path)
+        .with_context(|| format!("open daemon log {}", log_path.display()))?;
+    let exe = std::env::current_exe().context("resolve current executable")?;
+    let mut command = std::process::Command::new(exe);
+    command
+        .arg("--state-dir")
+        .arg(state_dir)
+        .arg("browser-daemon")
+        .stdin(std::process::Stdio::null())
+        .stdout(log.try_clone().context("clone daemon log handle")?)
+        .stderr(log);
+    #[cfg(unix)]
+    {
+        // New process group: the daemon must survive the assistant's shell
+        // (and any group-wide interrupt) ending this CLI invocation.
+        std::os::unix::process::CommandExt::process_group(&mut command, 0);
+    }
+    command.spawn().context("spawn browser daemon")?;
+
+    let ready_deadline = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < ready_deadline {
+        if let Ok(response) =
+            external_daemon_send(&socket, &ExternalBrowserDaemonRequest::Ping, PING_TIMEOUT)
+        {
+            if response.ok {
+                return Ok(socket);
+            }
+        }
+        thread::sleep(Duration::from_millis(100));
+    }
+    bail!(
+        "browser daemon did not become ready; see {}",
+        log_path.display()
+    )
+}
+
+const PING_TIMEOUT: Duration = Duration::from_secs(3);
+/// Generous request timeout: `browser connect local` can legitimately wait on
+/// the user clicking Allow in Chrome's permission popup.
+const EXTERNAL_DAEMON_COMMAND_TIMEOUT: Duration = Duration::from_secs(900);
+
+#[allow(clippy::too_many_arguments)]
+fn browser_cli_via_daemon(
+    socket: &Path,
+    session_id: &str,
+    cwd: &Path,
+    artifact_dir: &Path,
+    timeout: u64,
+    json: bool,
+    action: ExternalBrowserAction,
+) -> Result<()> {
+    match action {
+        ExternalBrowserAction::Exec { code } => {
+            let response = external_daemon_send(
+                socket,
+                &ExternalBrowserDaemonRequest::Exec {
+                    session_id: session_id.to_string(),
+                    cwd: cwd.to_path_buf(),
+                    artifact_dir: artifact_dir.to_path_buf(),
+                    code,
+                    timeout_secs: timeout,
+                },
+                Duration::from_secs(timeout).saturating_add(EXTERNAL_DAEMON_COMMAND_TIMEOUT),
+            )?;
+            if let Some(blocked) = response.blocked {
+                return print_external_blocked(&blocked);
+            }
+            if !response.ok {
+                bail!(
+                    "{}",
+                    response
+                        .error
+                        .unwrap_or_else(|| "browser daemon request failed".to_string())
+                );
+            }
+            let script = response
+                .script
+                .ok_or_else(|| anyhow::anyhow!("browser daemon returned no script output"))?;
+            print_external_exec_result(&script, json)
+        }
+        ExternalBrowserAction::Command { command } => {
+            let response = external_daemon_send(
+                socket,
+                &ExternalBrowserDaemonRequest::Command {
+                    session_id: session_id.to_string(),
+                    cwd: cwd.to_path_buf(),
+                    artifact_dir: artifact_dir.to_path_buf(),
+                    command,
+                },
+                EXTERNAL_DAEMON_COMMAND_TIMEOUT,
+            )?;
+            if !response.ok {
+                bail!(
+                    "{}",
+                    response
+                        .error
+                        .unwrap_or_else(|| "browser daemon request failed".to_string())
+                );
+            }
+            let content = response.content.unwrap_or(Value::Null);
+            print_external_command_content(&content);
+            Ok(())
+        }
+    }
+}
+
+/// `browser daemon status|stop|logs` — operate the daemon itself.
+fn browser_external_daemon_control(state_dir: &Path, argv: &[String]) -> Result<()> {
+    let socket = external_daemon_socket_path(state_dir);
+    match argv.get(1).map(String::as_str) {
+        Some("status") | None => {
+            match external_daemon_send(&socket, &ExternalBrowserDaemonRequest::Ping, PING_TIMEOUT) {
+                Ok(response) if response.ok => println!(
+                    "running (version {}, socket {})",
+                    response.version.as_deref().unwrap_or("unknown"),
+                    socket.display()
+                ),
+                _ => println!("not running (socket {})", socket.display()),
+            }
+            Ok(())
+        }
+        Some("stop") => {
+            match external_daemon_send(
+                &socket,
+                &ExternalBrowserDaemonRequest::Shutdown,
+                PING_TIMEOUT,
+            ) {
+                Ok(_) => println!("stopped"),
+                Err(_) => println!("not running"),
+            }
+            Ok(())
+        }
+        Some("logs") => {
+            let log_path = external_daemon_log_path(state_dir);
+            let contents = fs::read_to_string(&log_path)
+                .with_context(|| format!("read {}", log_path.display()))?;
+            let lines: Vec<&str> = contents.lines().collect();
+            let start = lines.len().saturating_sub(100);
+            for line in &lines[start..] {
+                println!("{line}");
+            }
+            Ok(())
+        }
+        Some(other) => bail!("unknown browser daemon command: {other} (use status|stop|logs)"),
+    }
+}
+
+/// Daemon main loop: serve line-delimited JSON requests over the unix socket,
+/// executing them against in-process browser registries so the CDP connection
+/// (and Chrome's granted debugging permission) persists across CLI calls.
+#[cfg(unix)]
+fn browser_external_daemon(store: Store) -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    use std::os::unix::net::UnixListener;
+
+    let state_dir = store.state_dir().to_path_buf();
+    apply_external_browser_env_defaults(&state_dir);
+    let socket = external_daemon_socket_path(&state_dir);
+    let _ = fs::remove_file(&socket);
+    let listener = UnixListener::bind(&socket)
+        .with_context(|| format!("bind browser daemon socket {}", socket.display()))?;
+    fs::set_permissions(&socket, fs::Permissions::from_mode(0o600))
+        .context("restrict browser daemon socket permissions")?;
+    eprintln!(
+        "[browser-daemon] started: version={} pid={} state_dir={} socket={}",
+        env!("CARGO_PKG_VERSION"),
+        std::process::id(),
+        state_dir.display(),
+        socket.display()
+    );
+    let shared: SharedStore = Arc::new(Mutex::new(store));
+    for stream in listener.incoming() {
+        let stream = match stream {
+            Ok(stream) => stream,
+            Err(error) => {
+                eprintln!("[browser-daemon] accept failed: {error:#}");
+                continue;
+            }
+        };
+        match handle_external_daemon_stream(stream, &shared) {
+            Ok(true) => {}
+            Ok(false) => break,
+            Err(error) => eprintln!("[browser-daemon] request failed: {error:#}"),
+        }
+    }
+    let _ = fs::remove_file(&socket);
+    eprintln!("[browser-daemon] stopped");
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn browser_external_daemon(_store: Store) -> Result<()> {
+    bail!("the external browser daemon is only supported on unix")
+}
+
+#[cfg(unix)]
+fn handle_external_daemon_stream(
+    stream: std::os::unix::net::UnixStream,
+    shared: &SharedStore,
+) -> Result<bool> {
+    stream.set_read_timeout(Some(Duration::from_secs(30)))?;
+    let mut line = String::new();
+    io::BufReader::new(&stream).read_line(&mut line)?;
+    let request: ExternalBrowserDaemonRequest =
+        serde_json::from_str(&line).context("parse browser daemon request")?;
+    let version = Some(env!("CARGO_PKG_VERSION").to_string());
+    let (response, keep_running) = match request {
+        ExternalBrowserDaemonRequest::Ping => (
+            ExternalBrowserDaemonResponse {
+                ok: true,
+                version,
+                ..Default::default()
+            },
+            true,
+        ),
+        ExternalBrowserDaemonRequest::Shutdown => (
+            ExternalBrowserDaemonResponse {
+                ok: true,
+                version,
+                ..Default::default()
+            },
+            false,
+        ),
+        ExternalBrowserDaemonRequest::Command {
+            session_id,
+            cwd,
+            artifact_dir,
+            command,
+        } => {
+            let response =
+                match browser_use_agent::tools::handlers::browser::run_external_browser_command(
+                    shared,
+                    &session_id,
+                    &cwd,
+                    &artifact_dir,
+                    &command,
+                ) {
+                    Ok(out) => ExternalBrowserDaemonResponse {
+                        ok: true,
+                        version,
+                        content: Some(out.content),
+                        ..Default::default()
+                    },
+                    Err(error) => ExternalBrowserDaemonResponse {
+                        ok: false,
+                        version,
+                        error: Some(format!("{error:#}")),
+                        ..Default::default()
+                    },
+                };
+            (response, true)
+        }
+        ExternalBrowserDaemonRequest::Exec {
+            session_id,
+            cwd,
+            artifact_dir,
+            code,
+            timeout_secs,
+        } => {
+            let response = match browser_use_agent::tools::handlers::browser::run_external_browser_script(
+                shared,
+                &session_id,
+                &cwd,
+                &artifact_dir,
+                &code,
+                timeout_secs,
+            ) {
+                Ok(
+                    browser_use_agent::tools::handlers::browser::ExternalBrowserScriptOutcome::Ran(
+                        out,
+                    ),
+                ) => ExternalBrowserDaemonResponse {
+                    ok: true,
+                    version,
+                    script: Some(out),
+                    ..Default::default()
+                },
+                Ok(
+                    browser_use_agent::tools::handlers::browser::ExternalBrowserScriptOutcome::Blocked(
+                        content,
+                    ),
+                ) => ExternalBrowserDaemonResponse {
+                    ok: true,
+                    version,
+                    blocked: Some(content),
+                    ..Default::default()
+                },
+                Err(error) => ExternalBrowserDaemonResponse {
+                    ok: false,
+                    version,
+                    error: Some(format!("{error:#}")),
+                    ..Default::default()
+                },
+            };
+            (response, true)
+        }
+    };
+    stream.set_write_timeout(Some(Duration::from_secs(60)))?;
+    let mut payload = serde_json::to_vec(&response)?;
+    payload.push(b'\n');
+    (&stream).write_all(&payload)?;
+    Ok(keep_running)
+}
+
+fn print_external_script_output(out: &browser_use_browser::BrowserScriptOutput) {
+    let text = out.text.trim_end();
+    if !text.is_empty() {
+        println!("{text}");
+    }
+    let mut printed_paths = HashSet::new();
+    for image in &out.images {
+        if let Some(path) = image.get("path").and_then(Value::as_str) {
+            if printed_paths.insert(path.to_string()) {
+                println!("Screenshot saved to {path}");
+            }
+        }
+    }
+    for artifact in &out.artifacts {
+        if let Some(path) = artifact.get("path").and_then(Value::as_str) {
+            if printed_paths.insert(path.to_string()) {
+                println!("Artifact saved to {path}");
+            }
+        }
+    }
+}
+
+fn sanitize_external_session_name(name: &str) -> Result<String> {
+    let trimmed = name.trim();
+    if trimmed.is_empty()
+        || trimmed.len() > 64
+        || !trimmed
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
+    {
+        bail!("invalid --session name {name:?}: use 1-64 ASCII letters, digits, '-', '_' or '.'");
+    }
+    Ok(trimmed.to_string())
+}
+
+/// Re-quote command words for the browser control plane's shell-words parser
+/// so arguments containing spaces (e.g. profile ids like
+/// `google-chrome:Profile 2`) survive the join.
+fn join_browser_command_words(words: &[String]) -> String {
+    words
+        .iter()
+        .map(|word| {
+            if !word.is_empty()
+                && !word
+                    .chars()
+                    .any(|c| c.is_whitespace() || matches!(c, '"' | '\'' | '\\'))
+            {
+                word.clone()
+            } else {
+                format!("'{}'", word.replace('\\', "\\\\").replace('\'', "\\'"))
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn skill(command: SkillCommand) -> Result<()> {
+    match command {
+        SkillCommand::Show => {
+            print!("{SKILL_MD}");
+            Ok(())
+        }
+        SkillCommand::Paths => {
+            let home = user_home_dir()?;
+            for assistant in [
+                SkillAssistant::Claude,
+                SkillAssistant::Codex,
+                SkillAssistant::Opencode,
+                SkillAssistant::Agents,
+            ] {
+                println!(
+                    "{}: {}",
+                    skill_assistant_label(assistant),
+                    skill_install_dir(&home, assistant)
+                        .join("SKILL.md")
+                        .display()
+                );
+            }
+            Ok(())
+        }
+        SkillCommand::Install { assistant } => skill_install(assistant),
+    }
+}
+
+fn skill_install(assistant: Option<SkillAssistant>) -> Result<()> {
+    let home = user_home_dir()?;
+    let targets = match assistant {
+        Some(assistant) => vec![assistant],
+        None => {
+            let detected = detect_skill_assistants(&home);
+            if detected.is_empty() {
+                bail!(
+                    "no assistant homes found (~/.claude, ~/.codex, ~/.config/opencode, ~/.agents). \
+                     Pass one explicitly: `browser-use-terminal skill install <claude|codex|opencode|agents>`"
+                );
+            }
+            detected
+        }
+    };
+    for target in targets {
+        let dir = skill_install_dir(&home, target);
+        fs::create_dir_all(&dir).with_context(|| format!("create skill dir {}", dir.display()))?;
+        let path = dir.join("SKILL.md");
+        fs::write(&path, SKILL_MD).with_context(|| format!("write {}", path.display()))?;
+        println!(
+            "Installed {} skill: {}",
+            skill_assistant_label(target),
+            path.display()
+        );
+    }
+    println!(
+        "\nNew sessions of those assistants will discover the skill automatically. \
+         Browser setup (one-time): open chrome://inspect/#remote-debugging in Chrome and tick \
+         \"Allow remote debugging\", or let the CLI use a managed/cloud browser \
+         (`browser-use-terminal browser preference use managed-headless|cloud`)."
+    );
+    Ok(())
+}
+
+fn skill_assistant_label(assistant: SkillAssistant) -> &'static str {
+    match assistant {
+        SkillAssistant::Claude => "Claude Code",
+        SkillAssistant::Codex => "Codex",
+        SkillAssistant::Opencode => "OpenCode",
+        SkillAssistant::Agents => "agents dir",
+    }
+}
+
+fn skill_install_dir(home: &Path, assistant: SkillAssistant) -> PathBuf {
+    let base = match assistant {
+        SkillAssistant::Claude => home.join(".claude"),
+        SkillAssistant::Codex => std::env::var_os("CODEX_HOME")
+            .filter(|value| !value.is_empty())
+            .map(PathBuf::from)
+            .unwrap_or_else(|| home.join(".codex")),
+        SkillAssistant::Opencode => home.join(".config").join("opencode"),
+        SkillAssistant::Agents => home.join(".agents"),
+    };
+    base.join("skills").join(SKILL_DIR_NAME)
+}
+
+fn detect_skill_assistants(home: &Path) -> Vec<SkillAssistant> {
+    // OpenCode also discovers Claude-compatible skill paths (~/.claude/skills),
+    // so a Claude install covers OpenCode users unless they only have
+    // ~/.config/opencode.
+    [
+        SkillAssistant::Claude,
+        SkillAssistant::Codex,
+        SkillAssistant::Opencode,
+        SkillAssistant::Agents,
+    ]
+    .into_iter()
+    .filter(|assistant| {
+        skill_install_dir(home, *assistant)
+            .parent()
+            .and_then(Path::parent)
+            .is_some_and(Path::is_dir)
+    })
+    .collect()
+}
+
+fn user_home_dir() -> Result<PathBuf> {
+    std::env::var_os("HOME")
+        .filter(|value| !value.is_empty())
+        .or_else(|| std::env::var_os("USERPROFILE").filter(|value| !value.is_empty()))
+        .map(PathBuf::from)
+        .context("could not resolve the home directory (HOME/USERPROFILE unset)")
 }
 
 fn remote_cdp_connect_command_from_env() -> Option<String> {
@@ -9475,6 +10555,17 @@ fn notify_parent_agent_done(store: &Store, task: &browser_use_protocol::SessionM
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn external_daemon_socket_path_is_stable_and_short() {
+        let a = external_daemon_socket_path(Path::new("/tmp/state-a"));
+        let b = external_daemon_socket_path(Path::new("/tmp/state-a"));
+        let c = external_daemon_socket_path(Path::new("/tmp/state-b"));
+        assert_eq!(a, b, "same state dir must map to the same socket");
+        assert_ne!(a, c, "different state dirs must map to different sockets");
+        // AF_UNIX socket paths are limited to ~104 bytes on macOS.
+        assert!(a.as_os_str().len() < 100, "socket path too long: {a:?}");
+    }
 
     #[test]
     fn cli_config_overrides_parse_toml_and_raw_strings_like_codex() -> Result<()> {

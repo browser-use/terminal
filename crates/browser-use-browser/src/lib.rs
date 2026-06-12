@@ -177,11 +177,18 @@ struct ManagedBrowser {
     _profile_dir: Option<TempDir>,
     launch: ManagedLaunch,
     marker_path: PathBuf,
+    /// Keep the browser process (and its marker) alive when this handle drops
+    /// so one-shot CLI invocations can reattach to it later. See
+    /// [`external_browser_persistence_enabled`].
+    persist: bool,
 }
 
 impl Drop for ManagedBrowser {
     fn drop(&mut self) {
         unregister_managed_browser_pid(self.child.id());
+        if self.persist {
+            return;
+        }
         let _ = self.child.kill();
         let _ = self.child.wait();
         let _ = fs::remove_file(&self.marker_path);
@@ -241,6 +248,10 @@ struct BrowserSession {
     active_local_profile_id: Option<String>,
     preferred_browser_context_id: Option<String>,
     artifact_dir: Option<PathBuf>,
+    /// Marker file of a persistent managed browser this session reattached to
+    /// (or launched) without owning the child process. Used so explicit stops
+    /// can terminate the browser even across one-shot CLI processes.
+    persistent_managed_marker: Option<PathBuf>,
     logs: VecDeque<String>,
 }
 
@@ -276,6 +287,7 @@ impl Default for BrowserSession {
             active_local_profile_id: None,
             preferred_browser_context_id: None,
             artifact_dir: None,
+            persistent_managed_marker: None,
             logs: VecDeque::new(),
         }
     }
@@ -3212,6 +3224,7 @@ fn dispatch_recover(session: &mut BrowserSession, argv: &[String]) -> Result<Val
         Some("reattach-same-target") => session.reattach_same_target(),
         Some("restart-runtime") => session.restart_runtime(),
         Some("restart-owned-browser") => session.restart_owned_browser(),
+        Some("stop-owned-browser") => session.stop_owned_browser(),
         Some("stop-owned-remote") => session.stop_owned_remote(),
         Some(other) => bail!("unknown browser recover command: {other}"),
         None => bail!("browser recover requires a recovery action"),
@@ -3647,6 +3660,26 @@ impl BrowserSession {
         profile: ManagedProfile,
         extra_args: Vec<String>,
     ) -> Result<Value> {
+        let persist = external_browser_persistence_enabled();
+        let profile = if persist {
+            match profile {
+                // Persistent managed browsers need a stable profile dir so the
+                // next one-shot invocation can find the marker and reattach.
+                ManagedProfile::Temp => ManagedProfile::Path(persistent_managed_profile_path(
+                    self.session_id.as_deref(),
+                )),
+                other => other,
+            }
+        } else {
+            profile
+        };
+        if persist {
+            if let ManagedProfile::Path(path) = &profile {
+                if let Some(connected) = self.reattach_persistent_managed(path) {
+                    return Ok(connected);
+                }
+            }
+        }
         self.stop_owned_managed();
         let mut launch_errors = Vec::new();
         let mut launched = None;
@@ -3657,7 +3690,7 @@ impl BrowserSession {
                 headless,
                 extra_args: extra_args.clone(),
             };
-            match launch_managed_browser(launch.clone(), self.session_id.clone()) {
+            match launch_managed_browser(launch.clone(), self.session_id.clone(), persist) {
                 Ok((managed, http_url)) => {
                     launched = Some((launch, managed, http_url));
                     break;
@@ -3679,6 +3712,7 @@ impl BrowserSession {
             );
         };
         let ws_url = resolve_ws_from_http(&http_url)?;
+        let marker_path = managed.marker_path.clone();
         self.managed = Some(managed);
         if let Err(error) = self.connect_endpoint(
             Endpoint {
@@ -3693,6 +3727,7 @@ impl BrowserSession {
             self.stop_owned_managed();
             return Err(error);
         }
+        self.persistent_managed_marker = persist.then_some(marker_path);
         self.browser_name = Some("Managed Chromium".to_string());
         self.profile = Some(match &launch.profile {
             ManagedProfile::Temp => "temp".to_string(),
@@ -3706,7 +3741,85 @@ impl BrowserSession {
         }))
     }
 
+    /// Reattach to a still-running Browser Use cloud browser recorded by a
+    /// previous one-shot invocation, instead of creating (and billing) a new
+    /// one. Returns `None` when the record is missing or the browser is gone.
+    fn reattach_persistent_cloud(&mut self) -> Option<Value> {
+        let record_path = persistent_cloud_record_path(self.session_id.as_deref());
+        let raw = fs::read_to_string(&record_path).ok()?;
+        let Ok(record) = serde_json::from_str::<Value>(&raw) else {
+            let _ = fs::remove_file(&record_path);
+            return None;
+        };
+        let (Some(id), Some(cdp_url)) = (
+            record.get("id").and_then(Value::as_str),
+            record.get("cdpUrl").and_then(Value::as_str),
+        ) else {
+            let _ = fs::remove_file(&record_path);
+            return None;
+        };
+        let Ok(ws_url) = resolve_ws_from_http(cdp_url) else {
+            // The cloud browser stopped (timeout or explicit stop); retire the
+            // record so the caller starts a fresh one.
+            let _ = fs::remove_file(&record_path);
+            return None;
+        };
+        self.stop_owned_managed();
+        self.connect_endpoint(
+            Endpoint {
+                kind: "browser-use-cloud".to_string(),
+                http_url: Some(cdp_url.to_string()),
+                ws_url,
+                candidate_id: None,
+            },
+            BrowserMode::RemoteCloud,
+            BrowserOwner::Rust,
+        )
+        .ok()?;
+        self.remote_browser_id = Some(id.to_string());
+        self.live_url = record
+            .get("liveUrl")
+            .and_then(Value::as_str)
+            .map(ToOwned::to_owned);
+        self.browser_name = Some("Browser Use Cloud".to_string());
+        self.profile = record
+            .get("profileId")
+            .and_then(Value::as_str)
+            .map(ToOwned::to_owned);
+        Some(json!({
+            "status": "connected",
+            "reattached": true,
+            "browser": self.status_json(),
+            "live_url": self.live_url,
+        }))
+    }
+
+    fn persist_cloud_record(&self, browser: &Value, requested_profile_id: Option<&str>) {
+        let record_path = persistent_cloud_record_path(self.session_id.as_deref());
+        if let Some(parent) = record_path.parent() {
+            let _ = fs::create_dir_all(parent);
+        }
+        let record = json!({
+            "id": self.remote_browser_id,
+            "cdpUrl": browser.get("cdpUrl"),
+            "liveUrl": browser.get("liveUrl"),
+            "profileId": requested_profile_id,
+            "started_at_ms": unix_time_ms() as u64,
+        });
+        if let Ok(raw) = serde_json::to_vec_pretty(&record) {
+            let _ = fs::write(&record_path, raw);
+        }
+    }
+
     fn start_remote_cloud(&mut self, argv: &[String]) -> Result<Value> {
+        // Plain `remote start` (no explicit profile/timeout/proxy options) may
+        // reattach to the persistent cloud browser from a prior invocation;
+        // explicit options always provision a fresh browser.
+        if external_browser_persistence_enabled() && argv.len() <= 2 {
+            if let Some(connected) = self.reattach_persistent_cloud() {
+                return Ok(connected);
+            }
+        }
         let mut body = serde_json::Map::new();
         let mut requested_profile_id = None;
         if let Some(profile_id) = option_value(argv, "--profile-id") {
@@ -3769,6 +3882,9 @@ impl BrowserSession {
             .and_then(Value::as_str)
             .map(ToOwned::to_owned);
         self.browser_name = Some("Browser Use Cloud".to_string());
+        if external_browser_persistence_enabled() {
+            self.persist_cloud_record(&browser, requested_profile_id.as_deref());
+        }
         self.profile = requested_profile_id;
         Ok(json!({
             "status": "connected",
@@ -3789,6 +3905,7 @@ impl BrowserSession {
             return Ok(json!({ "stopped": false, "reason": "missing remote browser id" }));
         };
         stop_cloud_browser(&id)?;
+        let _ = fs::remove_file(persistent_cloud_record_path(self.session_id.as_deref()));
         if let Some(sid) = self.session_id.clone() {
             stop_session_capture(&sid);
         }
@@ -4061,11 +4178,86 @@ impl BrowserSession {
         Ok(json!({ "restarted": true, "browser": self.status_json() }))
     }
 
+    /// Reattach to a still-running persistent managed browser via its marker
+    /// file instead of launching a new one. Returns `None` when there is no
+    /// live browser to reattach to (caller falls through to a fresh launch).
+    fn reattach_persistent_managed(&mut self, profile_path: &Path) -> Option<Value> {
+        let marker_path = profile_path.join(MANAGED_BROWSER_MARKER_FILE);
+        let raw = fs::read_to_string(&marker_path).ok()?;
+        let marker = serde_json::from_str::<ManagedBrowserMarker>(&raw).ok()?;
+        if !process_command_matches_managed_marker(marker.pid, &marker.profile_path) {
+            return None;
+        }
+        let http_url = format!("http://127.0.0.1:{}", marker.port);
+        let ws_url = resolve_ws_from_http(&http_url).ok()?;
+        // Clear any current attachment state without killing the browser we
+        // are about to reattach to.
+        self.persistent_managed_marker = None;
+        self.detach_managed_state();
+        self.connect_endpoint(
+            Endpoint {
+                kind: "cdp-url".to_string(),
+                http_url: Some(http_url),
+                ws_url,
+                candidate_id: None,
+            },
+            BrowserMode::Managed,
+            BrowserOwner::Rust,
+        )
+        .ok()?;
+        self.persistent_managed_marker = Some(marker_path);
+        self.browser_name = Some("Managed Chromium".to_string());
+        self.profile = Some(profile_path.display().to_string());
+        Some(json!({
+            "status": "connected",
+            "reattached": true,
+            "browser": self.status_json(),
+            "next_step": "Continue immediately with the user's requested browser/search/page work in this connected managed browser.",
+            "model_instruction": "Browser connection is setup only. Do not answer the user's browser/search/page task from memory or stop after connecting; continue with page work now.",
+        }))
+    }
+
+    /// Explicitly stop a Rust-owned managed browser, including persistent
+    /// managed browsers reattached from a previous one-shot invocation.
+    fn stop_owned_browser(&mut self) -> Result<Value> {
+        let owned = self.managed.is_some()
+            || self.persistent_managed_marker.is_some()
+            || (self.owner == BrowserOwner::Rust && self.mode == BrowserMode::Managed);
+        if !owned {
+            return Ok(json!({
+                "stopped": false,
+                "reason": "current browser is not a Rust-owned managed browser",
+            }));
+        }
+        self.stop_owned_managed();
+        Ok(json!({ "stopped": true }))
+    }
+
     fn stop_owned_managed(&mut self) {
         if let Some(mut managed) = self.managed.take() {
             let _ = managed.child.kill();
             let _ = managed.child.wait();
+            // Explicit stops always retire the marker, even for persistent
+            // managed browsers whose Drop would otherwise keep it.
+            let _ = fs::remove_file(&managed.marker_path);
+        } else if let Some(marker_path) = self.persistent_managed_marker.take() {
+            if let Ok(raw) = fs::read_to_string(&marker_path) {
+                if let Ok(marker) = serde_json::from_str::<ManagedBrowserMarker>(&raw) {
+                    if process_command_matches_managed_marker(marker.pid, &marker.profile_path) {
+                        terminate_process(marker.pid);
+                    }
+                }
+            }
+            let _ = fs::remove_file(&marker_path);
+            if let Some(profile_dir) = marker_path.parent() {
+                let _ = fs::remove_file(profile_dir.join("DevToolsActivePort"));
+            }
         }
+        self.persistent_managed_marker = None;
+        self.detach_managed_state();
+    }
+
+    fn detach_managed_state(&mut self) {
         if self.mode == BrowserMode::Managed {
             if let Some(sid) = self.session_id.clone() {
                 stop_session_capture(&sid);
@@ -6127,9 +6319,17 @@ fn process_command_matches_managed_marker(_pid: u32, _profile_path: &Path) -> bo
 #[cfg(unix)]
 fn terminate_process(pid: u32) {
     let pid = pid.to_string();
-    let _ = Command::new("kill").args(["-TERM", &pid]).status();
+    let _ = Command::new("kill")
+        .args(["-TERM", &pid])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status();
     thread::sleep(Duration::from_millis(200));
-    let _ = Command::new("kill").args(["-KILL", &pid]).status();
+    let _ = Command::new("kill")
+        .args(["-KILL", &pid])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status();
 }
 
 #[cfg(not(unix))]
@@ -6157,9 +6357,47 @@ fn write_managed_browser_marker(
     Ok(marker_path)
 }
 
+/// Whether externally-driven one-shot CLI invocations should keep Rust-owned
+/// browsers (managed Chromium, Browser Use cloud) alive across processes and
+/// reattach to them, instead of stopping them when the process exits.
+///
+/// Set by `browser-use-terminal browser ...` (the assistant plugin surface);
+/// long-lived hosts (TUI/SDK) keep the default in-process ownership.
+fn external_browser_persistence_enabled() -> bool {
+    env_bool("BROWSER_USE_TERMINAL_PERSIST_BROWSERS") == Some(true)
+}
+
+/// Root directory for persistent external-browser state (managed profiles and
+/// cloud browser records). Override with `BU_EXTERNAL_BROWSER_STATE_DIR` (the
+/// external CLI points it inside the resolved state dir).
+fn persistent_external_browser_state_root() -> PathBuf {
+    std::env::var_os("BU_EXTERNAL_BROWSER_STATE_DIR")
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| {
+            home_dir()
+                .map(|home| home.join(".browser-use-terminal"))
+                .unwrap_or_else(|| PathBuf::from(".browser-use-terminal"))
+                .join("external-browser")
+        })
+}
+
+fn persistent_managed_profile_path(session_id: Option<&str>) -> PathBuf {
+    persistent_external_browser_state_root()
+        .join("managed")
+        .join(session_id.unwrap_or("default"))
+}
+
+fn persistent_cloud_record_path(session_id: Option<&str>) -> PathBuf {
+    persistent_external_browser_state_root()
+        .join("cloud")
+        .join(format!("{}.json", session_id.unwrap_or("default")))
+}
+
 fn launch_managed_browser(
     launch: ManagedLaunch,
     owner_session_id: Option<String>,
+    persist: bool,
 ) -> Result<(ManagedBrowser, String)> {
     let (profile_path, temp_dir) = match &launch.profile {
         ManagedProfile::Temp => {
@@ -6237,6 +6475,7 @@ fn launch_managed_browser(
                         _profile_dir: temp_dir,
                         launch,
                         marker_path,
+                        persist,
                     },
                     http_url,
                 ));
@@ -7023,7 +7262,8 @@ fn local_profile_cookies(profile: &LocalBrowserProfile) -> Result<Vec<Value>> {
         headless: true,
         extra_args: vec!["--no-startup-window".to_string()],
     };
-    let (mut managed, http_url) = launch_managed_browser(launch, None)?;
+    // Profile inspection browsers are always throwaway; never persist them.
+    let (mut managed, http_url) = launch_managed_browser(launch, None, false)?;
     let result = (|| -> Result<Vec<Value>> {
         let ws_url = resolve_ws_from_http(&http_url)?;
         let mut connection = CdpConnection::connect(&ws_url)?;
@@ -13953,6 +14193,49 @@ print("large response ok", len(data["blob"]))
             .as_deref()
             .unwrap()
             .contains("DevToolsActivePort"));
+    }
+
+    #[test]
+    fn stop_owned_browser_reports_not_owned_for_fresh_session() {
+        let mut session = BrowserSession::default();
+        let result = session.stop_owned_browser().unwrap();
+        assert_eq!(result["stopped"], false);
+    }
+
+    #[test]
+    fn stop_owned_browser_terminates_persistent_marker_browser() {
+        let temp = tempfile::tempdir().unwrap();
+        let marker_path = temp.path().join(MANAGED_BROWSER_MARKER_FILE);
+        let marker = ManagedBrowserMarker {
+            // A pid that does not match a managed chrome command line, so the
+            // stop path only retires the marker without killing anything.
+            pid: 999_999,
+            port: 9,
+            executable: "chrome".to_string(),
+            profile_path: temp.path().to_path_buf(),
+            owner_session_id: Some("owner-session".to_string()),
+            started_at_ms: 1,
+        };
+        fs::write(&marker_path, serde_json::to_vec(&marker).unwrap()).unwrap();
+        fs::write(temp.path().join("DevToolsActivePort"), "9\nstale\n").unwrap();
+
+        let mut session = BrowserSession {
+            persistent_managed_marker: Some(marker_path.clone()),
+            ..BrowserSession::default()
+        };
+        let result = session.stop_owned_browser().unwrap();
+        assert_eq!(result["stopped"], true);
+        assert!(session.persistent_managed_marker.is_none());
+        assert!(!marker_path.exists());
+        assert!(!temp.path().join("DevToolsActivePort").exists());
+    }
+
+    #[test]
+    fn persistent_external_browser_paths_are_session_scoped() {
+        let managed = persistent_managed_profile_path(Some("browser-cli-work"));
+        assert!(managed.ends_with("managed/browser-cli-work"));
+        let cloud = persistent_cloud_record_path(None);
+        assert!(cloud.ends_with("cloud/default.json"));
     }
 
     #[test]

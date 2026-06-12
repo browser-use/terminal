@@ -614,6 +614,19 @@ pub(crate) fn browser_command_is_passive(words: &[&str]) -> bool {
         words,
         ["browser", "status", ..]
             | ["status", ..]
+            // Read-only / informational commands must never trigger an
+            // auto-connect: `help`/`doctor`/`domain` are the first things an
+            // external assistant runs to orient itself.
+            | ["browser", "help", ..]
+            | ["help", ..]
+            | ["browser", "--help", ..]
+            | ["--help", ..]
+            | ["browser", "-h", ..]
+            | ["-h", ..]
+            | ["browser", "doctor", ..]
+            | ["doctor", ..]
+            | ["browser", "domain", ..]
+            | ["domain", ..]
             | ["browser", "connect", ..]
             | ["connect", ..]
             | ["browser", "local", "list", ..]
@@ -2917,105 +2930,17 @@ impl ToolRuntime<BrowserRequest, ExecOutput> for BrowserTool {
                 BrowserAction::Command { command } => {
                     let selected_browser_mode = selected_browser_mode.as_deref();
                     let out = if let Some(persistence) = &persistence {
-                        let store = persistence.store.lock().map_err(|_| {
-                            ToolError::Other(anyhow::anyhow!("store mutex poisoned"))
-                        })?;
-                        if let Some(content) = dispatch_browser_preference_command_for_mode(
-                            &store,
+                        run_browser_command_with_shared_store(
+                            &persistence.store,
                             backend.as_ref(),
                             &session_id,
                             &cwd,
                             &artifact_dir,
                             &command,
                             selected_browser_mode,
-                        )
-                        .map_err(|error| ToolError::Rejected(format!("{error:#}")))?
-                        {
-                            BrowserCommandOutput {
-                                content,
-                                events: Vec::new(),
-                            }
-                        } else {
-                            let resolved = resolve_browser_command_for_selected_mode(
-                                Some(&store),
-                                &command,
-                                selected_browser_mode,
-                                selected_browser_profile_id.as_deref(),
-                            )
-                            .map_err(|error| ToolError::Rejected(format!("{error:#}")))?;
-                            let preferred_browser = selected_local_browser.clone().or_else(|| {
-                                store
-                                    .get_setting(BROWSER_PREF_BROWSER)
-                                    .ok()
-                                    .flatten()
-                                    .filter(|browser| !browser.trim().is_empty())
-                            });
-                            let effective_mode =
-                                effective_browser_mode(Some(&store), selected_browser_mode)
-                                    .map_err(|error| ToolError::Rejected(format!("{error:#}")))?;
-                            let store_profile_id = if matches!(effective_mode, "local" | "cloud") {
-                                stored_profile_for_mode(&store, effective_mode)
-                                    .map_err(|error| ToolError::Rejected(format!("{error:#}")))?
-                            } else {
-                                None
-                            };
-                            let default_profile_id =
-                                selected_browser_profile_id.clone().or(store_profile_id);
-                            let default_profile_id = if matches!(effective_mode, "local" | "cloud")
-                            {
-                                default_profile_id
-                            } else {
-                                None
-                            };
-                            let has_default_profile = default_profile_id.is_some();
-                            drop(store);
-                            if let Some(preflight) = local_connect_default_profile_preflight(
-                                has_default_profile,
-                                preferred_browser.as_deref(),
-                                backend.as_ref(),
-                                &session_id,
-                                &cwd,
-                                &artifact_dir,
-                                &resolved,
-                            )
-                            .map_err(|error| ToolError::Rejected(format!("{error:#}")))?
-                            {
-                                preflight
-                            } else {
-                                open_default_profile_before_local_connect(
-                                    backend.as_ref(),
-                                    &session_id,
-                                    &cwd,
-                                    &artifact_dir,
-                                    &resolved,
-                                    default_profile_id.as_deref(),
-                                )
-                                .map_err(ToolError::Other)?;
-                                let output = backend
-                                    .command(&session_id, &cwd, &artifact_dir, &resolved)
-                                    .map_err(ToolError::Other)?;
-                                let output = enrich_local_profiles_with_default_profile(
-                                    output,
-                                    &resolved,
-                                    default_profile_id.as_deref(),
-                                );
-                                let output = enforce_local_connect_default_profile_context(
-                                    output,
-                                    &resolved,
-                                    default_profile_id.as_deref(),
-                                );
-                                let output = enrich_local_connect_recovery_with_default_profile(
-                                    output,
-                                    &resolved,
-                                    default_profile_id.as_deref(),
-                                );
-                                enrich_status_with_selected_browser_mode(
-                                    output,
-                                    &resolved,
-                                    Some(effective_mode),
-                                )
-                            }
-                        }
+                            selected_browser_profile_id.as_deref(),
+                            selected_local_browser.as_deref(),
+                        )?
                     } else {
                         let resolved = resolve_browser_command_for_selected_mode(
                             None,
@@ -3048,62 +2973,21 @@ impl ToolRuntime<BrowserRequest, ExecOutput> for BrowserTool {
                 }
                 BrowserAction::Execute { script, .. } => {
                     if let Some(persistence) = &persistence {
-                        let store = persistence.store.lock().map_err(|_| {
-                            ToolError::Other(anyhow::anyhow!("store mutex poisoned"))
-                        })?;
-                        let mode =
-                            effective_browser_mode(Some(&store), selected_browser_mode.as_deref())
-                                .map_err(|error| ToolError::Rejected(format!("{error:#}")))?;
-                        let default_profile_id = if mode == "local" {
-                            selected_browser_profile_id.clone().or_else(|| {
-                                stored_profile_for_mode(&store, "local")
-                                    .ok()
-                                    .flatten()
-                                    .filter(|profile| !profile.trim().is_empty())
-                            })
-                        } else {
-                            None
-                        };
-                        let preferred_browser = if mode == "local" {
-                            selected_local_browser.clone().or_else(|| {
-                                store
-                                    .get_setting(BROWSER_PREF_BROWSER)
-                                    .ok()
-                                    .flatten()
-                                    .filter(|browser| !browser.trim().is_empty())
-                            })
-                        } else {
-                            None
-                        };
-                        drop(store);
-                        if mode == "local" && default_profile_id.is_none() {
-                            if let Some(preflight) = local_connect_default_profile_preflight(
-                                false,
-                                preferred_browser.as_deref(),
-                                backend.as_ref(),
-                                &session_id,
-                                &cwd,
-                                &artifact_dir,
-                                "browser connect local",
-                            )
-                            .map_err(|error| ToolError::Rejected(format!("{error:#}")))?
-                            {
-                                return Ok(map_command_output(preflight));
-                            }
-                        }
-                        ensure_browser_ready_for_work(
+                        if let Some(preflight) = prepare_browser_for_script_with_shared_store(
+                            &persistence.store,
                             backend.as_ref(),
                             &session_id,
                             &cwd,
                             &artifact_dir,
-                            mode,
-                            default_profile_id.as_deref(),
-                        )
-                        .map_err(ToolError::Other)?;
+                            selected_browser_mode.as_deref(),
+                            selected_browser_profile_id.as_deref(),
+                            selected_local_browser.as_deref(),
+                        )? {
+                            return Ok(map_command_output(preflight));
+                        }
                     }
                     // Re-resolve the secrets + nav policy on every run (fail closed)
-                    // so secret/domain changes take effect mid-session. Cheap now
-                    // that values live in an encrypted file, not the OS keychain.
+                    // so secret/domain changes take effect mid-session
                     if let Some(persistence) = &persistence {
                         let store = persistence.store.lock().map_err(|_| {
                             ToolError::Other(anyhow::anyhow!("store mutex poisoned"))
@@ -3172,6 +3056,337 @@ impl ToolRuntime<BrowserRequest, ExecOutput> for BrowserTool {
 
         result
     }
+}
+
+/// Run a `browser <cmd>` control-plane command with full store-backed
+/// behavior: preference dispatch, mode/profile resolution, local-profile
+/// preflight, and the default-profile enrichers.
+///
+/// Shared by the in-session [`BrowserTool`] command path and the external
+/// assistant CLI surface ([`run_external_browser_command`]) so both see
+/// identical heuristics.
+#[allow(clippy::too_many_arguments)]
+fn run_browser_command_with_shared_store(
+    shared_store: &SharedStore,
+    backend: &dyn BrowserBackend,
+    session_id: &str,
+    cwd: &std::path::Path,
+    artifact_dir: &std::path::Path,
+    command: &str,
+    selected_browser_mode: Option<&str>,
+    selected_browser_profile_id: Option<&str>,
+    selected_local_browser: Option<&str>,
+) -> Result<BrowserCommandOutput, ToolError> {
+    let store = shared_store
+        .lock()
+        .map_err(|_| ToolError::Other(anyhow::anyhow!("store mutex poisoned")))?;
+    if let Some(content) = dispatch_browser_preference_command_for_mode(
+        &store,
+        backend,
+        session_id,
+        cwd,
+        artifact_dir,
+        command,
+        selected_browser_mode,
+    )
+    .map_err(|error| ToolError::Rejected(format!("{error:#}")))?
+    {
+        return Ok(BrowserCommandOutput {
+            content,
+            events: Vec::new(),
+        });
+    }
+    let resolved = resolve_browser_command_for_selected_mode(
+        Some(&store),
+        command,
+        selected_browser_mode,
+        selected_browser_profile_id,
+    )
+    .map_err(|error| ToolError::Rejected(format!("{error:#}")))?;
+    let preferred_browser = selected_local_browser.map(str::to_string).or_else(|| {
+        store
+            .get_setting(BROWSER_PREF_BROWSER)
+            .ok()
+            .flatten()
+            .filter(|browser| !browser.trim().is_empty())
+    });
+    let effective_mode = effective_browser_mode(Some(&store), selected_browser_mode)
+        .map_err(|error| ToolError::Rejected(format!("{error:#}")))?;
+    let store_profile_id = if matches!(effective_mode, "local" | "cloud") {
+        stored_profile_for_mode(&store, effective_mode)
+            .map_err(|error| ToolError::Rejected(format!("{error:#}")))?
+    } else {
+        None
+    };
+    let default_profile_id = selected_browser_profile_id
+        .map(str::to_string)
+        .or(store_profile_id);
+    let default_profile_id = if matches!(effective_mode, "local" | "cloud") {
+        default_profile_id
+    } else {
+        None
+    };
+    let has_default_profile = default_profile_id.is_some();
+    drop(store);
+    if let Some(preflight) = local_connect_default_profile_preflight(
+        has_default_profile,
+        preferred_browser.as_deref(),
+        backend,
+        session_id,
+        cwd,
+        artifact_dir,
+        &resolved,
+    )
+    .map_err(|error| ToolError::Rejected(format!("{error:#}")))?
+    {
+        return Ok(preflight);
+    }
+    open_default_profile_before_local_connect(
+        backend,
+        session_id,
+        cwd,
+        artifact_dir,
+        &resolved,
+        default_profile_id.as_deref(),
+    )
+    .map_err(ToolError::Other)?;
+    let output = backend
+        .command(session_id, cwd, artifact_dir, &resolved)
+        .map_err(ToolError::Other)?;
+    let output = enrich_local_profiles_with_default_profile(
+        output,
+        &resolved,
+        default_profile_id.as_deref(),
+    );
+    let output = enforce_local_connect_default_profile_context(
+        output,
+        &resolved,
+        default_profile_id.as_deref(),
+    );
+    let output = enrich_local_connect_recovery_with_default_profile(
+        output,
+        &resolved,
+        default_profile_id.as_deref(),
+    );
+    Ok(enrich_status_with_selected_browser_mode(
+        output,
+        &resolved,
+        Some(effective_mode),
+    ))
+}
+
+/// Make the browser ready for a `browser_script` run: resolve the effective
+/// mode from the store, run the local default-profile preflight, and
+/// auto-connect/auto-start the configured browser when needed.
+///
+/// Returns `Some(preflight)` when browser work is blocked on a user decision
+/// (e.g. no default local Chrome profile chosen yet); the caller must surface
+/// that output instead of running the script.
+///
+/// Shared by the in-session [`BrowserTool`] execute path and the external
+/// assistant CLI surface ([`run_external_browser_script`]).
+#[allow(clippy::too_many_arguments)]
+fn prepare_browser_for_script_with_shared_store(
+    shared_store: &SharedStore,
+    backend: &dyn BrowserBackend,
+    session_id: &str,
+    cwd: &std::path::Path,
+    artifact_dir: &std::path::Path,
+    selected_browser_mode: Option<&str>,
+    selected_browser_profile_id: Option<&str>,
+    selected_local_browser: Option<&str>,
+) -> Result<Option<BrowserCommandOutput>, ToolError> {
+    let store = shared_store
+        .lock()
+        .map_err(|_| ToolError::Other(anyhow::anyhow!("store mutex poisoned")))?;
+    let mode = effective_browser_mode(Some(&store), selected_browser_mode)
+        .map_err(|error| ToolError::Rejected(format!("{error:#}")))?;
+    let default_profile_id = if mode == "local" {
+        selected_browser_profile_id.map(str::to_string).or_else(|| {
+            stored_profile_for_mode(&store, "local")
+                .ok()
+                .flatten()
+                .filter(|profile| !profile.trim().is_empty())
+        })
+    } else {
+        None
+    };
+    let preferred_browser = if mode == "local" {
+        selected_local_browser.map(str::to_string).or_else(|| {
+            store
+                .get_setting(BROWSER_PREF_BROWSER)
+                .ok()
+                .flatten()
+                .filter(|browser| !browser.trim().is_empty())
+        })
+    } else {
+        None
+    };
+    drop(store);
+    if mode == "local" && default_profile_id.is_none() {
+        if let Some(preflight) = local_connect_default_profile_preflight(
+            false,
+            preferred_browser.as_deref(),
+            backend,
+            session_id,
+            cwd,
+            artifact_dir,
+            "browser connect local",
+        )
+        .map_err(|error| ToolError::Rejected(format!("{error:#}")))?
+        {
+            return Ok(Some(preflight));
+        }
+    }
+    ensure_browser_ready_for_work(
+        backend,
+        session_id,
+        cwd,
+        artifact_dir,
+        mode,
+        default_profile_id.as_deref(),
+    )
+    .map_err(ToolError::Other)?;
+    Ok(None)
+}
+
+// ============================================================================
+// External assistant CLI surface
+// ============================================================================
+//
+// `browser-use-terminal browser ...` lets external coding assistants
+// (Claude Code, Codex, OpenCode, ...) drive the browser through one-shot CLI
+// invocations. These blocking entry points reuse the
+// exact preference resolution, connect heuristics, security policy, and event
+// persistence of the in-session `browser` / `browser_script` tools so an
+// external assistant and the built-in agent see identical behavior.
+
+/// Outcome of an external `browser exec` script request.
+#[derive(Debug)]
+pub enum ExternalBrowserScriptOutcome {
+    /// The script ran. `output.ok` may still be false on script errors.
+    Ran(BrowserScriptOutput),
+    /// Browser work is blocked on a user decision before any script can run
+    /// (e.g. no default local Chrome profile is chosen yet). The payload is the
+    /// preflight JSON with `user_prompt` / `next_step` guidance.
+    Blocked(Value),
+}
+
+fn external_tool_error(error: ToolError) -> anyhow::Error {
+    match error {
+        ToolError::Rejected(message) => anyhow!(message),
+        ToolError::Other(error) => error,
+        ToolError::Sandboxed(denial) => anyhow!(
+            "browser call denied by sandbox: {}",
+            denial.output.stderr.trim()
+        ),
+    }
+}
+
+/// Configure a backend with the store-preferred browser mode so its
+/// auto-connect behavior (the harness `ensure_daemon()` analog) targets the
+/// right browser.
+fn set_backend_browser_mode_from_store(
+    shared_store: &SharedStore,
+    backend: &dyn BrowserBackend,
+) -> anyhow::Result<()> {
+    let store = shared_store
+        .lock()
+        .map_err(|_| anyhow!("store mutex poisoned"))?;
+    let mode = preferred_browser_mode(Some(&store))?;
+    drop(store);
+    backend.set_browser_mode(Some(mode.to_string()));
+    Ok(())
+}
+
+/// Run a `browser <cmd>` control-plane command for an external assistant CLI.
+///
+/// Blocking. Resolves the preferred mode from the store (so plain
+/// `browser connect` honors `browser preference use ...`), runs the same
+/// preflights/enrichers as the in-session tool, and records browser events to
+/// the session's durable event log.
+pub fn run_external_browser_command(
+    shared_store: &SharedStore,
+    session_id: &str,
+    cwd: &std::path::Path,
+    artifact_dir: &std::path::Path,
+    command: &str,
+) -> anyhow::Result<BrowserCommandOutput> {
+    let backend = RealBackend::default();
+    set_backend_browser_mode_from_store(shared_store, &backend)?;
+    let out = run_browser_command_with_shared_store(
+        shared_store,
+        &backend,
+        session_id,
+        cwd,
+        artifact_dir,
+        command,
+        None,
+        None,
+        None,
+    )
+    .map_err(external_tool_error)?;
+    if let Ok(store) = shared_store.lock() {
+        let _ = record_browser_command_response_events(
+            &store,
+            session_id,
+            "browser",
+            &format!("browser-cli-{session_id}"),
+            &out,
+        );
+    }
+    Ok(out)
+}
+
+/// Run a `browser_script` Python snippet for an external assistant CLI.
+///
+/// Blocking: auto-connects the preferred browser when needed, installs the
+/// secrets/navigation policy, runs the script to completion, and records the
+/// response (text, images, artifacts, browser events) to the session's durable
+/// event log. Screenshots taken by the script land in `artifact_dir` and their
+/// paths are reported in the returned output's `images`.
+pub fn run_external_browser_script(
+    shared_store: &SharedStore,
+    session_id: &str,
+    cwd: &std::path::Path,
+    artifact_dir: &std::path::Path,
+    code: &str,
+    timeout_secs: u64,
+) -> anyhow::Result<ExternalBrowserScriptOutcome> {
+    let backend = RealBackend::default();
+    set_backend_browser_mode_from_store(shared_store, &backend)?;
+    if let Some(preflight) = prepare_browser_for_script_with_shared_store(
+        shared_store,
+        &backend,
+        session_id,
+        cwd,
+        artifact_dir,
+        None,
+        None,
+        None,
+    )
+    .map_err(external_tool_error)?
+    {
+        return Ok(ExternalBrowserScriptOutcome::Blocked(preflight.content));
+    }
+    {
+        let store = shared_store
+            .lock()
+            .map_err(|_| anyhow!("store mutex poisoned"))?;
+        super::secrets_admin::install_script_security(&store, session_id)
+            .map_err(|error| anyhow!("failed to apply browser security policy: {error:#}"))?;
+    }
+    let out = backend.run_script(session_id, cwd, artifact_dir, code, timeout_secs)?;
+    if let Ok(store) = shared_store.lock() {
+        let _ = record_browser_script_response_events_for_tool(
+            &store,
+            session_id,
+            "browser_script",
+            &format!("browser-cli-{session_id}"),
+            &out,
+        );
+    }
+    Ok(ExternalBrowserScriptOutcome::Ran(out))
 }
 
 #[cfg(test)]

@@ -87,6 +87,26 @@ browser config show
 browser diagnostics
 ```
 
+## Use It From Claude Code, Codex, or OpenCode
+
+Browser Use Terminal plugs into any coding assistant that can run shell commands, browser-harness style: a skill teaches the assistant the CLI, and the CLI hands it the whole browser runtime.
+
+```bash
+browser-use-terminal skill install        # registers the skill for detected assistants
+```
+
+Then ask your assistant to browse:
+
+```bash
+browser-use-terminal browser exec <<'PY'
+new_tab("https://example.com")
+wait_for_load()
+print(capture_screenshot())
+PY
+```
+
+Screenshots are saved as files and the path is printed, so assistants view them with their native file-reading tools (Claude Code `Read`, Codex `view_image`, OpenCode `read`). The browser persists between calls. See `docs/assistant-plugins.md`.
+
 ## Development
 
 ```bash
@@ -118,6 +138,7 @@ You can disable (100% completely anonymous) telemetry with  `BUT_TELEMETRY=0`.
 - `docs/terminal-ui-product-ux.md`
 - `docs/terminal-ui-testing.md`
 - `docs/terminal-renderer-architecture.md`
+- `docs/assistant-plugins.md`
 
 ## License
 
