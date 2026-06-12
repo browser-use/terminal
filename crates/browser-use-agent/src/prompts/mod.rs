@@ -66,6 +66,12 @@ pub const KNOWN_MODE_NAMES: &str = "Default";
 /// (`crates/browser-use-providers/src/lib.rs:4874`).
 pub const BASE_SYSTEM_PROMPT: &str = include_str!("../../../../prompts/browser-agent-system.md");
 
+/// The assistant-facing skill file (SKILL.md at repo root), embedded at build
+/// time. When `BUT_SKILL_TEST=1` this replaces the native browser tool
+/// descriptions so the agent exercises the exact code path an external coding
+/// assistant (Codex, Claude Code, etc.) would follow.
+pub const SKILL_MD: &str = include_str!("../../../../SKILL.md");
+
 /// The `browser` runtime-control tool description (the control-plane CLI tool).
 ///
 /// Sourced from `prompts/browser-tool-description.md`
@@ -143,6 +149,12 @@ pub fn system_prompt() -> &'static str {
 /// Builds the browser-agent system prompt with the browser-harness interaction
 /// skills appended, matching main's provider instruction assembly.
 pub fn browser_agent_system_prompt() -> String {
+    // BUT_SKILL_TEST=1 — drops native browser tools and runs the model against
+    // the SKILL.md surface instead, exercising the same path Codex/Claude Code
+    // would follow. Tool registration is also gated in provider.rs.
+    if std::env::var("BUT_SKILL_TEST").as_deref() == Ok("1") {
+        return SKILL_MD.to_string();
+    }
     let mut instructions = String::from(system_prompt());
     instructions.push_str("\n\n## Loaded Browser-Harness Interaction Skills");
     instructions.push_str(

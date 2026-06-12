@@ -1398,23 +1398,29 @@ fn build_tool_dispatcher_with_cwd_and_goal_store(
         }
         None => browser_tool,
     };
-    // `browser`: standalone production backend (`browser-use-browser`, internal
-    // session management). parallel_safe = false (single CDP connection).
-    reg.register::<_, BrowserRequest>(
-        "browser",
-        definitions::browser(),
-        false,
-        browser_tool.clone(),
-    );
-    // `browser_script`: browser-use's page/data-plane surface. It routes through
-    // the same handler, but the schema omits the internal session id and matches
-    // the prompt contract used by current-main browser tasks.
-    reg.register::<_, BrowserRequest>(
-        "browser_script",
-        definitions::browser_script(),
-        false,
-        browser_tool,
-    );
+    // BUT_SKILL_TEST=1 — omit native browser tools so the model must use the
+    // SKILL.md surface (browser-use-terminal browser exec via shell), exactly
+    // as an external coding assistant (Codex, Claude Code) would. See also the
+    // matching gate in crates/browser-use-agent/src/prompts/mod.rs.
+    if std::env::var("BUT_SKILL_TEST").as_deref() != Ok("1") {
+        // `browser`: standalone production backend (`browser-use-browser`, internal
+        // session management). parallel_safe = false (single CDP connection).
+        reg.register::<_, BrowserRequest>(
+            "browser",
+            definitions::browser(),
+            false,
+            browser_tool.clone(),
+        );
+        // `browser_script`: browser-use's page/data-plane surface. It routes through
+        // the same handler, but the schema omits the internal session id and matches
+        // the prompt contract used by current-main browser tasks.
+        reg.register::<_, BrowserRequest>(
+            "browser_script",
+            definitions::browser_script(),
+            false,
+            browser_tool,
+        );
+    }
     // Temporarily disable the agent-driven GIF curation pipeline. The
     // deterministic post-run fallback recording remains active.
     const AGENT_DRIVEN_GIF_CURATION_ENABLED: bool = false;
