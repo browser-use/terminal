@@ -1595,4 +1595,44 @@ mod tests {
         // The bearer token must never leak into the transport error message.
         assert!(!err.message.contains("sk-not-used"), "leaked token: {err}");
     }
+
+    #[tokio::test]
+    #[ignore = "diagnostic repro: current ModelClient has no request/stream-open timeout"]
+    async fn repro_model_stream_open_can_remain_pending_without_client_timeout() {
+        use tokio::io::AsyncReadExt;
+
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .expect("bind local listener");
+        let addr = listener.local_addr().expect("local addr");
+        let server = tokio::spawn(async move {
+            let Ok((mut socket, _)) = listener.accept().await else {
+                return;
+            };
+            let mut buf = [0u8; 1024];
+            let _ = socket.read(&mut buf).await;
+            tokio::time::sleep(Duration::from_secs(30)).await;
+        });
+
+        let client = ModelClient::with_retry(RetryPolicy {
+            max_attempts: 1,
+            ..RetryPolicy::default()
+        });
+        let route = Route::new(
+            Box::new(OpenAiResponsesProtocol::new()),
+            Endpoint::new(format!("http://{addr}"), "/v1/responses"),
+            Auth::bearer("sk-not-used"),
+        );
+        let mut req = LlmRequest::new("gpt-5.1-codex", "openai");
+        req.messages.push(crate::schema::Message::user_text("hi"));
+
+        let result =
+            tokio::time::timeout(Duration::from_millis(250), client.stream(&route, &req)).await;
+        server.abort();
+
+        assert!(
+            result.is_err(),
+            "stream open returned inside the outer watchdog; this repro expects it to remain pending"
+        );
+    }
 }

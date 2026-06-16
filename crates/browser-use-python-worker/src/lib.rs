@@ -593,6 +593,50 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "diagnostic repro: omitted timeout waits for snippet completion instead of self-recovering"]
+    fn repro_worker_without_timeout_waits_for_snippet_completion() -> Result<()> {
+        let repo_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .and_then(Path::parent)
+            .context("repo root")?
+            .to_path_buf();
+        let temp = tempfile::tempdir()?;
+        let cwd = temp.path().to_path_buf();
+        let artifact_dir = temp.path().join("artifacts");
+        let pythonpath = repo_root.join("python");
+        let (tx, rx) = std::sync::mpsc::channel();
+
+        let handle = std::thread::spawn(move || {
+            let result = (|| -> Result<RunPythonResponse> {
+                let mut worker = PythonWorker::start_with_pythonpath("python3", pythonpath)?;
+                worker.run_with_timeout(
+                    "s1",
+                    cwd,
+                    artifact_dir,
+                    "import time\ntime.sleep(1.5)\nresult = 'finished'",
+                    None,
+                )
+            })();
+            let _ = tx.send(result);
+        });
+
+        match rx.recv_timeout(Duration::from_millis(250)) {
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+            other => panic!(
+                "python call returned before the outer watchdog; expected no self-timeout: {other:?}"
+            ),
+        }
+
+        let response = rx
+            .recv_timeout(Duration::from_secs(3))
+            .expect("worker should finish after snippet sleep")?;
+        handle.join().expect("worker thread join");
+        assert!(response.ok, "{response:?}");
+        assert_eq!(response.data, Value::String("finished".to_string()));
+        Ok(())
+    }
+
+    #[test]
     fn worker_hard_times_out_threadpool_shutdown_hang_and_recovers() -> Result<()> {
         let repo_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .parent()
