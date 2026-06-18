@@ -864,8 +864,9 @@ impl SimpleHarnessPaths {
             local_bin.join(BROWSER_HARNESS_WORKER_CLIENT_COMMAND_NAME);
         let artifact_audit_command_path = local_bin.join(ARTIFACT_AUDIT_COMMAND_NAME);
         let force_cloud_marker_path = home.join(FORCE_CLOUD_MARKER);
-        let worker_socket_path = runtime_dir.join("browser-harness-worker.sock");
-        let worker_pid_path = runtime_dir.join("browser-harness-worker.pid");
+        let worker_key = short_hash(&format!("{}:{}", session.id, state_dir.display()));
+        let worker_socket_path = env::temp_dir().join(format!("buh-{worker_key}.sock"));
+        let worker_pid_path = env::temp_dir().join(format!("buh-{worker_key}.pid"));
         let worker_log_path = tmp_dir.join("browser-harness-worker.log");
         let worker_events_jsonl_path = tmp_dir.join("browser-harness-worker-events.jsonl");
         Self {
@@ -2034,6 +2035,11 @@ mod tests {
         assert_eq!(
             paths.worker_events_jsonl_path,
             paths.tmp_dir.join("browser-harness-worker-events.jsonl")
+        );
+        assert!(
+            paths.worker_socket_path.display().to_string().len() < 90,
+            "Unix socket path must stay below platform limits: {}",
+            paths.worker_socket_path.display()
         );
         assert!(!paths.worker_events_jsonl_path.exists());
         assert!(!paths.force_cloud_marker_path.exists());
