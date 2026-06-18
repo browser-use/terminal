@@ -97,6 +97,8 @@ trait LlmErrorExt {
     fn provider_internal(message: impl Into<String>) -> LlmError;
     /// A rate-limit (429) failure.
     fn rate_limit(message: impl Into<String>) -> LlmError;
+    /// A hard quota / usage-limit failure.
+    fn quota_exceeded(message: impl Into<String>) -> LlmError;
     /// An authentication / authorization failure (401 / 403).
     fn authentication(message: impl Into<String>) -> LlmError;
     /// A non-retryable bad-request style failure (4xx other than auth/429).
@@ -112,6 +114,9 @@ impl LlmErrorExt for LlmError {
     }
     fn rate_limit(message: impl Into<String>) -> LlmError {
         LlmError::new(LlmErrorReason::RateLimit, message)
+    }
+    fn quota_exceeded(message: impl Into<String>) -> LlmError {
+        LlmError::new(LlmErrorReason::QuotaExceeded, message)
     }
     fn authentication(message: impl Into<String>) -> LlmError {
         LlmError::new(LlmErrorReason::Authentication, message)
@@ -142,12 +147,32 @@ fn error_for_status(status: u16, body: &str) -> LlmError {
     };
     let mut err = match status {
         401 | 403 => LlmError::authentication(msg),
+        429 if body_has_usage_limit_error_type(body) => LlmError::quota_exceeded(msg),
         429 => LlmError::rate_limit(msg),
         500..=599 => LlmError::provider_internal(msg),
         _ => LlmError::invalid_request(msg),
     };
     err.status = Some(status);
     err
+}
+
+fn body_has_usage_limit_error_type(body: &str) -> bool {
+    let Ok(value) = serde_json::from_str::<Value>(body) else {
+        return false;
+    };
+    let error_type = value
+        .get("error")
+        .and_then(|error| error.get("type"))
+        .or_else(|| value.get("type"))
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    matches!(
+        error_type.as_str(),
+        "usage_limit_reached"
+            | "workspace_owner_usage_limit_reached"
+            | "workspace_member_usage_limit_reached"
+    )
 }
 
 // ===========================================================================
@@ -1377,6 +1402,14 @@ mod tests {
         let rl = error_for_status(429, "slow down");
         assert_eq!(rl.reason, LlmErrorReason::RateLimit);
         assert_eq!(rl.status, Some(429));
+        assert!(rl.retryable);
+        let usage_limit = error_for_status(
+            429,
+            r#"{"error":{"type":"usage_limit_reached","message":"The usage limit has been reached"}}"#,
+        );
+        assert_eq!(usage_limit.reason, LlmErrorReason::QuotaExceeded);
+        assert_eq!(usage_limit.status, Some(429));
+        assert!(!usage_limit.retryable);
         assert_eq!(
             error_for_status(500, "").reason,
             LlmErrorReason::ProviderInternal

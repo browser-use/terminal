@@ -51,7 +51,9 @@ email_address()
 email_inbox(limit=20, sent_after=None)
 email_message(message_id)
 http_get(url, **kwargs)
+http_get_many(urls, **kwargs)
 browser_fetch(url, **kwargs)
+browser_fetch_many(requests, **kwargs)
 
 copy_artifact(path, kind="file")
 emit_output(value, label=None)
@@ -105,6 +107,17 @@ emit_output(rows, label="employee_rows")
 - Prefer coordinate clicks for visible UI: screenshot, inspect pixels, `click_at_xy(x, y)`, wait, screenshot again. Use `js(...)` for DOM inspection and raw `cdp(...)` for lower-level actions; pass JSON-serializable Python values into JavaScript with `js(function_source, *args)`, and use `target_id=` for iframe targets.
 - For real user forms, act like a browser user: screenshot, click the visible field/control, type with `type_text(...)`, `press_key(...)`, or `fill_input(...)`, then screenshot or otherwise verify. Use coordinate clicks for checkboxes, radios, buttons, dropdowns, and custom controls. Do not assign `element.value`, `element.checked`, `selectedIndex`, React private state, or MutationObserver restore loops on live forms. Do not synthesize `input`, `change`, `click`, or keyboard events in page JavaScript to make a form look filled. Those anti-patterns can desynchronize framework state from the visible DOM.
 - Use `http_get(...)` for one static page/API URL after the browser reveals a stable endpoint. Use `browser_fetch(...)` when the page's cookies, auth headers, or browser session are needed. Returned bodies are strings by default, bytes with `binary=True`, and expose `.status_code`, `.headers`, `.url`, `.text`, `.content`, and `.json()`. If direct HTTP hits bot or login protection, retry with `browser_fetch(...)`, site-specific headers/cookies, or the configured Browser Use fetch proxy. Do not replace source completion with blind bulk fetching; use small inspected chunks with progress, counts, missing fields, and source coverage.
+- For text-heavy research, document reading, search, pricing, tables, and list extraction, screenshots add latency. If navigation output says `navigation_ready` and the URL/title are right, trust it and inspect/extract from the current page instead of repeating screenshots. If you have three or more independent URLs, first verify one in-browser, then batch the rest when appropriate. Batch recipe after discovering stable links or endpoints:
+
+```python
+urls = ["https://example.com/a", "https://example.com/b"]
+responses = http_get_many(urls, timeout=12, max_workers=8)
+print(f"Fetched {sum(1 for r in responses if getattr(r, 'ok', False))}/{len(responses)} independent URLs")
+```
+
+When this is emitted through a `browser_summary`, use a compact message like `Fetched ${$.ok_count}/${$.total} independent URLs`.
+
+For logged-in/session-dependent pages, use `browser_fetch_many(requests, timeout=12, max_concurrency=6)` after proving the request shape in the browser.
 
 - Extract only fields needed for the task. Do not emit full profile text, full DOM text, cookies, localStorage, or entire app caches unless you are debugging and the smaller field-level extraction failed.
 - Save complete generated result files under `outputs_dir()` or relative paths in the cwd — files written there are collected as artifacts automatically (`copy_artifact(...)` is for files created elsewhere). Write large structured results to a file: if the task asks for an exact inline final format, return that content with `done(result=...)` and optionally `result_file=path`; otherwise finish with `done(result_file=path)`.

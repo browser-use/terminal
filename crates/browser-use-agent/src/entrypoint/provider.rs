@@ -60,7 +60,7 @@ use browser_use_runtime::{
     MailboxDeliveryPhase as RuntimeMailboxDeliveryPhase, RuntimeHandle,
     SessionId as RuntimeSessionId,
 };
-use browser_use_store::Store;
+use browser_use_store::{default_state_dir, Store};
 use serde::Serialize;
 
 use crate::config_overrides::ProviderBackend;
@@ -131,6 +131,21 @@ const DISABLE_LOCAL_SEARCH_ENV: &str = "BROWSER_USE_DISABLE_LOCAL_SEARCH";
 /// REAL [`GuardianApprover`] (permissive sandbox seam). Named so the builder + the
 /// fused driver agree on the runner's generic arguments.
 pub type RealToolDispatcher = ToolDispatcher<RegistryRunner<NoneSandboxProvider, GuardianApprover>>;
+
+struct DisabledPythonBackend;
+
+impl PythonBackend for DisabledPythonBackend {
+    fn run(
+        &self,
+        _session_id: &str,
+        _cwd: &std::path::Path,
+        _artifact_dir: &std::path::Path,
+        _code: &str,
+        _timeout_secs: Option<f64>,
+    ) -> anyhow::Result<browser_use_python_worker::RunPythonResponse> {
+        anyhow::bail!("python tool is disabled in simple harness mode")
+    }
+}
 
 static UNIFIED_EXEC_MANAGERS: OnceLock<Mutex<HashMap<String, UnifiedExecManager>>> =
     OnceLock::new();
@@ -749,11 +764,32 @@ fn env_first(keys: &[&str]) -> Option<String> {
         .find_map(|k| std::env::var(k).ok().filter(|v| !v.trim().is_empty()))
 }
 
-/// Read a non-empty value from the [`Store`] settings, ignoring read errors
-/// (a store read failure should not block an otherwise-resolvable env credential;
-/// it degrades to "no stored value").
+/// Read a non-empty value from the run [`Store`] settings, then from the default
+/// product auth store for `auth.*` keys. Store read failures degrade to "no
+/// stored value" so they do not block an otherwise-resolvable env credential.
 fn store_first(store: Option<&Store>, key: &str) -> Option<String> {
-    store?
+    if let Some(value) = store
+        .and_then(|store| store.get_setting(key).ok().flatten())
+        .filter(|v| !v.trim().is_empty())
+    {
+        return Some(value);
+    }
+    default_auth_store_first(store, key)
+}
+
+fn default_auth_store_first(current_store: Option<&Store>, key: &str) -> Option<String> {
+    if !key.starts_with("auth.") {
+        return None;
+    }
+    let default_dir = default_state_dir();
+    if current_store.is_some_and(|store| store.state_dir() == default_dir.as_path()) {
+        return None;
+    }
+    if !default_dir.join("state.db").exists() {
+        return None;
+    }
+    Store::open(default_dir)
+        .ok()?
         .get_setting(key)
         .ok()
         .flatten()
@@ -1133,6 +1169,7 @@ fn resolve_provider_with_python(
     //      inject a fake.
     let python_backend = match python_backend {
         Some(backend) => backend,
+        None if config.options.simple_harness => Arc::new(DisabledPythonBackend),
         None => python_backend_for_runtime_or_config(
             config,
             runtime_handle.as_ref(),
@@ -1310,17 +1347,19 @@ fn build_tool_dispatcher_with_cwd_and_goal_store(
             session_id.as_str().to_string(),
         ))
     });
+    let default_shell_env = crate::simple_harness::shell_default_env(config);
     let shell_tool = match &unified_exec_emitter {
-        Some(emitter) => {
-            ShellTool::with_manager(unified_exec.clone()).with_event_emitter(Arc::clone(emitter))
-        }
-        None => ShellTool::with_manager(unified_exec.clone()),
+        Some(emitter) => ShellTool::with_manager(unified_exec.clone())
+            .with_default_env(default_shell_env.clone())
+            .with_event_emitter(Arc::clone(emitter)),
+        None => ShellTool::with_manager(unified_exec.clone())
+            .with_default_env(default_shell_env.clone()),
     };
     let exec_command_tool = match &unified_exec_emitter {
-        Some(emitter) => {
-            ExecCommandTool::new(unified_exec.clone()).with_event_emitter(Arc::clone(emitter))
-        }
-        None => ExecCommandTool::new(unified_exec.clone()),
+        Some(emitter) => ExecCommandTool::new(unified_exec.clone())
+            .with_default_env(default_shell_env)
+            .with_event_emitter(Arc::clone(emitter)),
+        None => ExecCommandTool::new(unified_exec.clone()).with_default_env(default_shell_env),
     };
     let write_stdin_tool = match &unified_exec_emitter {
         Some(emitter) => {
@@ -1375,70 +1414,72 @@ fn build_tool_dispatcher_with_cwd_and_goal_store(
     if local_search_enabled_for_run(config) {
         reg.register::<_, SearchRequest>("search", definitions::search(), true, SearchTool::new());
     }
-    let browser_backend = browser_backend_for_runtime_or_config(
-        config,
-        runtime_handle.as_ref(),
-        user_input.as_ref().map(|(_, session_id)| session_id),
-    )?;
-    let browser_tool = BrowserTool::with_backend(browser_backend)
-        .with_selected_browser_mode(config.options.browser_mode.clone())
-        .with_selected_browser_profile_id(config.options.browser_profile_id.clone())
-        .with_selected_local_browser(config.options.browser_local_browser.clone())
-        .with_default_script_timeout_secs(config.options.python_tool_timeout_seconds);
-    let browser_tool = match &user_input {
-        Some((store, session_id)) => {
-            let tool = browser_tool
-                .with_session_id(session_id.as_str().to_string())
-                .with_persistence(store.clone(), session_id.as_str().to_string());
-            if config.options.dynamic_browser_mode_from_store {
-                tool.with_dynamic_browser_mode_from_store(true)
-            } else {
-                tool
+    if !config.options.simple_harness {
+        let browser_backend = browser_backend_for_runtime_or_config(
+            config,
+            runtime_handle.as_ref(),
+            user_input.as_ref().map(|(_, session_id)| session_id),
+        )?;
+        let browser_tool = BrowserTool::with_backend(browser_backend)
+            .with_selected_browser_mode(config.options.browser_mode.clone())
+            .with_selected_browser_profile_id(config.options.browser_profile_id.clone())
+            .with_selected_local_browser(config.options.browser_local_browser.clone())
+            .with_default_script_timeout_secs(config.options.python_tool_timeout_seconds);
+        let browser_tool = match &user_input {
+            Some((store, session_id)) => {
+                let tool = browser_tool
+                    .with_session_id(session_id.as_str().to_string())
+                    .with_persistence(store.clone(), session_id.as_str().to_string());
+                if config.options.dynamic_browser_mode_from_store {
+                    tool.with_dynamic_browser_mode_from_store(true)
+                } else {
+                    tool
+                }
+            }
+            None => browser_tool,
+        };
+        // `browser`: standalone production backend (`browser-use-browser`, internal
+        // session management). parallel_safe = false (single CDP connection).
+        reg.register::<_, BrowserRequest>(
+            "browser",
+            definitions::browser(),
+            false,
+            browser_tool.clone(),
+        );
+        // `browser_script`: browser-use's page/data-plane surface. It routes through
+        // the same handler, but the schema omits the internal session id and matches
+        // the prompt contract used by current-main browser tasks.
+        reg.register::<_, BrowserRequest>(
+            "browser_script",
+            definitions::browser_script(),
+            false,
+            browser_tool,
+        );
+        // Temporarily disable the agent-driven GIF curation pipeline. The
+        // deterministic post-run fallback recording remains active.
+        const AGENT_DRIVEN_GIF_CURATION_ENABLED: bool = false;
+        if AGENT_DRIVEN_GIF_CURATION_ENABLED {
+            if let Some((store, session_id)) = &user_input {
+                reg.register::<_, CaptureCurationRequest>(
+                    "submit_capture_curation",
+                    definitions::submit_capture_curation(),
+                    false,
+                    CaptureCurationTool::with_store(store.clone(), session_id.as_str().to_string()),
+                );
             }
         }
-        None => browser_tool,
-    };
-    // `browser`: standalone production backend (`browser-use-browser`, internal
-    // session management). parallel_safe = false (single CDP connection).
-    reg.register::<_, BrowserRequest>(
-        "browser",
-        definitions::browser(),
-        false,
-        browser_tool.clone(),
-    );
-    // `browser_script`: browser-use's page/data-plane surface. It routes through
-    // the same handler, but the schema omits the internal session id and matches
-    // the prompt contract used by current-main browser tasks.
-    reg.register::<_, BrowserRequest>(
-        "browser_script",
-        definitions::browser_script(),
-        false,
-        browser_tool,
-    );
-    // Temporarily disable the agent-driven GIF curation pipeline. The
-    // deterministic post-run fallback recording remains active.
-    const AGENT_DRIVEN_GIF_CURATION_ENABLED: bool = false;
-    if AGENT_DRIVEN_GIF_CURATION_ENABLED {
-        if let Some((store, session_id)) = &user_input {
-            reg.register::<_, CaptureCurationRequest>(
-                "submit_capture_curation",
-                definitions::submit_capture_curation(),
-                false,
-                CaptureCurationTool::with_store(store.clone(), session_id.as_str().to_string()),
-            );
-        }
+        // `python`: backed by the run's single PythonWorker (started eagerly by
+        // `resolve_provider`). parallel_safe = false (single interpreter process).
+        reg.register::<_, PythonRequest>(
+            "python",
+            definitions::python(),
+            false,
+            PythonTool::with_backend(python_backend),
+        );
+        // `done`: the completion tool the model calls to declare it has finished,
+        // with its final summary. Serial (terminal; must not be reordered).
+        reg.register::<_, DoneRequest>("done", definitions::done(), false, DoneTool::new());
     }
-    // `python`: backed by the run's single PythonWorker (started eagerly by
-    // `resolve_provider`). parallel_safe = false (single interpreter process).
-    reg.register::<_, PythonRequest>(
-        "python",
-        definitions::python(),
-        false,
-        PythonTool::with_backend(python_backend),
-    );
-    // `done`: the completion tool the model calls to declare it has finished, with
-    // its final summary. Serial (terminal; must not be reordered).
-    reg.register::<_, DoneRequest>("done", definitions::done(), false, DoneTool::new());
 
     // Codex-style collaboration exposure: v2 is gated by
     // `features.multi_agent_v2`, but only advertise the subagent tools when this
@@ -1577,16 +1618,25 @@ fn build_tool_dispatcher_with_cwd_and_goal_store(
 }
 
 fn subagent_tools_enabled_for_run(config: &ProviderRunConfig) -> bool {
+    if config.options.simple_harness {
+        return false;
+    }
     config.options.multi_agent_v2.enabled && config.options.child_agent_runner.is_some()
 }
 
 fn legacy_subagent_tools_enabled_for_run(config: &ProviderRunConfig) -> bool {
+    if config.options.simple_harness {
+        return false;
+    }
     !config.options.multi_agent_v2.enabled
         && config.options.collab_enabled
         && config.options.child_agent_runner.is_some()
 }
 
 fn local_search_enabled_for_run(config: &ProviderRunConfig) -> bool {
+    if config.options.simple_harness {
+        return false;
+    }
     if config_override_bool_any(
         &config.options.config_overrides,
         &[
@@ -2501,9 +2551,12 @@ fn build_goal_store(
 }
 
 fn goal_runtime_enabled(
-    _config: &ProviderRunConfig,
+    config: &ProviderRunConfig,
     user_input: &Option<(SharedStore, SessionId)>,
 ) -> bool {
+    if config.options.simple_harness {
+        return false;
+    }
     let Some((store, sid)) = user_input else {
         return false;
     };
@@ -3002,6 +3055,40 @@ mod tests {
         }
     }
 
+    #[test]
+    fn default_auth_store_key_is_fallback_for_fresh_run_store() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let previous_home = std::env::var_os("HOME");
+        let home = tempfile::tempdir().expect("home tempdir");
+        std::env::set_var("HOME", home.path());
+        std::env::remove_var("OPENAI_API_KEY");
+        std::env::remove_var("LLM_BROWSER_OPENAI_API_KEY");
+
+        let default_store = Store::open(default_state_dir()).expect("default auth store");
+        default_store
+            .set_setting("auth.openai.api_key", "default-store-openai-key")
+            .unwrap();
+        let run_dir = tempfile::tempdir().expect("run tempdir");
+        let run_store = Store::open(run_dir.path()).expect("run store");
+
+        let choice = provider_choice_for_backend(ProviderBackend::Openai, Some(&run_store))
+            .expect("resolves")
+            .expect("real provider");
+
+        match choice {
+            ProviderChoice::OpenAiResponses { api_key, .. } => {
+                assert_eq!(api_key, "default-store-openai-key");
+            }
+            other => panic!("expected openai choice, got {other:?}"),
+        }
+
+        if let Some(home) = previous_home {
+            std::env::set_var("HOME", home);
+        } else {
+            std::env::remove_var("HOME");
+        }
+    }
+
     // ---- browser/python tool wiring (network/process free) --------------------
     //
     // These prove the `browser` and `python` handlers are REGISTERED in the
@@ -3434,6 +3521,167 @@ mod tests {
         assert!(!names.contains(&"search"));
         assert!(names.contains(&"browser_script"));
         assert!(names.contains(&"done"));
+    }
+
+    #[test]
+    fn simple_harness_uses_codex_like_tool_surface() {
+        let options = crate::config_overrides::AgentRunOptions::default()
+            .with_simple_harness(true)
+            .with_child_agent_runner(test_child_agent_runner());
+        let config =
+            ProviderRunConfig::new(ProviderBackend::Fake, "fake-model").with_options(options);
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store: SharedStore = Arc::new(std::sync::Mutex::new(
+            Store::open(dir.path()).expect("open store"),
+        ));
+        let session_id = store
+            .lock()
+            .unwrap()
+            .create_session(None, dir.path())
+            .expect("create session row")
+            .id;
+        let dispatcher = build_tool_dispatcher(
+            Arc::new(MarkerPythonBackend),
+            &config,
+            Some((store, SessionId(session_id))),
+        );
+        let names: Vec<&str> = dispatcher
+            .tool_specs()
+            .iter()
+            .map(|s| s.name.as_str())
+            .collect();
+
+        for tool in [
+            "shell",
+            "exec_command",
+            "write_stdin",
+            "view_image",
+            "web_search",
+        ] {
+            assert!(
+                names.contains(&tool),
+                "{tool} must stay available in simple harness mode; got {names:?}"
+            );
+        }
+        for tool in [
+            "browser",
+            "browser_script",
+            "python",
+            "done",
+            "search",
+            "spawn_agent",
+            "wait_agent",
+            "send_message",
+            "followup_task",
+            "list_agents",
+            "close_agent",
+            "get_goal",
+            "create_goal",
+            "update_goal",
+        ] {
+            assert!(
+                !names.contains(&tool),
+                "{tool} must be hidden in simple harness mode; got {names:?}"
+            );
+        }
+        assert!(
+            names.contains(&"tool_search"),
+            "tool_search should describe the simple surface; got {names:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn simple_harness_tool_search_does_not_leak_hidden_tools() {
+        let options = crate::config_overrides::AgentRunOptions::default()
+            .with_simple_harness(true)
+            .with_child_agent_runner(test_child_agent_runner());
+        let config =
+            ProviderRunConfig::new(ProviderBackend::Fake, "fake-model").with_options(options);
+        let dispatcher = build_tool_dispatcher(Arc::new(MarkerPythonBackend), &config, None);
+
+        let (text, is_error) = dispatch_call(
+            &dispatcher,
+            "tool_search",
+            serde_json::json!({
+                "query": "command shell browser browser_script python done search spawn_agent goal",
+                "limit": 20,
+            }),
+        )
+        .await;
+
+        assert!(!is_error, "tool_search should run successfully: {text}");
+        let payload = text
+            .strip_prefix(crate::tools::handlers::tool_search::TOOL_SEARCH_STDOUT_PREFIX)
+            .expect("tool_search output prefix");
+        let matches: Vec<serde_json::Value> =
+            serde_json::from_str(payload).expect("tool_search JSON payload");
+        let names: Vec<&str> = matches
+            .iter()
+            .filter_map(|entry| entry.get("name").and_then(serde_json::Value::as_str))
+            .collect();
+
+        assert!(
+            names
+                .iter()
+                .any(|name| *name == "shell" || *name == "exec_command"),
+            "tool_search should still search the simple shell surface; got {names:?}"
+        );
+        for tool in [
+            "browser",
+            "browser_script",
+            "python",
+            "done",
+            "search",
+            "spawn_agent",
+            "wait_agent",
+            "send_message",
+            "followup_task",
+            "list_agents",
+            "close_agent",
+            "get_goal",
+            "create_goal",
+            "update_goal",
+        ] {
+            assert!(
+                !names.contains(&tool),
+                "{tool} must not leak through tool_search in simple harness mode; got {names:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn simple_harness_env_is_applied_to_exec_command() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let options = crate::config_overrides::AgentRunOptions {
+            simple_harness: true,
+            python_env: vec![(
+                "BH_AGENT_WORKSPACE".to_string(),
+                "workspace-marker".to_string(),
+            )],
+            ..crate::config_overrides::AgentRunOptions::default()
+        };
+        let config =
+            ProviderRunConfig::new(ProviderBackend::Fake, "fake-model").with_options(options);
+        let dispatcher = build_tool_dispatcher_with_cwd(
+            Arc::new(MarkerPythonBackend),
+            &config,
+            None,
+            dir.path().to_path_buf(),
+            dir.path().join("artifacts"),
+            Arc::new(NoopEventSink),
+        );
+
+        let (text, is_error) = dispatch_call(
+            &dispatcher,
+            "exec_command",
+            serde_json::json!({ "cmd": "printf %s \"$BH_AGENT_WORKSPACE\"" }),
+        )
+        .await;
+        assert!(!is_error, "exec_command should run successfully: {text}");
+        assert!(
+            text.contains("workspace-marker"),
+            "harness env must be inherited by exec_command, got: {text}"
+        );
     }
 
     /// A non-empty `mcp_servers` map registers the `mcp` tool. The stdio server

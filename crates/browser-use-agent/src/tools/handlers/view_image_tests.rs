@@ -195,6 +195,46 @@ async fn unsupported_extension_is_rejected() {
     }
 }
 
+#[tokio::test]
+async fn svg_or_html_bytes_under_png_extension_are_rejected() {
+    let dir = tempfile::tempdir().unwrap();
+    let ctx = ctx_in(dir.path());
+    std::fs::write(
+        dir.path().join("captcha.png"),
+        b"<?xml version=\"1.0\"?><svg xmlns=\"http://www.w3.org/2000/svg\"></svg>",
+    )
+    .unwrap();
+
+    let req = ViewImageRequest::new("captcha.png");
+    match run_direct(&req, &ctx).await {
+        Err(ToolError::Rejected(msg)) => {
+            assert!(
+                msg.contains("SVG/XML/HTML"),
+                "should reject mislabeled text markup, got: {msg}"
+            );
+        }
+        other => panic!("expected Rejected for mislabeled SVG/PNG, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn corrupt_png_bytes_are_rejected_before_provider_inline() {
+    let dir = tempfile::tempdir().unwrap();
+    let ctx = ctx_in(dir.path());
+    std::fs::write(dir.path().join("broken.png"), b"not actually a png").unwrap();
+
+    let req = ViewImageRequest::new("broken.png");
+    match run_direct(&req, &ctx).await {
+        Err(ToolError::Rejected(msg)) => {
+            assert!(
+                msg.contains("does not contain valid image/png"),
+                "should reject corrupt png bytes, got: {msg}"
+            );
+        }
+        other => panic!("expected Rejected for corrupt PNG, got {other:?}"),
+    }
+}
+
 // (4) An oversize file is rejected. We can't write 20 MiB cheaply in every CI,
 // so we assert the cap value is the legacy one and that a file just over a small
 // synthetic boundary trips the same code path by exceeding the real cap. To keep

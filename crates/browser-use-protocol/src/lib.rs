@@ -252,6 +252,7 @@ pub struct HistoryRow {
     pub session_id: String,
     pub task: String,
     pub status: SessionStatus,
+    pub created_ms: i64,
     pub updated_ms: i64,
 }
 
@@ -1424,11 +1425,17 @@ pub fn project_workbench(
                 session_id: session.id.clone(),
                 task: task_from_events(events).unwrap_or_else(|| "untitled task".to_string()),
                 status: session.status.clone(),
+                created_ms: session.created_ms,
                 updated_ms: session.updated_ms,
             }
         })
         .collect::<Vec<_>>();
-    history.sort_by(|a, b| b.updated_ms.cmp(&a.updated_ms));
+    history.sort_by(|a, b| {
+        b.updated_ms
+            .cmp(&a.updated_ms)
+            .then_with(|| b.created_ms.cmp(&a.created_ms))
+            .then_with(|| b.session_id.cmp(&a.session_id))
+    });
 
     let result = if current_session
         .as_ref()
@@ -2332,6 +2339,39 @@ mod tests {
         let state = project_workbench(&sessions, &[], &[], None, "local chrome");
         assert_eq!(state.history.len(), 1);
         assert_eq!(state.history[0].session_id, "parent");
+    }
+
+    #[test]
+    fn history_ties_on_updated_ms_use_created_ms_newest_first() {
+        let sessions = vec![
+            SessionMeta {
+                id: "older".to_string(),
+                parent_id: None,
+                cwd: "/tmp".to_string(),
+                artifact_root: "/tmp/artifacts/older".to_string(),
+                status: SessionStatus::Done,
+                created_ms: 10,
+                updated_ms: 100,
+            },
+            SessionMeta {
+                id: "newer".to_string(),
+                parent_id: None,
+                cwd: "/tmp".to_string(),
+                artifact_root: "/tmp/artifacts/newer".to_string(),
+                status: SessionStatus::Running,
+                created_ms: 20,
+                updated_ms: 100,
+            },
+        ];
+        let state = project_workbench(&sessions, &[], &[], None, "local chrome");
+        assert_eq!(
+            state
+                .history
+                .iter()
+                .map(|row| row.session_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["newer", "older"]
+        );
     }
 
     #[test]

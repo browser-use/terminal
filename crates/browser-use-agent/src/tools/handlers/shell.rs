@@ -144,6 +144,15 @@ fn truncate_model_text(text: &str, max_output_tokens: Option<usize>) -> String {
     format!("{}\n…\n", &text[..end])
 }
 
+fn merge_env(
+    default_env: &HashMap<String, String>,
+    request_env: &HashMap<String, String>,
+) -> HashMap<String, String> {
+    let mut env = default_env.clone();
+    env.extend(request_env.clone());
+    env
+}
+
 /// A simple, conservative denylist of obviously destructive commands.
 ///
 /// PARITY CAVEAT: the legacy impl used a tree-sitter-based
@@ -252,6 +261,7 @@ fn is_root_wipe(norm: &str) -> bool {
 pub struct ShellTool {
     manager: UnifiedExecManager,
     emitter: Option<Arc<UnifiedExecEventEmitter>>,
+    default_env: HashMap<String, String>,
 }
 
 impl Default for ShellTool {
@@ -266,6 +276,7 @@ impl ShellTool {
         Self {
             manager: UnifiedExecManager::default(),
             emitter: None,
+            default_env: HashMap::new(),
         }
     }
 
@@ -273,11 +284,17 @@ impl ShellTool {
         Self {
             manager,
             emitter: None,
+            default_env: HashMap::new(),
         }
     }
 
     pub fn with_event_emitter(mut self, emitter: Arc<UnifiedExecEventEmitter>) -> Self {
         self.emitter = Some(emitter);
+        self
+    }
+
+    pub fn with_default_env(mut self, env: HashMap<String, String>) -> Self {
+        self.default_env = env;
         self
     }
 }
@@ -382,6 +399,7 @@ impl WriteStdinRequest {
 pub struct ExecCommandTool {
     manager: UnifiedExecManager,
     emitter: Option<Arc<UnifiedExecEventEmitter>>,
+    default_env: HashMap<String, String>,
 }
 
 impl ExecCommandTool {
@@ -389,11 +407,17 @@ impl ExecCommandTool {
         Self {
             manager,
             emitter: None,
+            default_env: HashMap::new(),
         }
     }
 
     pub fn with_event_emitter(mut self, emitter: Arc<UnifiedExecEventEmitter>) -> Self {
         self.emitter = Some(emitter);
+        self
+    }
+
+    pub fn with_default_env(mut self, env: HashMap<String, String>) -> Self {
+        self.default_env = env;
         self
     }
 }
@@ -572,7 +596,7 @@ impl ToolRuntime<ShellRequest, ExecOutput> for ShellTool {
             .run_to_completion(SpawnProcessRequest {
                 argv: req.command.clone(),
                 cwd,
-                env: req.env.clone(),
+                env: merge_env(&self.default_env, &req.env),
                 tty: false,
                 yield_time_ms: DEFAULT_WRITE_STDIN_YIELD_TIME_MS,
                 max_output_tokens: req.max_output_tokens,
@@ -615,7 +639,7 @@ impl ToolRuntime<ExecCommandRequest, ExecOutput> for ExecCommandTool {
             .spawn_process(SpawnProcessRequest {
                 argv,
                 cwd: req.cwd(ctx),
-                env: req.env.clone(),
+                env: merge_env(&self.default_env, &req.env),
                 tty: req.tty,
                 yield_time_ms: req.yield_time_ms(),
                 max_output_tokens: req.max_output_tokens,

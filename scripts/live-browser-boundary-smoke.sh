@@ -5,6 +5,28 @@ is_google_chrome_wrapper() {
   [[ -f "$1" ]] && grep -q 'Google Chrome.app' "$1"
 }
 
+find_allowed_google_chrome() {
+  local candidate
+  for candidate in \
+    "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome" \
+    "/opt/google/chrome/google-chrome"
+  do
+    if [[ -x "$candidate" ]]; then
+      printf '%s\n' "$candidate"
+      return 0
+    fi
+  done
+
+  for candidate in google-chrome google-chrome-stable; do
+    if command -v "$candidate" >/dev/null 2>&1; then
+      command -v "$candidate"
+      return 0
+    fi
+  done
+
+  return 1
+}
+
 if [[ -n "${CHROME_PATH:-}" ]]; then
   chrome="$CHROME_PATH"
 elif compgen -G "$HOME/Library/Caches/ms-playwright/chromium-*/chrome-mac*/Google Chrome for Testing.app/Contents/MacOS/Google Chrome for Testing" >/dev/null; then
@@ -17,8 +39,8 @@ elif command -v chromium >/dev/null 2>&1 && ! is_google_chrome_wrapper "$(comman
   chrome="$(command -v chromium)"
 elif [[ -x /opt/homebrew/bin/chromium ]] && ! is_google_chrome_wrapper /opt/homebrew/bin/chromium; then
   chrome="/opt/homebrew/bin/chromium"
-elif [[ "${LLM_BROWSER_ALLOW_GOOGLE_CHROME:-}" == "1" ]]; then
-  chrome="/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
+elif [[ "${LLM_BROWSER_ALLOW_GOOGLE_CHROME:-}" == "1" ]] && chrome="$(find_allowed_google_chrome)"; then
+  :
 else
   echo "Chromium not found; install Chromium, set CHROME_PATH, or set LLM_BROWSER_ALLOW_GOOGLE_CHROME=1" >&2
   exit 1

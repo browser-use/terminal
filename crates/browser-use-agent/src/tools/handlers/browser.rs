@@ -1140,8 +1140,32 @@ fn resolve_browser_command_for_selected_mode(
         {
             return Ok(command);
         }
-        enforce_browser_command_matches_selected_mode(&args, selected_browser_mode)?;
+        let enforced_mode =
+            browser_command_enforced_mode(store, selected_browser_mode)?.map(str::to_string);
+        enforce_browser_command_matches_selected_mode(&args, enforced_mode.as_deref())?;
         Ok(cmd.to_string())
+    }
+}
+
+fn browser_command_enforced_mode(
+    store: Option<&Store>,
+    selected_browser_mode: Option<&str>,
+) -> anyhow::Result<Option<&'static str>> {
+    if let Some(mode) = selected_browser_mode
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        return Ok(Some(normalize_browser_preference_mode(mode)?));
+    }
+    let Some(store) = store else {
+        return Ok(None);
+    };
+    let has_stored_preference =
+        store.get_setting(BROWSER_PREF_MODE)?.is_some() || store.get_setting("browser")?.is_some();
+    if has_stored_preference {
+        Ok(Some(preferred_browser_mode(Some(store))?))
+    } else {
+        Ok(None)
     }
 }
 

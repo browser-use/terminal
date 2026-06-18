@@ -1663,8 +1663,7 @@ impl AppStateCache {
         } else {
             self.sessions.push(session);
         }
-        self.sessions
-            .sort_by(|left, right| right.updated_ms.cmp(&left.updated_ms));
+        sort_sessions_recent_first(&mut self.sessions);
         true
     }
 
@@ -1786,9 +1785,19 @@ impl AppStateCache {
                 updated_ms: synthetic_ts,
             });
         }
-        sessions.sort_by(|left, right| right.updated_ms.cmp(&left.updated_ms));
+        sort_sessions_recent_first(&mut sessions);
         sessions
     }
+}
+
+fn sort_sessions_recent_first(sessions: &mut [SessionMeta]) {
+    sessions.sort_by(|left, right| {
+        right
+            .updated_ms
+            .cmp(&left.updated_ms)
+            .then_with(|| right.created_ms.cmp(&left.created_ms))
+            .then_with(|| right.id.cmp(&left.id))
+    });
 }
 
 fn runtime_status_overlay_for_store_status(
@@ -17324,6 +17333,28 @@ mod redesign_tests {
         let screen = render_dump(&mut app)?;
         assert!(screen.contains("/task"));
         assert!(screen.contains("/model"));
+        Ok(())
+    }
+
+    #[test]
+    fn feedback_palette_action_opens_feedback_surface() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let mut app = ready_app(&temp)?;
+
+        assert!(!app.execute_palette_action(PaletteAction::Feedback)?);
+
+        assert_eq!(app.surface, Surface::Feedback);
+        assert_eq!(app.feedback.step, FeedbackStep::Category);
+        assert_eq!(app.feedback.category_index, 0);
+        let screen = render_dump(&mut app)?;
+        assert!(screen.contains("Feedback"));
+        assert!(screen.contains("Choose a category"));
+        assert!(screen.contains("bug"));
+        assert!(screen.contains("bad result"));
+        assert!(screen.contains("good result"));
+        assert!(screen.contains("safety check"));
+        assert!(screen.contains("other"));
+        assert!(screen.contains("1-5"));
         Ok(())
     }
 

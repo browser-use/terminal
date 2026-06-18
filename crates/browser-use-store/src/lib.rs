@@ -534,7 +534,7 @@ impl Store {
 
     pub fn list_sessions(&self) -> Result<Vec<SessionMeta>> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, parent_id, cwd, artifact_root, status, created_ms, updated_ms FROM sessions ORDER BY updated_ms DESC",
+            "SELECT id, parent_id, cwd, artifact_root, status, created_ms, updated_ms FROM sessions ORDER BY updated_ms DESC, created_ms DESC, id DESC",
         )?;
         let rows = stmt
             .query_map([], row_to_session)?
@@ -1392,6 +1392,40 @@ mod tests {
         assert_eq!(events.len(), 3);
         assert_eq!(events[1].event_type, "session.input");
         assert_eq!(events[2].payload["result"], "complete");
+        Ok(())
+    }
+
+    #[test]
+    fn list_sessions_breaks_updated_ms_ties_by_created_ms_desc() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let store = Store::open(temp.path())?;
+        store.insert_session(&SessionMeta {
+            id: "older".to_string(),
+            parent_id: None,
+            cwd: "/tmp".to_string(),
+            artifact_root: "/tmp/artifacts/older".to_string(),
+            status: SessionStatus::Done,
+            created_ms: 10,
+            updated_ms: 100,
+        })?;
+        store.insert_session(&SessionMeta {
+            id: "newer".to_string(),
+            parent_id: None,
+            cwd: "/tmp".to_string(),
+            artifact_root: "/tmp/artifacts/newer".to_string(),
+            status: SessionStatus::Running,
+            created_ms: 20,
+            updated_ms: 100,
+        })?;
+
+        let sessions = store.list_sessions()?;
+        assert_eq!(
+            sessions
+                .iter()
+                .map(|session| session.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["newer", "older"]
+        );
         Ok(())
     }
 

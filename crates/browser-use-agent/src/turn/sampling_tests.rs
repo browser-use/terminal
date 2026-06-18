@@ -531,6 +531,27 @@ async fn non_retryable_error_fails_without_retrying() {
 }
 
 #[tokio::test]
+async fn quota_exceeded_error_fails_without_retrying() {
+    let (transport, opens) = ScriptedTransport::new(vec![OpenScript::OpenErr(LlmError::new(
+        LlmErrorReason::QuotaExceeded,
+        "usage limit reached",
+    ))]);
+    let sink = Arc::new(RecordingSink::default());
+    let d = driver(transport, sink, 5);
+
+    let err = d
+        .run_sampling_request(user_input(), CancellationToken::new())
+        .await
+        .expect_err("quota exceeded must fail immediately");
+    assert!(matches!(err, AgentError::UsageLimitReached), "got {err:?}");
+    assert_eq!(
+        opens.load(Ordering::SeqCst),
+        1,
+        "hard usage limits must not be retried"
+    );
+}
+
+#[tokio::test]
 async fn streamed_provider_error_fails_turn_after_emitting_stream_error() {
     let (transport, opens) =
         ScriptedTransport::new(vec![OpenScript::Stream(vec![provider_error(

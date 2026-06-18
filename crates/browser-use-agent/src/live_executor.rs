@@ -19,6 +19,7 @@ use tokio_util::sync::CancellationToken;
 use crate::config_overrides::ProviderRunConfig;
 use crate::entrypoint::RuntimeTurnDriver;
 use crate::session::SharedStore;
+use crate::simple_harness;
 
 #[derive(Clone)]
 pub struct RuntimeAgentExecutor {
@@ -163,12 +164,16 @@ impl RuntimeAgentExecutor {
         let runtime_session_id = RuntimeSessionId::from_string(request.session_id.clone())?;
         let store =
             Store::open_with_optional_notifier(&self.inner.state_dir, self.inner.notifier.clone())?;
+        let mut run_config = request.config.clone();
+        let simple_harness_enabled = run_config.options.simple_harness;
+        if simple_harness_enabled {
+            simple_harness::prepare_existing_session(&store, &request.session_id, &mut run_config)?;
+        }
         ensure_agent_attached(
             &self.inner.runtime,
             &store,
             &request.session_id,
-            request
-                .config
+            run_config
                 .options
                 .multi_agent_v2
                 .max_concurrent_threads_per_session,
@@ -192,14 +197,14 @@ impl RuntimeAgentExecutor {
             .cancellation_token
             .unwrap_or_else(CancellationToken::new);
         let provider_config = json!({
-            "backend": format!("{:?}", request.config.backend),
-            "model": request.config.model,
+            "backend": format!("{:?}", run_config.backend),
+            "model": run_config.model,
             "runtime_agent_executor": true,
         });
         let agent_id = AgentId::from_string(request.session_id.clone())?;
         let runtime = self.inner.runtime.clone();
         let request_session_id = request.session_id.clone();
-        let config = request.config;
+        let config = run_config;
         let shared_store_for_loop = Arc::clone(&shared_store);
         let request_session_id_for_loop = request_session_id.clone();
         let result = self.inner.tokio.block_on(async move {
@@ -262,15 +267,26 @@ impl RuntimeAgentExecutor {
             }
         });
         match result {
-            Ok(response) => Ok(RuntimeAgentRunResult {
-                session_id: response.output.0,
-            }),
+            Ok(response) => {
+                if simple_harness_enabled {
+                    let mirror_result = mirror_session_outputs(&shared_store, &request_session_id);
+                    cleanup_simple_harness_session(&shared_store, &request_session_id);
+                    mirror_result?;
+                }
+                Ok(RuntimeAgentRunResult {
+                    session_id: response.output.0,
+                })
+            }
             Err(error) => {
                 append_session_failed_if_missing(
                     &shared_store,
                     &request_session_id,
                     &format!("{error:#}"),
                 );
+                if simple_harness_enabled {
+                    let _ = mirror_session_outputs(&shared_store, &request_session_id);
+                    cleanup_simple_harness_session(&shared_store, &request_session_id);
+                }
                 Err(error)
             }
         }
@@ -301,6 +317,11 @@ impl RuntimeAgentExecutor {
                             &message,
                             executor.inner.notifier.clone(),
                         );
+                        cleanup_simple_harness_session_in_state_dir(
+                            executor.state_dir(),
+                            &session_id,
+                            executor.inner.notifier.clone(),
+                        );
                         Err(anyhow!(message))
                     }
                 };
@@ -323,6 +344,39 @@ impl RuntimeAgentExecutor {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         *active == 0
     }
+}
+
+fn mirror_session_outputs(shared_store: &SharedStore, session_id: &str) -> Result<()> {
+    let store = shared_store
+        .lock()
+        .map_err(|_| anyhow!("session store lock poisoned"))?;
+    let mirror = simple_harness::mirror_existing_session(&store, session_id)?;
+    simple_harness::record_mirror_event(&store, session_id, &mirror)?;
+    Ok(())
+}
+
+fn cleanup_simple_harness_session(shared_store: &SharedStore, session_id: &str) {
+    let Ok(store) = shared_store.lock() else {
+        return;
+    };
+    let Ok(cleanup) = simple_harness::cleanup_existing_session(&store, session_id) else {
+        return;
+    };
+    let _ = simple_harness::record_cleanup_event(&store, session_id, &cleanup);
+}
+
+fn cleanup_simple_harness_session_in_state_dir(
+    state_dir: &Path,
+    session_id: &str,
+    notifier: Option<StoreNotifier>,
+) {
+    let Ok(store) = Store::open_with_optional_notifier(state_dir, notifier) else {
+        return;
+    };
+    let Ok(cleanup) = simple_harness::cleanup_existing_session(&store, session_id) else {
+        return;
+    };
+    let _ = simple_harness::record_cleanup_event(&store, session_id, &cleanup);
 }
 
 struct BackgroundRunGuard {
@@ -495,6 +549,8 @@ fn panic_payload_message(payload: Box<dyn Any + Send>) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config_overrides::AgentRunOptions;
+    use crate::config_overrides::ProviderBackend;
     use browser_use_runtime::{
         BrowserUseRuntime, CreateRootAgentRequest, CreateThreadRequest, Durability, JournalAppend,
         JournalReader, JournalSink, LiveThreadPersistence, MemoryJournal, RuntimeEvent, SpawnEdge,
@@ -784,6 +840,100 @@ mod tests {
         assert!(event_types
             .iter()
             .all(|event_type| event_type != "mailbox.enqueued"));
+        Ok(())
+    }
+
+    #[test]
+    fn run_blocking_prepares_simple_harness_and_mirrors_final_answer() -> Result<()> {
+        let dir = TempDir::new()?;
+        let cwd = dir.path().join("work");
+        let artifact_root = dir.path().join("artifacts");
+        let store = Store::open(dir.path())?;
+        let session = store.create_session_with_id_and_artifact_root(
+            None,
+            &cwd,
+            &artifact_root,
+            "sess-1".to_string(),
+        )?;
+        store.append_event(
+            &session.id,
+            "session.input",
+            json!({ "text": "return the canned fake result" }),
+        )?;
+
+        let runtime = sqlite_runtime(dir.path())?;
+        let executor =
+            RuntimeAgentExecutor::new(RuntimeAgentExecutorConfig::new(dir.path(), runtime))?;
+        let config = ProviderRunConfig::new(ProviderBackend::Fake, "fake-model")
+            .with_fake_result("mirrored fake answer")
+            .with_options(AgentRunOptions::default().with_simple_harness(true));
+
+        let result = executor.run_blocking(RuntimeAgentRunRequest::new(&session.id, config))?;
+
+        assert_eq!(result.session_id, session.id);
+        let paths = simple_harness::SimpleHarnessPaths::from_session(dir.path(), &session);
+        assert!(paths.browser_skill_path.is_file());
+        assert!(paths.agent_workspace.is_dir());
+        assert!(paths.domain_skills_root.is_dir());
+        assert_eq!(
+            std::fs::read_to_string(&paths.final_txt)?,
+            "mirrored fake answer"
+        );
+        let events_jsonl = std::fs::read_to_string(&paths.events_jsonl)?;
+        assert!(events_jsonl.contains("\"harness.prepared\""));
+        assert!(events_jsonl.contains("\"session.done\""));
+
+        let event_types = store
+            .events_for_session(&session.id)?
+            .into_iter()
+            .map(|event| event.event_type)
+            .collect::<Vec<_>>();
+        assert!(event_types.contains(&simple_harness::SIMPLE_HARNESS_PREPARED_EVENT.to_string()));
+        assert!(event_types.contains(&simple_harness::SIMPLE_HARNESS_MIRRORED_EVENT.to_string()));
+        assert!(event_types.contains(&simple_harness::SIMPLE_HARNESS_CLEANED_EVENT.to_string()));
+        Ok(())
+    }
+
+    #[test]
+    fn run_blocking_skips_simple_harness_when_disabled() -> Result<()> {
+        let dir = TempDir::new()?;
+        let cwd = dir.path().join("work");
+        let artifact_root = dir.path().join("artifacts");
+        let store = Store::open(dir.path())?;
+        let session = store.create_session_with_id_and_artifact_root(
+            None,
+            &cwd,
+            &artifact_root,
+            "sess-legacy".to_string(),
+        )?;
+        store.append_event(
+            &session.id,
+            "session.input",
+            json!({ "text": "return the canned fake result" }),
+        )?;
+
+        let runtime = sqlite_runtime(dir.path())?;
+        let executor =
+            RuntimeAgentExecutor::new(RuntimeAgentExecutorConfig::new(dir.path(), runtime))?;
+        let config = ProviderRunConfig::new(ProviderBackend::Fake, "fake-model")
+            .with_fake_result("legacy fake answer");
+
+        let result = executor.run_blocking(RuntimeAgentRunRequest::new(&session.id, config))?;
+
+        assert_eq!(result.session_id, session.id);
+        let paths = simple_harness::SimpleHarnessPaths::from_session(dir.path(), &session);
+        assert!(!paths.browser_skill_path.exists());
+        assert!(!paths.final_txt.exists());
+
+        let event_types = store
+            .events_for_session(&session.id)?
+            .into_iter()
+            .map(|event| event.event_type)
+            .collect::<Vec<_>>();
+        assert!(event_types.iter().any(|event| event == "session.done"));
+        assert!(!event_types.contains(&simple_harness::SIMPLE_HARNESS_PREPARED_EVENT.to_string()));
+        assert!(!event_types.contains(&simple_harness::SIMPLE_HARNESS_MIRRORED_EVENT.to_string()));
+        assert!(!event_types.contains(&simple_harness::SIMPLE_HARNESS_CLEANED_EVENT.to_string()));
         Ok(())
     }
 }

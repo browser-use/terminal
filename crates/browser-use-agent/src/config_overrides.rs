@@ -41,6 +41,12 @@ use crate::tools::AskForApproval;
 /// (`constants.rs:9`). Reproduced verbatim so [`AgentRunOptions::default`]
 /// matches the legacy engine exactly.
 pub const DEFAULT_MAX_CONTEXT_CHARS: usize = 240_000;
+/// Default task turn ceiling for provider-backed runs.
+///
+/// This is intentionally high for browser benchmark parity: Internal_Bench_hard
+/// has legitimate long-running extraction tasks, and a low default cuts
+/// those off before the model can finish.
+pub const DEFAULT_MAX_TURNS: usize = 10_000;
 
 /// Codex MultiAgentV2 defaults. These mirror Codex's `MultiAgentV2Config`
 /// values, with v2 enabled by default for this terminal's model-visible toolset.
@@ -292,6 +298,9 @@ pub struct AgentRunOptions {
     pub config_profile: Option<String>,
     pub config_overrides: ConfigOverrides,
     pub session_thread_config: Option<toml::Value>,
+    /// Opt into the Codex-style browser-harness surface: a lean prompt, shell
+    /// access to `browser-harness`, and no product browser/python/done tools.
+    pub simple_harness: bool,
     pub base_instructions: Option<String>,
     pub developer_instructions: Option<String>,
     pub compact_prompt: Option<String>,
@@ -350,7 +359,7 @@ pub struct AgentRunOptions {
 impl Default for AgentRunOptions {
     fn default() -> Self {
         Self {
-            max_turns: 80,
+            max_turns: DEFAULT_MAX_TURNS,
             max_context_chars: DEFAULT_MAX_CONTEXT_CHARS,
             browser_mode: None,
             dynamic_browser_mode_from_store: false,
@@ -365,6 +374,7 @@ impl Default for AgentRunOptions {
             config_profile: None,
             config_overrides: Vec::new(),
             session_thread_config: None,
+            simple_harness: false,
             base_instructions: None,
             developer_instructions: None,
             compact_prompt: None,
@@ -473,6 +483,11 @@ impl AgentRunOptions {
         overrides: Vec<(String, toml::Value)>,
     ) -> Self {
         self.session_thread_config = Some(build_config_overrides_layer(&overrides));
+        self
+    }
+
+    pub fn with_simple_harness(mut self, enabled: bool) -> Self {
+        self.simple_harness = enabled;
         self
     }
 
@@ -784,6 +799,38 @@ pub fn apply_runtime_config_overrides(
     }
     if let Some(value) = config_override_str(overrides, "browser_mode") {
         options.browser_mode = Some(value);
+    }
+    if let Some(value) =
+        config_override_str_any(overrides, &["browser_profile_id", "browser.profile_id"])
+    {
+        options.browser_profile_id = Some(value);
+    }
+    if let Some(value) = config_override_str_any(
+        overrides,
+        &[
+            "browser_profile_label",
+            "browser.profile_label",
+            "browser.profile",
+        ],
+    ) {
+        options.browser_profile_label = Some(value);
+    }
+    if let Some(value) = config_override_str_any(
+        overrides,
+        &["browser_local_browser", "browser.local_browser"],
+    ) {
+        options.browser_local_browser = Some(value);
+    }
+    if let Some(value) = config_override_bool_any(
+        overrides,
+        &[
+            "simple_harness",
+            "browser_harness_simple",
+            "browser_harness.simple",
+            "features.simple_harness",
+        ],
+    ) {
+        options.simple_harness = value;
     }
     if let Some(value) = config_override_str(overrides, "base_instructions") {
         options.base_instructions = Some(value);
@@ -1594,6 +1641,14 @@ fn config_override_str(overrides: &ConfigOverrides, key: &str) -> Option<String>
         .and_then(|(_, value)| value.as_str().map(str::to_string))
 }
 
+fn config_override_str_any(overrides: &ConfigOverrides, keys: &[&str]) -> Option<String> {
+    overrides
+        .iter()
+        .rev()
+        .find(|(candidate, _)| keys.iter().any(|key| candidate == key))
+        .and_then(|(_, value)| value.as_str().map(str::to_string))
+}
+
 fn config_override_bool(overrides: &ConfigOverrides, key: &str) -> Option<bool> {
     overrides
         .iter()
@@ -1846,7 +1901,8 @@ command = "profile-server"
     #[test]
     fn agent_run_options_defaults_match_core() {
         let options = AgentRunOptions::default();
-        assert_eq!(options.max_turns, 80);
+        assert_eq!(options.max_turns, DEFAULT_MAX_TURNS);
+        assert_eq!(options.max_turns, 10_000);
         assert_eq!(options.max_context_chars, DEFAULT_MAX_CONTEXT_CHARS);
         assert_eq!(options.max_context_chars, 240_000);
         assert!(options.browser_mode.is_none());
@@ -1858,6 +1914,7 @@ command = "profile-server"
         assert!(options.config_profile.is_none());
         assert!(options.config_overrides.is_empty());
         assert!(options.session_thread_config.is_none());
+        assert!(!options.simple_harness);
         assert!(options.base_instructions.is_none());
         assert!(options.developer_instructions.is_none());
         assert!(options.compact_prompt.is_none());
@@ -1890,6 +1947,10 @@ command = "profile-server"
         let overrides = parse_config_overrides(&ov(&[
             "max_turns=100",
             "browser_mode=\"remote-cdp\"",
+            "browser_profile_id=\"google-chrome:Profile 1\"",
+            "browser_profile_label=\"Work\"",
+            "browser_local_browser=\"Google Chrome\"",
+            "simple_harness=true",
             "python_tool_timeout_seconds=45",
             "model_compaction_enabled=false",
             "full_llm_input_events=true",
@@ -1901,6 +1962,16 @@ command = "profile-server"
 
         assert_eq!(options.max_turns, 100);
         assert_eq!(options.browser_mode.as_deref(), Some("remote-cdp"));
+        assert_eq!(
+            options.browser_profile_id.as_deref(),
+            Some("google-chrome:Profile 1")
+        );
+        assert_eq!(options.browser_profile_label.as_deref(), Some("Work"));
+        assert_eq!(
+            options.browser_local_browser.as_deref(),
+            Some("Google Chrome")
+        );
+        assert!(options.simple_harness);
         assert_eq!(options.python_tool_timeout_seconds, 45);
         assert!(!options.model_compaction_enabled);
         assert!(options.full_llm_input_events);
@@ -1928,7 +1999,7 @@ command = "profile-server"
         assert_eq!(config.model_source, RunConfigValueSource::Explicit);
         assert!(config.fake_result.is_none());
         // options default to AgentRunOptions::default()
-        assert_eq!(config.options.max_turns, 80);
+        assert_eq!(config.options.max_turns, DEFAULT_MAX_TURNS);
     }
 
     #[test]

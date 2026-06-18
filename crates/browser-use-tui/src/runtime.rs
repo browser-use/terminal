@@ -6,7 +6,7 @@ use anyhow::{bail, Context, Result};
 #[cfg(test)]
 use browser_use_agent::config_overrides::ChildAgentCompletionHandler;
 use browser_use_agent::config_overrides::{
-    load_mcp_servers_for_profile, resolve_agent_roles_for_profile,
+    apply_runtime_config_overrides, load_mcp_servers_for_profile, resolve_agent_roles_for_profile,
     resolve_approval_policy_for_profile, resolve_collab_for_profile, resolve_guardian_for_profile,
     resolve_multi_agent_v2_for_profile, AgentRunOptions, ChildAgentRunCompletion,
     ChildAgentRunRequest, ChildAgentRunner, ConfigOverrides, ProviderRunConfig,
@@ -1011,17 +1011,20 @@ fn tui_agent_options(
         "Headless Chromium" => AgentRunOptions::default()
             .with_collaboration_mode(collaboration_mode)
             .with_browser_mode("managed-headless")
+            .with_simple_harness(true)
             .with_model_compaction(true)
             .with_analytics_source("tui"),
         "Managed Chromium" => AgentRunOptions::default()
             .with_collaboration_mode(collaboration_mode)
             .with_browser_mode("managed-headed")
+            .with_simple_harness(true)
             .with_model_compaction(true)
             .with_analytics_source("tui"),
         BROWSER_USE_CLOUD => {
             let mut options = AgentRunOptions::default()
                 .with_collaboration_mode(collaboration_mode)
                 .with_browser_mode("cloud")
+                .with_simple_harness(true)
                 .with_model_compaction(true)
                 .with_analytics_source("tui");
             if let Some(api_key) =
@@ -1037,6 +1040,7 @@ fn tui_agent_options(
         _ => AgentRunOptions::default()
             .with_collaboration_mode(collaboration_mode)
             .with_browser_mode("local")
+            .with_simple_harness(true)
             .with_model_compaction(true)
             .with_analytics_source("tui"),
     };
@@ -1084,6 +1088,7 @@ fn tui_agent_options(
         options = options.with_config_profile(profile);
     }
     if !config_overrides.is_empty() {
+        apply_runtime_config_overrides(&mut options, &config_overrides)?;
         options = options.with_config_overrides(config_overrides);
     }
     if let Some(model_provider_id) = model_provider_id
@@ -1168,6 +1173,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(options.browser_mode.as_deref(), Some("local"));
+        assert!(options.simple_harness);
         assert!(!options.dynamic_browser_mode_from_store);
         assert!(options.python_env.is_empty());
     }
@@ -1197,6 +1203,7 @@ mod tests {
             options.browser_local_browser.as_deref(),
             Some("Google Chrome")
         );
+        assert!(options.simple_harness);
         assert!(!options.dynamic_browser_mode_from_store);
     }
 
@@ -1216,6 +1223,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(options.browser_mode.as_deref(), Some("managed-headless"));
+        assert!(options.simple_harness);
         assert!(!options.dynamic_browser_mode_from_store);
         assert!(options.python_env.is_empty());
     }
@@ -1255,6 +1263,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(options.browser_mode.as_deref(), Some("cloud"));
+        assert!(options.simple_harness);
         assert!(!options.dynamic_browser_mode_from_store);
         assert!(options.python_env.is_empty());
     }
@@ -1279,6 +1288,31 @@ mod tests {
             env_value(&options, BROWSER_USE_CLOUD_API_KEY_ENV),
             Some("bu-test")
         );
+        assert!(options.simple_harness);
+    }
+
+    #[test]
+    fn tui_agent_options_allow_simple_harness_opt_out() {
+        let config_overrides = browser_use_agent::config_overrides::parse_config_overrides(&[
+            "simple_harness=false".to_string(),
+        ])
+        .expect("valid config override");
+        let options = tui_agent_options(
+            "Local Chrome",
+            "abc123",
+            CollaborationModeKind::Default,
+            Some("codex"),
+            None,
+            None,
+            None,
+            None,
+            None,
+            config_overrides,
+        )
+        .unwrap();
+
+        assert_eq!(options.browser_mode.as_deref(), Some("local"));
+        assert!(!options.simple_harness);
     }
 
     #[test]
@@ -1532,6 +1566,7 @@ mod tests {
     fn tui_agent_options_pass_profile_and_config_overrides_to_core() {
         let config_overrides = browser_use_agent::config_overrides::parse_config_overrides(&[
             "developer_instructions=\"Stay precise.\"".to_string(),
+            "simple_harness=true".to_string(),
         ])
         .expect("valid config override");
         let options = tui_agent_options(
@@ -1549,6 +1584,11 @@ mod tests {
         .unwrap();
 
         assert_eq!(options.config_profile.as_deref(), Some("work"));
+        assert!(options.simple_harness);
+        assert_eq!(
+            options.developer_instructions.as_deref(),
+            Some("Stay precise.")
+        );
         assert_eq!(
             options
                 .config_overrides

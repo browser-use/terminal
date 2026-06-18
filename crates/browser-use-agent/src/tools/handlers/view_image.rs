@@ -272,6 +272,8 @@ impl ToolRuntime<ViewImageRequest, ExecOutput> for ViewImageTool {
             )));
         }
 
+        validate_image_bytes(mime, &bytes, &req.path)?;
+
         let content = encode_data_url(mime, &bytes);
         Ok(content.into_exec_output())
     }
@@ -295,6 +297,43 @@ pub fn mime_from_extension(path: &Path) -> Option<&'static str> {
         _ => return None,
     };
     Some(mime)
+}
+
+fn validate_image_bytes(mime: &str, bytes: &[u8], display_path: &Path) -> Result<(), ToolError> {
+    if bytes_match_mime(mime, bytes) {
+        return Ok(());
+    }
+    if looks_like_text_markup(bytes) {
+        return Err(ToolError::Rejected(format!(
+            "view_image: {} has an image extension but contains SVG/XML/HTML text; save or convert a real PNG/JPEG/GIF/WebP before viewing it",
+            display_path.display()
+        )));
+    }
+    Err(ToolError::Rejected(format!(
+        "view_image: {} does not contain valid {mime} image bytes",
+        display_path.display()
+    )))
+}
+
+fn bytes_match_mime(mime: &str, bytes: &[u8]) -> bool {
+    match mime {
+        "image/png" => bytes.starts_with(b"\x89PNG\r\n\x1a\n"),
+        "image/jpeg" => bytes.starts_with(b"\xff\xd8\xff"),
+        "image/gif" => bytes.starts_with(b"GIF87a") || bytes.starts_with(b"GIF89a"),
+        "image/webp" => bytes.len() >= 12 && bytes.starts_with(b"RIFF") && &bytes[8..12] == b"WEBP",
+        _ => false,
+    }
+}
+
+fn looks_like_text_markup(bytes: &[u8]) -> bool {
+    let prefix_len = bytes.len().min(512);
+    let prefix = String::from_utf8_lossy(&bytes[..prefix_len])
+        .trim_start_matches(|ch: char| ch.is_whitespace() || ch == '\u{feff}')
+        .to_ascii_lowercase();
+    prefix.starts_with("<svg")
+        || prefix.starts_with("<?xml")
+        || prefix.starts_with("<!doctype html")
+        || prefix.starts_with("<html")
 }
 
 /// Base64-encode `bytes` into a `data:<mime>;base64,<...>` URL.

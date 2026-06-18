@@ -35,7 +35,7 @@ const SCRIPT_MAX_OUTPUT_CHARS: usize = 120_000;
 // still hands control back at 30s, so a stuck script can be cancelled/finalized
 // (unlike the reverted "observe30", which STACKED 30s observe blocks and starved
 // the run timebox — see DEFAULT_OBSERVE_TIMEOUT_MS doc in browser.rs).
-const BROWSER_SCRIPT_DEFAULT_INITIAL_WAIT_MS: u64 = 30_000;
+const BROWSER_SCRIPT_DEFAULT_INITIAL_WAIT_MS: u64 = 15_000;
 // The `next_observe_ms` HINT surfaced to the model ("call observe with
 // observe_timeout_ms=N"). Raised 1s->15s to nudge the model to long-poll instead
 // of issuing 1s "still running?" peeks (the dominant observe-churn cost). This is

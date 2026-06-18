@@ -134,7 +134,7 @@ stdbuf -oL -eL ./target/debug/browser-use-terminal \
   dataset-run-codex /home/exedev/datasets/real_v17_short.json \
   --all \
   --model gpt-5.1-codex \
-  --max-turns 80 \
+  --max-turns 10000 \
   --python-timeout-seconds 180 \
   --max-attempts 1 \
   --concurrency 25 \

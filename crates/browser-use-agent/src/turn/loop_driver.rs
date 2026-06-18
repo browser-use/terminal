@@ -82,8 +82,8 @@ use crate::task::{TurnAbortReason, TurnLifecycleEvent};
 use browser_use_llm::schema::{ContentPart, Message, MessageRole};
 use tokio_util::sync::CancellationToken;
 
-const FINAL_MAX_TURNS_NUDGE: &str = "This is the final allowed step for this run. Stop exploring and call the done tool with the best complete answer you can provide now. Include unknown or unavailable items explicitly instead of continuing to search.";
-const PROGRESS_MAX_TURNS_NUDGE: &str = "Progress checkpoint: If you have enough evidence, a saved artifact, or a complete-enough answer, stop further exploration and call the done tool now. Continue only for clearly missing required information that is likely to change the final answer.";
+const FINAL_MAX_TURNS_NUDGE: &str = "This is the final allowed step for this run. Stop exploring and provide the best complete final answer you can now; if a done tool is available, use it. Include unknown or unavailable items explicitly instead of continuing to search.";
+const PROGRESS_MAX_TURNS_NUDGE: &str = "Progress checkpoint: If you have enough evidence, a saved artifact, or a complete-enough answer, stop further exploration and provide the final answer now; if a done tool is available, use it. Continue only for clearly missing required information that is likely to change the final answer.";
 
 /// The async, unbounded turn-loop driver. Generic over the three frozen turn
 /// traits so production wires real impls (`ContextManager`+`Session`,

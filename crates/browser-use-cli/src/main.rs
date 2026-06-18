@@ -3,6 +3,7 @@ use std::fs;
 use std::io::{self, BufRead, IsTerminal, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
+use std::process::Command as ProcessCommand;
 use std::sync::{
     atomic::{AtomicBool, Ordering},
     mpsc, Arc, Mutex,
@@ -79,9 +80,12 @@ use browser_use_runtime::{
     RunAgentRequest, RunId as RuntimeRunId, RuntimeEvent, RuntimeHandle, RuntimeProjectionState,
     SessionId, SpawnChildRequest, SqliteJournal, StateIndex, SubmitInputRequest,
 };
+
+const SIMPLE_HARNESS_ARTIFACT_AUDIT_PY: &str =
+    include_str!("../../../prompts/simple-harness-artifact-audit.py");
 #[cfg(test)]
 use browser_use_runtime::{AttachChildAgentRequest, AttachRootAgentRequest};
-use browser_use_store::{now_ms, resolve_state_dir, Store};
+use browser_use_store::{default_state_dir, now_ms, resolve_state_dir, Store};
 use clap::{Parser, Subcommand, ValueEnum};
 use reqwest::Url;
 use serde::{Deserialize, Serialize};
@@ -92,10 +96,23 @@ const MESSAGE_KIND_FOLLOWUP: &str = "followup";
 const SDK_PROTOCOL_VERSION: u64 = 1;
 const APPROX_CHARS_PER_TOKEN: usize = 4;
 const DATASET_BROWSER_CLEANUP_TIMEOUT: Duration = Duration::from_secs(15);
+const DATASET_PROVIDER_DEFAULT_MAX_TURNS: usize = 10_000;
+const INTERNAL_BENCH_HARD_MIN_MAX_TURNS: usize = 10_000;
 const SDK_EVENT_STRING_LIMIT_BYTES: usize = 1_000_000;
 const SDK_JSON_RPC_FRAME_LIMIT_BYTES: usize = 8 * 1024 * 1024;
 const SDK_HISTORY_EVENTS_HEAD_COUNT: usize = 20;
 const SDK_HISTORY_EVENTS_INITIAL_TAIL_COUNT: usize = 400;
+const BROWSER_SETTING: &str = "browser";
+const BROWSER_PREFERENCE_MODE_SETTING: &str = "browser.preference.mode";
+const BROWSER_PREFERENCE_BROWSER_SETTING: &str = "browser.preference.browser";
+const BROWSER_PREFERENCE_BROWSER_LABEL_SETTING: &str = "browser.preference.browser_label";
+const BROWSER_PREFERENCE_PROFILE_SETTING: &str = "browser.preference.profile";
+const BROWSER_PREFERENCE_PROFILE_LABEL_SETTING: &str = "browser.preference.profile_label";
+const BROWSER_LOCAL_CHROME: &str = "Local Chrome";
+const BROWSER_USE_CLOUD: &str = "Browser Use Cloud";
+const BROWSER_MANAGED_HEADLESS: &str = "Headless Chromium";
+const BROWSER_MANAGED_HEADED: &str = "Managed Chromium";
+const BROWSER_REMOTE_CDP: &str = "Remote CDP";
 
 #[derive(Clone, Debug, Default)]
 struct MessageAnalytics {
@@ -545,7 +562,7 @@ enum Command {
         all: bool,
         #[arg(long)]
         model: Option<String>,
-        #[arg(long, default_value_t = 80)]
+        #[arg(long, default_value_t = DATASET_PROVIDER_DEFAULT_MAX_TURNS)]
         max_turns: usize,
         #[arg(long, default_value_t = 120)]
         python_timeout_seconds: u64,
@@ -574,7 +591,7 @@ enum Command {
         all: bool,
         #[arg(long, default_value = "gpt-5.1-codex")]
         model: String,
-        #[arg(long, default_value_t = 80)]
+        #[arg(long, default_value_t = DATASET_PROVIDER_DEFAULT_MAX_TURNS)]
         max_turns: usize,
         #[arg(long, default_value_t = 120)]
         python_timeout_seconds: u64,
@@ -603,7 +620,7 @@ enum Command {
         all: bool,
         #[arg(long, default_value = "claude-sonnet-4-6")]
         model: String,
-        #[arg(long, default_value_t = 80)]
+        #[arg(long, default_value_t = DATASET_PROVIDER_DEFAULT_MAX_TURNS)]
         max_turns: usize,
         #[arg(long, default_value_t = 120)]
         python_timeout_seconds: u64,
@@ -632,7 +649,7 @@ enum Command {
         all: bool,
         #[arg(long, default_value = "openai/gpt-5.5")]
         model: String,
-        #[arg(long, default_value_t = 80)]
+        #[arg(long, default_value_t = DATASET_PROVIDER_DEFAULT_MAX_TURNS)]
         max_turns: usize,
         #[arg(long, default_value_t = 120)]
         python_timeout_seconds: u64,
@@ -728,6 +745,14 @@ enum SecretsCommand {
     /// Reads Login items via the `op` CLI, which must be installed and signed in
     /// (`op signin`). Each login becomes username/password/otp secrets.
     Import,
+    /// Internal raw-harness credential bridge.
+    #[command(hide = true)]
+    HarnessSecret {
+        #[arg(long)]
+        domain: String,
+        #[arg(long)]
+        name: String,
+    },
     /// Configure email one-time-code (2FA / verification) via AgentMail.
     Email {
         #[command(subcommand)]
@@ -746,6 +771,13 @@ enum EmailCommand {
     Status,
     /// Provision (if needed) and print the agent's inbox email address.
     Address,
+    /// List recent inbox messages as JSON.
+    Inbox {
+        #[arg(long, default_value_t = 20)]
+        limit: u32,
+    },
+    /// Read one inbox message as JSON.
+    Message { message_id: String },
     /// Remove the AgentMail token and cached inbox.
     Clear,
 }
@@ -857,6 +889,7 @@ struct DatasetProviderConfig {
     browser_mode: String,
     max_turns: usize,
     python_timeout_seconds: u64,
+    simple_harness: bool,
 }
 
 trait DatasetRunner: Clone + Send + Sync + 'static {
@@ -881,20 +914,52 @@ impl DatasetRunner for ConfigDatasetRunner {
         options: AgentRunOptions,
     ) -> Result<()> {
         let mut config = self.config.clone();
-        let mut merged_options = options;
-        merged_options.config_profile = config.options.config_profile.clone();
-        merged_options.config_overrides = config.options.config_overrides.clone();
-        merged_options.model_provider_id = config.options.model_provider_id.clone();
-        merged_options.model_provider_id_source = config.options.model_provider_id_source;
-        merged_options.collaboration_mode = config.options.collaboration_mode;
-        merged_options.child_agent_runner = config.options.child_agent_runner.clone();
-        merged_options.mcp_servers = config.options.mcp_servers.clone();
-        merged_options.approval_policy = config.options.approval_policy;
-        merged_options.use_guardian = config.options.use_guardian;
-        config.options = merged_options;
+        config.options = merge_dataset_provider_run_options(&config.options, options);
         run_existing_session_from_config_and_notify(store, session_id, config, None)?;
         Ok(())
     }
+}
+
+fn merge_dataset_provider_run_options(
+    provider_options: &AgentRunOptions,
+    dataset_options: AgentRunOptions,
+) -> AgentRunOptions {
+    let mut merged_options = dataset_options;
+    merged_options.config_profile = provider_options.config_profile.clone();
+    merged_options.config_overrides = provider_options.config_overrides.clone();
+    merged_options.simple_harness = provider_options.simple_harness;
+    merged_options.model_provider_id = provider_options.model_provider_id.clone();
+    merged_options.model_provider_id_source = provider_options.model_provider_id_source;
+    merged_options.collaboration_mode = provider_options.collaboration_mode;
+    merged_options.child_agent_runner = provider_options.child_agent_runner.clone();
+    merged_options.mcp_servers = provider_options.mcp_servers.clone();
+    merged_options.approval_policy = provider_options.approval_policy;
+    merged_options.use_guardian = provider_options.use_guardian;
+    merged_options
+}
+
+fn dataset_name_or_stem(dataset: &str) -> &str {
+    Path::new(dataset)
+        .file_stem()
+        .and_then(|stem| stem.to_str())
+        .unwrap_or(dataset)
+}
+
+fn is_internal_bench_hard_dataset(dataset: &str) -> bool {
+    dataset_name_or_stem(dataset).eq_ignore_ascii_case("Internal_Bench_hard")
+}
+
+fn validate_dataset_run_limits(dataset: &str, config: &DatasetProviderConfig) -> Result<()> {
+    if is_internal_bench_hard_dataset(dataset)
+        && config.max_turns < INTERNAL_BENCH_HARD_MIN_MAX_TURNS
+    {
+        bail!(
+            "Internal_Bench_hard parity runs must use --max-turns >= {} (got {}). Do not run this benchmark with an 80-turn cap.",
+            INTERNAL_BENCH_HARD_MIN_MAX_TURNS,
+            config.max_turns
+        );
+    }
+    Ok(())
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -2259,6 +2324,7 @@ fn cli_agent_options(
     let mut options = AgentRunOptions::default()
         .with_collaboration_mode(collaboration_mode)
         .with_browser_mode(cli_browser_mode())
+        .with_simple_harness(true)
         .with_model_compaction(true)
         .with_analytics_source("cli");
     if let Some(profile) = config_profile {
@@ -4487,7 +4553,20 @@ fn browser_use_api_key_from_store_or_env(store: &Store) -> Result<Option<String>
             return Ok(Some(value));
         }
     }
-    Ok(store
+    if let Some(value) = store
+        .get_setting(BROWSER_USE_CLOUD_API_KEY_SETTING)?
+        .filter(|value| !value.trim().is_empty())
+    {
+        return Ok(Some(value));
+    }
+    let default_dir = default_state_dir();
+    if store.state_dir() == default_dir {
+        return Ok(None);
+    }
+    if !default_dir.join("state.db").exists() {
+        return Ok(None);
+    }
+    Ok(Store::open(default_dir)?
         .get_setting(BROWSER_USE_CLOUD_API_KEY_SETTING)?
         .filter(|value| !value.trim().is_empty()))
 }
@@ -4831,6 +4910,20 @@ fn secrets(store: &Store, command: SecretsCommand) -> Result<()> {
             }
             Ok(())
         }
+        SecretsCommand::HarnessSecret { domain, name } => {
+            if std::env::var("BU_HARNESS_WORKER_ACTIVE").ok().as_deref() != Some("1") {
+                bail!("harness secret bridge is only available inside browser-harness");
+            }
+            let value = sa::browser_harness_secret_value(store, &domain, &name)?;
+            println!(
+                "{}",
+                serde_json::json!({
+                    "value": value,
+                    "label": name,
+                })
+            );
+            Ok(())
+        }
         SecretsCommand::Email { action } => secrets_email(store, action),
     }
 }
@@ -4868,6 +4961,14 @@ fn secrets_email(store: &Store, command: EmailCommand) -> Result<()> {
         EmailCommand::Address => {
             let inbox = sa::agentmail_inbox_address(store)?;
             println!("{inbox}");
+            Ok(())
+        }
+        EmailCommand::Inbox { limit } => {
+            println!("{}", sa::agentmail_messages(store, limit)?);
+            Ok(())
+        }
+        EmailCommand::Message { message_id } => {
+            println!("{}", sa::agentmail_message(store, &message_id)?);
             Ok(())
         }
         EmailCommand::Clear => {
@@ -7034,6 +7135,9 @@ fn handle_sdk_json_rpc_request(context: &SdkServerContext, request: JsonRpcReque
         "runtime.ping" => Ok(sdk_runtime_ping()),
         "runtime.python_worker_ping" => sdk_runtime_python_worker_ping(context),
         "runtime.snapshot" => sdk_runtime_snapshot(&context.runtime),
+        "browser.settings" | "browser.get_settings" => sdk_browser_settings(context),
+        "browser.set_backend" => sdk_browser_set_backend(context, &request.params),
+        "browser.set_profile" => sdk_browser_set_profile(context, &request.params),
         "browser.create" => sdk_browser_create(&context.runtime, &request.params),
         "browser.stop" | "browser.close" => sdk_browser_close(&context.runtime, &request.params),
         "agent.create" => sdk_agent_create(context, &request.params),
@@ -7063,6 +7167,9 @@ fn sdk_runtime_ping() -> Value {
         "sdk_protocol_version": SDK_PROTOCOL_VERSION,
         "terminal_version": env!("CARGO_PKG_VERSION"),
         "capabilities": [
+            "browser.settings",
+            "browser.set_backend",
+            "browser.set_profile",
             "browser.create",
             "agent.run_task",
             "agent.run",
@@ -7096,6 +7203,74 @@ fn sdk_runtime_python_worker_ping(context: &SdkServerContext) -> Result<Value> {
 
 fn sdk_runtime_snapshot(runtime: &RuntimeHandle) -> Result<Value> {
     Ok(serde_json::to_value(runtime.snapshot())?)
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct SdkBrowserPreference {
+    mode: Option<String>,
+    profile_id: Option<String>,
+    profile_label: Option<String>,
+    local_browser: Option<String>,
+}
+
+fn sdk_browser_settings(context: &SdkServerContext) -> Result<Value> {
+    let preference = sdk_browser_preference_from_context(context)?;
+    Ok(sdk_browser_preference_value(&preference))
+}
+
+fn sdk_browser_set_backend(context: &SdkServerContext, params: &Value) -> Result<Value> {
+    let mode = sdk_browser_backend_param(params)
+        .context("browser.set_backend requires string param `backend`, `mode`, or `browser`")?;
+    let browser_label = sdk_browser_display_name(&mode).to_string();
+    let local_browser = sdk_string_param(params, "local_browser")
+        .or_else(|| sdk_string_param(params, "browser_name"))
+        .or_else(|| sdk_string_param(params, "browser_label").filter(|_| mode.as_str() == "local"));
+
+    {
+        let store = context.store.lock().expect("sdk store mutex poisoned");
+        store.set_setting(BROWSER_PREFERENCE_MODE_SETTING, &mode)?;
+        store.set_setting(BROWSER_SETTING, &browser_label)?;
+        if mode == "local" {
+            if let Some(local_browser) = local_browser.as_deref() {
+                store.set_setting(BROWSER_PREFERENCE_BROWSER_SETTING, local_browser)?;
+                store.set_setting(BROWSER_PREFERENCE_BROWSER_LABEL_SETTING, local_browser)?;
+            }
+        }
+    }
+
+    sdk_browser_settings(context)
+}
+
+fn sdk_browser_set_profile(context: &SdkServerContext, params: &Value) -> Result<Value> {
+    let profile_id = sdk_browser_profile_param(params)
+        .context("browser.set_profile requires string param `profile_id`, `id`, or `profile`")?;
+    let profile_label = sdk_browser_profile_label_param(params, &profile_id);
+    let existing = sdk_browser_preference_from_context(context)?;
+    let mode = sdk_browser_backend_param(params)
+        .or_else(|| sdk_browser_mode_from_profile_id(&profile_id).map(ToOwned::to_owned))
+        .or(existing.mode)
+        .unwrap_or_else(|| "local".to_string());
+    let browser_label = sdk_browser_display_name(&mode).to_string();
+    let local_browser = sdk_string_param(params, "local_browser")
+        .or_else(|| sdk_string_param(params, "browser_name"))
+        .or_else(|| sdk_local_browser_from_profile_id(&profile_id))
+        .or(existing.local_browser);
+
+    {
+        let store = context.store.lock().expect("sdk store mutex poisoned");
+        store.set_setting(BROWSER_PREFERENCE_MODE_SETTING, &mode)?;
+        store.set_setting(BROWSER_SETTING, &browser_label)?;
+        store.set_setting(BROWSER_PREFERENCE_PROFILE_SETTING, &profile_id)?;
+        store.set_setting(BROWSER_PREFERENCE_PROFILE_LABEL_SETTING, &profile_label)?;
+        if mode == "local" {
+            if let Some(local_browser) = local_browser.as_deref() {
+                store.set_setting(BROWSER_PREFERENCE_BROWSER_SETTING, local_browser)?;
+                store.set_setting(BROWSER_PREFERENCE_BROWSER_LABEL_SETTING, local_browser)?;
+            }
+        }
+    }
+
+    sdk_browser_settings(context)
 }
 
 fn sdk_browser_create(runtime: &RuntimeHandle, params: &Value) -> Result<Value> {
@@ -7138,6 +7313,138 @@ fn sdk_browser_close(runtime: &RuntimeHandle, params: &Value) -> Result<Value> {
     )?;
     runtime.close_browser(&browser_id)?;
     Ok(serde_json::json!({ "ok": true }))
+}
+
+fn sdk_browser_preference_from_context(context: &SdkServerContext) -> Result<SdkBrowserPreference> {
+    let store = context.store.lock().expect("sdk store mutex poisoned");
+    sdk_browser_preference_from_store(&store)
+}
+
+fn sdk_browser_preference_from_store(store: &Store) -> Result<SdkBrowserPreference> {
+    let stored_display = store.get_setting(BROWSER_SETTING)?;
+    let stored_local_browser = store.get_setting(BROWSER_PREFERENCE_BROWSER_SETTING)?;
+    let stored_local_browser_label = store.get_setting(BROWSER_PREFERENCE_BROWSER_LABEL_SETTING)?;
+    let stored_mode = store
+        .get_setting(BROWSER_PREFERENCE_MODE_SETTING)?
+        .and_then(|value| {
+            sdk_normalize_browser_mode(&value)
+                .ok()
+                .map(ToOwned::to_owned)
+        })
+        .or_else(|| {
+            stored_display
+                .as_deref()
+                .and_then(sdk_browser_display_to_mode)
+                .map(ToOwned::to_owned)
+        });
+    Ok(SdkBrowserPreference {
+        mode: stored_mode,
+        profile_id: store
+            .get_setting(BROWSER_PREFERENCE_PROFILE_SETTING)?
+            .and_then(non_empty_string),
+        profile_label: store
+            .get_setting(BROWSER_PREFERENCE_PROFILE_LABEL_SETTING)?
+            .and_then(non_empty_string),
+        local_browser: stored_local_browser
+            .or(stored_local_browser_label)
+            .and_then(non_empty_string),
+    })
+}
+
+fn sdk_browser_preference_value(preference: &SdkBrowserPreference) -> Value {
+    let mode = preference
+        .mode
+        .clone()
+        .unwrap_or_else(|| "managed-headless".to_string());
+    serde_json::json!({
+        "backend": mode.as_str(),
+        "mode": mode.as_str(),
+        "browser": sdk_browser_display_name(&mode),
+        "local_browser": preference.local_browser.as_deref(),
+        "profile_id": preference.profile_id.as_deref(),
+        "profile_label": preference.profile_label.as_deref(),
+    })
+}
+
+fn sdk_browser_backend_param(params: &Value) -> Option<String> {
+    let raw = if let Some(raw) = params.as_str() {
+        Some(raw.to_string())
+    } else {
+        sdk_string_param(params, "backend")
+            .or_else(|| sdk_string_param(params, "mode"))
+            .or_else(|| sdk_string_param(params, "browser"))
+            .or_else(|| sdk_string_param(params, "browser_mode"))
+            .or_else(|| sdk_string_param(params, "browser_backend"))
+    }?;
+    sdk_normalize_browser_mode(&raw).ok().map(ToOwned::to_owned)
+}
+
+fn sdk_browser_profile_param(params: &Value) -> Option<String> {
+    if let Some(raw) = params.as_str() {
+        return non_empty_string(raw.to_string());
+    }
+    sdk_string_param(params, "profile_id")
+        .or_else(|| sdk_string_param(params, "id"))
+        .or_else(|| sdk_string_param(params, "profile"))
+}
+
+fn sdk_browser_profile_label_param(params: &Value, profile_id: &str) -> String {
+    sdk_string_param(params, "profile_label")
+        .or_else(|| sdk_string_param(params, "label"))
+        .or_else(|| sdk_string_param(params, "profile_name"))
+        .or_else(|| {
+            sdk_string_param(params, "profile").filter(|profile| profile.as_str() != profile_id)
+        })
+        .unwrap_or_else(|| profile_id.to_string())
+}
+
+fn sdk_browser_display_name(mode: &str) -> &'static str {
+    match mode {
+        "cloud" => BROWSER_USE_CLOUD,
+        "remote-cdp" => BROWSER_REMOTE_CDP,
+        "managed-headed" => BROWSER_MANAGED_HEADED,
+        "managed-headless" => BROWSER_MANAGED_HEADLESS,
+        _ => BROWSER_LOCAL_CHROME,
+    }
+}
+
+fn sdk_browser_display_to_mode(display: &str) -> Option<&'static str> {
+    let normalized = display.trim().to_ascii_lowercase();
+    match normalized.as_str() {
+        "browser use cloud" | "browser-use-cloud" => Some("cloud"),
+        "remote cdp" | "remote-cdp" => Some("remote-cdp"),
+        "managed chromium" | "managed-chromium" => Some("managed-headed"),
+        "headless chromium" | "headless-chromium" => Some("managed-headless"),
+        "local chrome" | "google chrome" | "chrome" => Some("local"),
+        _ => None,
+    }
+}
+
+fn sdk_normalize_browser_mode(raw: &str) -> Result<&'static str> {
+    let normalized = raw.trim().to_ascii_lowercase().replace(['_', ' '], "-");
+    match normalized.as_str() {
+        "local" | "chrome" | "google-chrome" | "local-chrome" => Ok("local"),
+        "cloud" | "browser-use-cloud" | "remote-cloud" => Ok("cloud"),
+        "remote-cdp" | "cdp" => Ok("remote-cdp"),
+        "headless" | "headless-chromium" | "managed-headless" => Ok("managed-headless"),
+        "managed" | "headed" | "managed-headed" | "managed-chromium" => Ok("managed-headed"),
+        other => bail!("unknown browser mode: {other}"),
+    }
+}
+
+fn sdk_browser_mode_from_profile_id(profile_id: &str) -> Option<&'static str> {
+    sdk_local_browser_from_profile_id(profile_id).map(|_| "local")
+}
+
+fn sdk_local_browser_from_profile_id(profile_id: &str) -> Option<String> {
+    let (family, _) = profile_id.split_once(':')?;
+    match family.trim().to_ascii_lowercase().as_str() {
+        "google-chrome" | "chrome" => Some("Google Chrome".to_string()),
+        "brave" => Some("Brave".to_string()),
+        "chromium" => Some("Chromium".to_string()),
+        "microsoft-edge" | "edge" => Some("Microsoft Edge".to_string()),
+        _ => None,
+    }
 }
 
 fn sdk_agent_create(context: &SdkServerContext, params: &Value) -> Result<Value> {
@@ -7267,8 +7574,20 @@ fn sdk_agent_run(context: &SdkServerContext, params: &Value) -> Result<Value> {
     let browser_snapshot = browser_id
         .as_ref()
         .and_then(|browser_id| context.runtime.browsers().snapshot(browser_id).ok());
-    sdk_require_cloud_browser_credentials(context, params, browser_snapshot.as_ref())?;
-    let config = sdk_provider_run_config(params, Some(&task), browser_snapshot.as_ref())?;
+    let stored_browser = sdk_browser_preference_from_context(context)?;
+    sdk_require_cloud_browser_credentials(
+        context,
+        params,
+        browser_snapshot.as_ref(),
+        Some(&stored_browser),
+    )?;
+    let config = sdk_provider_run_config(
+        params,
+        Some(&task),
+        browser_snapshot.as_ref(),
+        Some(&stored_browser),
+        context,
+    )?;
     let browser_id_value = browser_id
         .as_ref()
         .map(|browser_id| browser_id.as_str().to_string());
@@ -7668,7 +7987,8 @@ fn sdk_floor_char_boundary(text: &str, mut index: usize) -> usize {
 }
 
 fn sdk_agent_run_task(context: &SdkServerContext, params: &Value) -> Result<Value> {
-    sdk_require_cloud_browser_credentials(context, params, None)?;
+    let stored_browser = sdk_browser_preference_from_context(context)?;
+    sdk_require_cloud_browser_credentials(context, params, None, Some(&stored_browser))?;
     let mut run_params = params.clone();
     if let Value::Object(map) = &mut run_params {
         if !map.contains_key("browser_id") {
@@ -7949,6 +8269,8 @@ fn sdk_provider_run_config(
     params: &Value,
     task: Option<&str>,
     browser_snapshot: Option<&browser_use_runtime::BrowserSnapshot>,
+    stored_browser: Option<&SdkBrowserPreference>,
+    context: &SdkServerContext,
 ) -> Result<ProviderRunConfig> {
     let llm = params.get("llm").unwrap_or(&Value::Null);
     let provider = llm
@@ -7966,14 +8288,31 @@ fn sdk_provider_run_config(
     let backend = sdk_provider_backend(provider, model)?;
     let provider_id = sdk_provider_id(provider, backend);
     let browser = params.get("browser").unwrap_or(&Value::Null);
-    let browser_mode = sdk_browser_mode_from_params(params, browser, browser_snapshot);
+    let browser_mode =
+        sdk_browser_mode_from_params(params, browser, browser_snapshot, stored_browser);
     let mut options = AgentRunOptions::default()
         .with_browser_mode(browser_mode)
+        .with_simple_harness(true)
         .with_model_compaction(true)
         .with_analytics_source("sdk")
         .with_model_provider_id(provider_id.clone());
     options.analytics_provider_kind = Some(provider_id);
     options.analytics_model = Some(model.to_string());
+    if let Some(profile_id) =
+        sdk_browser_profile_id_from_params(params, browser, browser_snapshot, stored_browser)
+    {
+        options = options.with_browser_profile_id(profile_id);
+    }
+    if let Some(profile_label) =
+        sdk_browser_profile_label_from_params(params, browser, browser_snapshot, stored_browser)
+    {
+        options = options.with_browser_profile_label(profile_label);
+    }
+    if let Some(local_browser) =
+        sdk_browser_local_browser_from_params(params, browser, browser_snapshot, stored_browser)
+    {
+        options = options.with_browser_local_browser(local_browser);
+    }
     if let Some(max_steps) = params
         .get("max_steps")
         .and_then(Value::as_u64)
@@ -7997,6 +8336,16 @@ fn sdk_provider_run_config(
         browser,
         browser_snapshot,
     )?);
+    if options.browser_mode.as_deref() == Some("cloud") {
+        let store = context.store.lock().expect("sdk store mutex poisoned");
+        if let Some(api_key) = browser_use_api_key_from_store_or_env(&store)? {
+            upsert_env_vec(
+                &mut options.python_env,
+                BROWSER_USE_CLOUD_API_KEY_ENV,
+                api_key,
+            );
+        }
+    }
 
     let mut config = ProviderRunConfig::new(backend, model).with_options(options);
     if backend == ProviderBackend::Fake {
@@ -8009,9 +8358,11 @@ fn sdk_require_cloud_browser_credentials(
     context: &SdkServerContext,
     params: &Value,
     browser_snapshot: Option<&browser_use_runtime::BrowserSnapshot>,
+    stored_browser: Option<&SdkBrowserPreference>,
 ) -> Result<()> {
     let browser = params.get("browser").unwrap_or(&Value::Null);
-    let browser_mode = sdk_browser_mode_from_params(params, browser, browser_snapshot);
+    let browser_mode =
+        sdk_browser_mode_from_params(params, browser, browser_snapshot, stored_browser);
     if browser_mode != "cloud" {
         return Ok(());
     }
@@ -8121,12 +8472,23 @@ fn sdk_browser_mode_from_params(
     params: &Value,
     browser: &Value,
     browser_snapshot: Option<&browser_use_runtime::BrowserSnapshot>,
+    stored_browser: Option<&SdkBrowserPreference>,
 ) -> String {
-    if let Some(mode) = params
-        .get("browser_mode")
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
+    if let Some(mode) = sdk_browser_backend_param(params)
+        .or_else(|| {
+            browser
+                .as_str()
+                .and_then(|value| sdk_browser_backend_param(&Value::String(value.to_string())))
+        })
+        .or_else(|| {
+            sdk_string_param(browser, "mode")
+                .or_else(|| sdk_string_param(browser, "backend"))
+                .and_then(|value| {
+                    sdk_normalize_browser_mode(&value)
+                        .ok()
+                        .map(ToOwned::to_owned)
+                })
+        })
     {
         return mode.to_string();
     }
@@ -8150,8 +8512,73 @@ fn sdk_browser_mode_from_params(
         if snapshot.config.headless == Some(true) {
             return "managed-headless".to_string();
         }
+        return "managed-headless".to_string();
+    }
+    if let Some(mode) = stored_browser.and_then(|preference| preference.mode.clone()) {
+        return mode;
     }
     "managed-headless".to_string()
+}
+
+fn sdk_browser_profile_id_from_params(
+    params: &Value,
+    browser: &Value,
+    browser_snapshot: Option<&browser_use_runtime::BrowserSnapshot>,
+    stored_browser: Option<&SdkBrowserPreference>,
+) -> Option<String> {
+    let allow_stored = !sdk_has_explicit_browser_runtime(params, browser, browser_snapshot);
+    sdk_string_param(browser, "profile_id")
+        .or_else(|| sdk_string_param(params, "browser_profile_id"))
+        .or_else(|| browser_snapshot.and_then(|snapshot| snapshot.config.profile_id.clone()))
+        .or_else(|| {
+            allow_stored
+                .then(|| stored_browser.and_then(|preference| preference.profile_id.clone()))?
+        })
+}
+
+fn sdk_browser_profile_label_from_params(
+    params: &Value,
+    browser: &Value,
+    browser_snapshot: Option<&browser_use_runtime::BrowserSnapshot>,
+    stored_browser: Option<&SdkBrowserPreference>,
+) -> Option<String> {
+    let allow_stored = !sdk_has_explicit_browser_runtime(params, browser, browser_snapshot);
+    sdk_string_param(browser, "profile_label")
+        .or_else(|| sdk_string_param(params, "browser_profile_label"))
+        .or_else(|| sdk_string_param(browser, "profile"))
+        .or_else(|| browser_snapshot.and_then(|snapshot| snapshot.config.profile.clone()))
+        .or_else(|| {
+            allow_stored
+                .then(|| stored_browser.and_then(|preference| preference.profile_label.clone()))?
+        })
+}
+
+fn sdk_browser_local_browser_from_params(
+    params: &Value,
+    browser: &Value,
+    browser_snapshot: Option<&browser_use_runtime::BrowserSnapshot>,
+    stored_browser: Option<&SdkBrowserPreference>,
+) -> Option<String> {
+    let allow_stored = !sdk_has_explicit_browser_runtime(params, browser, browser_snapshot);
+    sdk_string_param(browser, "local_browser")
+        .or_else(|| sdk_string_param(params, "browser_local_browser"))
+        .or_else(|| {
+            allow_stored
+                .then(|| stored_browser.and_then(|preference| preference.local_browser.clone()))?
+        })
+}
+
+fn sdk_has_explicit_browser_runtime(
+    params: &Value,
+    browser: &Value,
+    browser_snapshot: Option<&browser_use_runtime::BrowserSnapshot>,
+) -> bool {
+    browser_snapshot.is_some()
+        || sdk_string_param(browser, "cdp_url").is_some()
+        || sdk_string_param(params, "cdp_url").is_some()
+        || sdk_bool_param(browser, "headless").is_some()
+        || sdk_bool_param(params, "headless").is_some()
+        || browser.get("keep_alive").is_some()
 }
 
 fn sdk_python_env_from_params(
@@ -8274,6 +8701,26 @@ fn sdk_string_param(value: &Value, key: &str) -> Option<String> {
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .map(ToOwned::to_owned)
+}
+
+fn non_empty_string(value: String) -> Option<String> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        None
+    } else if trimmed.len() == value.len() {
+        Some(value)
+    } else {
+        Some(trimmed.to_string())
+    }
+}
+
+fn upsert_env_vec(env: &mut Vec<(String, String)>, key: &str, value: impl Into<String>) {
+    let value = value.into();
+    if let Some((_, existing)) = env.iter_mut().find(|(existing_key, _)| existing_key == key) {
+        *existing = value;
+    } else {
+        env.push((key.to_string(), value));
+    }
 }
 
 fn sdk_bool_param(value: &Value, key: &str) -> Option<bool> {
@@ -9068,6 +9515,7 @@ fn dataset_run_fake(store: &Store, dataset: &str, options: DatasetRunOptions) ->
     let browser_mode = dataset_browser_mode(&options);
     let run_config = ProviderRunConfig::new(ProviderBackend::Fake, "fake")
         .with_fake_result("Fake dataset case completed.");
+    let simple_harness = run_config.options.simple_harness;
     dataset_run_provider(
         store,
         dataset,
@@ -9077,8 +9525,9 @@ fn dataset_run_fake(store: &Store, dataset: &str, options: DatasetRunOptions) ->
             provider: "fake".to_string(),
             model: "fake".to_string(),
             browser_mode,
-            max_turns: 80,
+            max_turns: DATASET_PROVIDER_DEFAULT_MAX_TURNS,
             python_timeout_seconds: 120,
+            simple_harness,
         },
     )
 }
@@ -9088,11 +9537,12 @@ fn create_dataset_session(
     run_id: &str,
     case: &DatasetCase,
     attempt: usize,
+    simple_harness: bool,
 ) -> Result<(String, DatasetTaskPaths)> {
     let paths = dataset_task_paths(store, run_id, case, attempt);
     create_dataset_task_dirs(&paths)?;
     let session = store.create_session_with_artifact_root(None, &paths.cwd, &paths.artifacts)?;
-    let prompt = build_dataset_prompt(case);
+    let prompt = build_dataset_prompt(case, simple_harness);
     store.append_event(
         &session.id,
         "session.input",
@@ -9154,6 +9604,7 @@ fn dataset_run_openai(
     let run_config = ProviderRunConfig::new(ProviderBackend::Openai, model.clone())
         .with_model_source(model_source)
         .with_options(agent_options);
+    let simple_harness = run_config.options.simple_harness;
     dataset_run_provider(
         store,
         dataset,
@@ -9165,6 +9616,7 @@ fn dataset_run_openai(
             browser_mode,
             max_turns,
             python_timeout_seconds,
+            simple_harness,
         },
     )
 }
@@ -9190,6 +9642,7 @@ fn dataset_run_codex(
         )?
         .with_default_model_provider_id("codex"),
     );
+    let simple_harness = run_config.options.simple_harness;
     dataset_run_provider(
         store,
         dataset,
@@ -9201,6 +9654,7 @@ fn dataset_run_codex(
             browser_mode,
             max_turns,
             python_timeout_seconds,
+            simple_harness,
         },
     )
 }
@@ -9220,6 +9674,7 @@ fn dataset_run_anthropic(
             cli_agent_options(None, &[], CollaborationModeKind::Default, runtime_options)?
                 .with_default_model_provider_id("anthropic"),
         );
+    let simple_harness = run_config.options.simple_harness;
     dataset_run_provider(
         store,
         dataset,
@@ -9231,6 +9686,7 @@ fn dataset_run_anthropic(
             browser_mode,
             max_turns,
             python_timeout_seconds,
+            simple_harness,
         },
     )
 }
@@ -9250,6 +9706,7 @@ fn dataset_run_openrouter(
             cli_agent_options(None, &[], CollaborationModeKind::Default, runtime_options)?
                 .with_default_model_provider_id("openrouter"),
         );
+    let simple_harness = run_config.options.simple_harness;
     dataset_run_provider(
         store,
         dataset,
@@ -9261,6 +9718,7 @@ fn dataset_run_openrouter(
             browser_mode,
             max_turns,
             python_timeout_seconds,
+            simple_harness,
         },
     )
 }
@@ -9275,6 +9733,7 @@ fn dataset_run_provider<R>(
 where
     R: DatasetRunner,
 {
+    validate_dataset_run_limits(dataset, &config)?;
     let all_cases = load_dataset_cases(dataset)?;
     let run_id = options
         .run_id
@@ -9371,9 +9830,21 @@ where
             }),
         };
         let ok = result.get("ok").and_then(Value::as_bool).unwrap_or(false);
+        let usage_limit = is_usage_limit_provider_failure(&result);
         manifest_sessions_mut(&mut manifest)?.push(result);
         manifest["summary"] = summarize_dataset_manifest(&manifest);
+        if usage_limit {
+            manifest["run_blocker"] = serde_json::json!({
+                "type": "provider_usage_limit",
+                "task_id": task_id,
+                "message": "Provider usage limit reached; remaining tasks were not launched as benchmark evidence.",
+            });
+        }
         write_dataset_manifest(store, &run_id, &manifest)?;
+        if usage_limit {
+            stop_launching = true;
+            pending.clear();
+        }
         if options.stop_on_failure && !ok {
             stop_launching = true;
             pending.clear();
@@ -9416,7 +9887,15 @@ fn run_dataset_case_with_attempts<R: DatasetRunner>(
             }
             return Ok(result);
         }
-        let should_retry = attempt < max_attempts && is_transient_provider_failure(&result);
+        if is_usage_limit_provider_failure(&result) {
+            result["retry_classification"] = Value::String("usage_limit".to_string());
+            if !retry_history.is_empty() {
+                result["retry_history"] = Value::Array(retry_history);
+            }
+            return Ok(result);
+        }
+        let should_retry = attempt < max_attempts
+            && (is_transient_provider_failure(&result) || is_artifact_audit_failure(&result));
         if !should_retry {
             if is_permanent_provider_failure(&result) {
                 result["retry_classification"] = Value::String("permanent".to_string());
@@ -9441,7 +9920,8 @@ fn run_dataset_case_with_provider<R: DatasetRunner>(
     config: DatasetProviderConfig,
     attempt: usize,
 ) -> Result<Value> {
-    let (session_id, paths) = create_dataset_session(store, run_id, case, attempt)?;
+    let (session_id, paths) =
+        create_dataset_session(store, run_id, case, attempt, config.simple_harness)?;
     println!("{}  {}", case.task_id, session_id);
     io::stdout().flush()?;
     let agent_options = AgentRunOptions {
@@ -9460,6 +9940,7 @@ fn run_dataset_case_with_provider<R: DatasetRunner>(
         config_profile: None,
         config_overrides: Vec::new(),
         session_thread_config: None,
+        simple_harness: false,
         base_instructions: None,
         developer_instructions: None,
         compact_prompt: None,
@@ -9586,13 +10067,47 @@ fn dataset_attempt_result(
     let final_result_chars = final_result.as_deref().map(str::len).unwrap_or(0);
     let usage = usage_summary_from_events(&events);
     let session_failure = failure_from_events(&events);
+    if let Some(mirror) =
+        mirror_dataset_final_artifact(case, Path::new(&session.cwd), final_result.as_deref())?
+    {
+        store.append_event(session_id, "dataset.final_artifact_mirrored", mirror)?;
+    }
     let artifacts =
         dataset_artifacts_for_paths(Path::new(&session.cwd), Path::new(&session.artifact_root))?;
-    let error = run_error.clone().or(session_failure.clone());
+    let artifact_audit = if config.simple_harness && dataset_artifact_audit_enabled() {
+        Some(dataset_artifact_audit(
+            case,
+            Path::new(&session.cwd),
+            Path::new(&session.artifact_root),
+        )?)
+    } else {
+        None
+    };
+    if let Some(audit) = &artifact_audit {
+        store.append_event(session_id, "dataset.artifact_audit", audit.clone())?;
+    }
+    let artifact_audit_error = artifact_audit.as_ref().and_then(|audit| {
+        let ok = audit.get("ok").and_then(Value::as_bool).unwrap_or(true);
+        if ok {
+            None
+        } else {
+            audit
+                .get("error")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+                .or_else(|| Some("artifact audit failed".to_string()))
+        }
+    });
+    let error = run_error
+        .clone()
+        .or(session_failure.clone())
+        .or(artifact_audit_error.clone());
     let error_type = if run_error.is_some() {
         Value::String("provider".to_string())
     } else if session_failure.is_some() {
         Value::String("session".to_string())
+    } else if artifact_audit_error.is_some() {
+        Value::String("artifact_audit".to_string())
     } else {
         Value::Null
     };
@@ -9612,6 +10127,7 @@ fn dataset_attempt_result(
         "final_result": final_result,
         "final_result_chars": final_result_chars,
         "artifacts": artifacts,
+        "artifact_audit": artifact_audit,
         "error_type": error_type,
         "error": error,
         "session": {
@@ -9621,6 +10137,170 @@ fn dataset_attempt_result(
             "artifact_root": session.artifact_root,
         },
     }))
+}
+
+fn dataset_artifact_audit(case: &DatasetCase, cwd: &Path, artifact_root: &Path) -> Result<Value> {
+    let Some(target) = dataset_artifact_audit_target(cwd) else {
+        return Ok(serde_json::json!({
+            "ok": true,
+            "status": "not_applicable",
+            "reason": "no canonical result file found",
+        }));
+    };
+
+    let audit_dir = artifact_root.join("tmp");
+    std::fs::create_dir_all(&audit_dir)
+        .with_context(|| format!("create {}", audit_dir.display()))?;
+    let script = audit_dir.join("artifact-audit-host.py");
+    std::fs::write(&script, SIMPLE_HARNESS_ARTIFACT_AUDIT_PY)
+        .with_context(|| format!("write {}", script.display()))?;
+
+    let output = ProcessCommand::new("python3")
+        .arg(&script)
+        .arg(&target)
+        .current_dir(cwd)
+        .env("BROWSER_USE_TASK_ID", &case.task_id)
+        .env("BROWSER_USE_TASK_TEXT", &case.confirmed_task)
+        .output()
+        .with_context(|| format!("run artifact audit for {}", target.display()))?;
+
+    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+    let ok = output.status.success();
+    Ok(serde_json::json!({
+        "ok": ok,
+        "status": if ok { "passed" } else { "failed" },
+        "target": target.display().to_string(),
+        "exit_code": output.status.code(),
+        "stdout": stdout,
+        "stderr": stderr,
+        "error": if ok {
+            Value::Null
+        } else {
+            Value::String(format!(
+                "artifact audit failed for {}: {}{}",
+                target.display(),
+                stdout.trim(),
+                if stderr.trim().is_empty() {
+                    String::new()
+                } else {
+                    format!("\n{}", stderr.trim())
+                }
+            ))
+        },
+    }))
+}
+
+fn mirror_dataset_final_artifact(
+    case: &DatasetCase,
+    cwd: &Path,
+    final_result: Option<&str>,
+) -> Result<Option<Value>> {
+    if dataset_artifact_audit_target(cwd).is_some() {
+        return Ok(None);
+    }
+    let Some(final_result) = final_result else {
+        return Ok(None);
+    };
+
+    std::fs::create_dir_all(cwd).with_context(|| format!("create {}", cwd.display()))?;
+    if task_requests_json_artifact(&case.confirmed_task) {
+        let Some(json_value) = parse_json_like_final_result(final_result) else {
+            return Ok(None);
+        };
+        let path = cwd.join("result.json");
+        std::fs::write(&path, serde_json::to_vec_pretty(&json_value)?)
+            .with_context(|| format!("write {}", path.display()))?;
+        return Ok(Some(serde_json::json!({
+            "path": path.display().to_string(),
+            "source": "session.done.result",
+            "format": "json",
+        })));
+    }
+
+    if task_requests_text_artifact(&case.confirmed_task) {
+        let trimmed = final_result.trim();
+        if trimmed.is_empty() {
+            return Ok(None);
+        }
+        let path = cwd.join("result.txt");
+        std::fs::write(&path, trimmed).with_context(|| format!("write {}", path.display()))?;
+        return Ok(Some(serde_json::json!({
+            "path": path.display().to_string(),
+            "source": "session.done.result",
+            "format": "text",
+        })));
+    }
+
+    Ok(None)
+}
+
+fn task_requests_json_artifact(task: &str) -> bool {
+    let lower = task.to_ascii_lowercase();
+    [
+        "return json",
+        "valid json",
+        "json object",
+        "json response",
+        "json with",
+        "format them into valid json",
+        "matching this schema",
+        "output matching this schema",
+        "copy and use this exact template",
+    ]
+    .iter()
+    .any(|needle| lower.contains(needle))
+}
+
+fn parse_json_like_final_result(text: &str) -> Option<Value> {
+    let trimmed = text.trim();
+    if let Ok(value) = serde_json::from_str::<Value>(trimmed) {
+        return Some(value);
+    }
+    let fenced = trimmed
+        .strip_prefix("```json")
+        .or_else(|| trimmed.strip_prefix("```JSON"))
+        .or_else(|| trimmed.strip_prefix("```"))?
+        .trim();
+    let fenced = fenced.strip_suffix("```").unwrap_or(fenced).trim();
+    serde_json::from_str::<Value>(fenced).ok()
+}
+
+fn task_requests_text_artifact(task: &str) -> bool {
+    let lower = task.to_ascii_lowercase();
+    [
+        "listing start",
+        "listing end",
+        "return a list",
+        "return list",
+        "return the list",
+        "return a table",
+        "return the table",
+        "format each listing",
+        "format each result",
+        "format each business",
+        "collect the names",
+        "collect names",
+    ]
+    .iter()
+    .any(|needle| lower.contains(needle))
+}
+
+fn dataset_artifact_audit_enabled() -> bool {
+    matches!(
+        std::env::var("BROWSER_USE_EVAL_ARTIFACT_AUDIT")
+            .ok()
+            .as_deref()
+            .map(str::trim),
+        Some("1" | "true" | "TRUE" | "yes" | "YES")
+    )
+}
+
+fn dataset_artifact_audit_target(cwd: &Path) -> Option<PathBuf> {
+    ["result.json", "result.csv", "result.md", "result.txt"]
+        .iter()
+        .map(|name| cwd.join(name))
+        .find(|path| path.exists())
 }
 
 fn load_dataset_cases(dataset: &str) -> Result<Vec<DatasetCase>> {
@@ -9761,8 +10441,13 @@ fn cases_from_manifest_selection(
         .collect()
 }
 
-fn build_dataset_prompt(case: &DatasetCase) -> String {
-    include_str!("../../../prompts/dataset-case-user.md")
+fn build_dataset_prompt(case: &DatasetCase, simple_harness: bool) -> String {
+    let template = if simple_harness {
+        include_str!("../../../prompts/dataset-case-simple-harness-user.md")
+    } else {
+        include_str!("../../../prompts/dataset-case-user.md")
+    };
+    template
         .trim()
         .replace("{{dataset}}", &case.dataset)
         .replace("{{task_id}}", &case.task_id)
@@ -9800,6 +10485,7 @@ fn new_dataset_manifest(
         "max_attempts": options.max_attempts.max(1),
         "max_turns": config.max_turns,
         "python_timeout_seconds": config.python_timeout_seconds,
+        "simple_harness": config.simple_harness,
         "headless": config.browser_mode != "cloud",
         "browser": config.browser_mode,
         "selection": cases.iter().map(dataset_case_manifest).collect::<Vec<_>>(),
@@ -9926,6 +10612,11 @@ fn dataset_python_env(
         (
             "LLM_BROWSER_OPEN_CLOUD_LIVE_VIEW".to_string(),
             "0".to_string(),
+        ),
+        ("BROWSER_USE_TASK_ID".to_string(), case.task_id.clone()),
+        (
+            "BROWSER_USE_TASK_TEXT".to_string(),
+            case.confirmed_task.clone(),
         ),
     ];
     if config.browser_mode == "cloud" {
@@ -10512,6 +11203,22 @@ fn is_transient_provider_failure(result: &Value) -> bool {
     .any(|needle| error.contains(needle))
 }
 
+fn is_artifact_audit_failure(result: &Value) -> bool {
+    result.get("error_type").and_then(Value::as_str) == Some("artifact_audit")
+}
+
+fn is_usage_limit_provider_failure(result: &Value) -> bool {
+    let Some(error) = result.get("error").and_then(Value::as_str) else {
+        return false;
+    };
+    let error = error.to_ascii_lowercase();
+    error.contains("usage_limit_reached")
+        || error.contains("workspace_owner_usage_limit_reached")
+        || error.contains("workspace_member_usage_limit_reached")
+        || error.trim() == "usage limit reached"
+        || error.contains("usage limit has been reached")
+}
+
 fn is_permanent_provider_failure(result: &Value) -> bool {
     result
         .get("error")
@@ -10555,6 +11262,8 @@ fn notify_parent_agent_done(store: &Store, task: &browser_use_protocol::SessionM
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     #[test]
     fn external_daemon_socket_path_is_stable_and_short() {
@@ -10608,6 +11317,87 @@ mod tests {
         )?;
 
         assert_eq!(options.collaboration_mode, CollaborationModeKind::Default);
+        assert!(options.simple_harness);
+        Ok(())
+    }
+
+    #[test]
+    fn cli_agent_options_allow_simple_harness_opt_out() -> Result<()> {
+        let options = cli_agent_options(
+            None,
+            &["simple_harness=false".to_string()],
+            CollaborationModeKind::Default,
+            &CliRuntimeOptions::default(),
+        )?;
+
+        assert!(!options.simple_harness);
+        Ok(())
+    }
+
+    #[test]
+    fn dataset_provider_merge_preserves_dataset_browser_limits_and_provider_surface() {
+        let provider_options = AgentRunOptions::default()
+            .with_simple_harness(true)
+            .with_model_provider_id("codex")
+            .with_config_profile("bench")
+            .with_config_overrides(vec![(
+                "simple_harness".to_string(),
+                toml::Value::Boolean(true),
+            )]);
+        let mut dataset_options = AgentRunOptions::default()
+            .with_browser_mode("cloud")
+            .with_simple_harness(false);
+        dataset_options.max_turns = 10_000;
+        dataset_options.python_tool_timeout_seconds = 180;
+        dataset_options.python_env =
+            vec![("BROWSER_USE_API_KEY".to_string(), "test-key".to_string())];
+
+        let merged = merge_dataset_provider_run_options(&provider_options, dataset_options);
+
+        assert_eq!(merged.browser_mode.as_deref(), Some("cloud"));
+        assert_eq!(merged.max_turns, 10_000);
+        assert_eq!(merged.python_tool_timeout_seconds, 180);
+        assert_eq!(
+            merged.python_env,
+            vec![("BROWSER_USE_API_KEY".to_string(), "test-key".to_string())]
+        );
+        assert!(merged.simple_harness);
+        assert_eq!(merged.model_provider_id.as_deref(), Some("codex"));
+        assert_eq!(
+            merged.model_provider_id_source,
+            RunConfigValueSource::Explicit
+        );
+        assert_eq!(merged.config_profile.as_deref(), Some("bench"));
+        assert_eq!(merged.config_overrides.len(), 1);
+    }
+
+    fn dataset_provider_config_with_max_turns(max_turns: usize) -> DatasetProviderConfig {
+        DatasetProviderConfig {
+            provider: "openai".to_string(),
+            model: "gpt-5.5".to_string(),
+            browser_mode: "cloud".to_string(),
+            max_turns,
+            python_timeout_seconds: 180,
+            simple_harness: true,
+        }
+    }
+
+    #[test]
+    fn internal_bench_hard_rejects_low_turn_caps() {
+        let config = dataset_provider_config_with_max_turns(80);
+        let error =
+            validate_dataset_run_limits("/home/exedev/datasets/Internal_Bench_hard.json", &config)
+                .expect_err("Internal_Bench_hard must reject the old 80-turn cap");
+
+        assert!(error.to_string().contains("got 80"));
+        assert!(error.to_string().contains("Do not run this benchmark"));
+    }
+
+    #[test]
+    fn internal_bench_hard_accepts_parity_turn_limit() -> Result<()> {
+        let config = dataset_provider_config_with_max_turns(10_000);
+
+        validate_dataset_run_limits("Internal_Bench_hard", &config)?;
         Ok(())
     }
 
@@ -10834,6 +11624,94 @@ command = "test-mcp"
     }
 
     #[test]
+    fn secrets_email_commands_accept_inbox_and_message() -> Result<()> {
+        let inbox = Args::try_parse_from([
+            "browser-use-terminal",
+            "secrets",
+            "email",
+            "inbox",
+            "--limit",
+            "7",
+        ])?;
+        match &inbox.command {
+            Command::Secrets {
+                command:
+                    SecretsCommand::Email {
+                        action: EmailCommand::Inbox { limit },
+                    },
+            } => assert_eq!(*limit, 7),
+            other => panic!("expected secrets email inbox command, got {other:?}"),
+        }
+
+        let message = Args::try_parse_from([
+            "browser-use-terminal",
+            "secrets",
+            "email",
+            "message",
+            "msg-123",
+        ])?;
+        match &message.command {
+            Command::Secrets {
+                command:
+                    SecretsCommand::Email {
+                        action: EmailCommand::Message { message_id },
+                    },
+            } => assert_eq!(message_id, "msg-123"),
+            other => panic!("expected secrets email message command, got {other:?}"),
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn secrets_harness_secret_command_accepts_domain_and_name() -> Result<()> {
+        let parsed = Args::try_parse_from([
+            "browser-use-terminal",
+            "secrets",
+            "harness-secret",
+            "--domain",
+            "github.com",
+            "--name",
+            "password",
+        ])?;
+        match &parsed.command {
+            Command::Secrets {
+                command: SecretsCommand::HarnessSecret { domain, name },
+            } => {
+                assert_eq!(domain, "github.com");
+                assert_eq!(name, "password");
+            }
+            other => panic!("expected secrets harness-secret command, got {other:?}"),
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn secrets_harness_secret_command_requires_worker_env() -> Result<()> {
+        let temp = unique_cli_test_dir("harness-secret-guard")?;
+        let store = Store::open(temp.join("state"))?;
+        let previous = std::env::var("BU_HARNESS_WORKER_ACTIVE").ok();
+        std::env::remove_var("BU_HARNESS_WORKER_ACTIVE");
+
+        let error = secrets(
+            &store,
+            SecretsCommand::HarnessSecret {
+                domain: "github.com".to_string(),
+                name: "password".to_string(),
+            },
+        )
+        .expect_err("direct harness secret resolution should be rejected");
+
+        if let Some(value) = previous {
+            std::env::set_var("BU_HARNESS_WORKER_ACTIVE", value);
+        }
+        assert!(error
+            .to_string()
+            .contains("only available inside browser-harness"));
+        std::fs::remove_dir_all(temp)?;
+        Ok(())
+    }
+
+    #[test]
     fn sdk_json_rpc_ping_and_create_methods_use_runtime() -> Result<()> {
         let context = SdkServerContext::memory()?;
 
@@ -10936,6 +11814,10 @@ command = "test-mcp"
 
     #[test]
     fn sdk_json_rpc_cloud_browser_requires_cloud_credentials_before_run() -> Result<()> {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let previous_home = std::env::var_os("HOME");
+        let home = tempfile::tempdir()?;
+        std::env::set_var("HOME", home.path());
         let previous = std::env::var(BROWSER_USE_CLOUD_API_KEY_ENV).ok();
         std::env::remove_var(BROWSER_USE_CLOUD_API_KEY_ENV);
         let context = SdkServerContext::memory()?;
@@ -10954,6 +11836,11 @@ command = "test-mcp"
 
         if let Some(value) = previous {
             std::env::set_var(BROWSER_USE_CLOUD_API_KEY_ENV, value);
+        }
+        if let Some(home) = previous_home {
+            std::env::set_var("HOME", home);
+        } else {
+            std::env::remove_var("HOME");
         }
         assert_eq!(response["error"]["code"], -32000);
         assert!(response["error"]["message"]
@@ -11057,6 +11944,173 @@ command = "test-mcp"
     }
 
     #[test]
+    fn sdk_json_rpc_browser_settings_feed_stored_defaults_to_run_config() -> Result<()> {
+        let context = SdkServerContext::memory()?;
+
+        let backend = handle_sdk_json_rpc_line(
+            &context,
+            &serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": 41,
+                "method": "browser.set_backend",
+                "params": {
+                    "backend": "local",
+                    "local_browser": "Brave"
+                }
+            })
+            .to_string(),
+        );
+        assert_eq!(backend["result"]["backend"], "local");
+        assert_eq!(backend["result"]["browser"], BROWSER_LOCAL_CHROME);
+        assert_eq!(backend["result"]["local_browser"], "Brave");
+
+        let profile = handle_sdk_json_rpc_line(
+            &context,
+            &serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": 42,
+                "method": "browser.set_profile",
+                "params": {
+                    "profile_id": "brave:Default",
+                    "profile_label": "Default"
+                }
+            })
+            .to_string(),
+        );
+        assert_eq!(profile["result"]["backend"], "local");
+        assert_eq!(profile["result"]["profile_id"], "brave:Default");
+        assert_eq!(profile["result"]["profile_label"], "Default");
+        assert_eq!(profile["result"]["local_browser"], "Brave");
+
+        let settings = handle_sdk_json_rpc_line(
+            &context,
+            r#"{"jsonrpc":"2.0","id":43,"method":"browser.settings","params":{}}"#,
+        );
+        assert_eq!(settings["result"], profile["result"]);
+
+        let stored = sdk_browser_preference_from_context(&context)?;
+        let config = sdk_provider_run_config(
+            &serde_json::json!({
+                "task": "inspect",
+                "llm": {"provider": "fake", "model": "fake"}
+            }),
+            Some("inspect"),
+            None,
+            Some(&stored),
+            &context,
+        )?;
+        assert_eq!(config.options.browser_mode.as_deref(), Some("local"));
+        assert_eq!(
+            config.options.browser_profile_id.as_deref(),
+            Some("brave:Default")
+        );
+        assert_eq!(
+            config.options.browser_profile_label.as_deref(),
+            Some("Default")
+        );
+        assert_eq!(
+            config.options.browser_local_browser.as_deref(),
+            Some("Brave")
+        );
+
+        let explicit_remote = sdk_provider_run_config(
+            &serde_json::json!({
+                "task": "inspect",
+                "llm": {"provider": "fake", "model": "fake"},
+                "browser": {"cdp_url": "wss://browser.example.test/cdp"}
+            }),
+            Some("inspect"),
+            None,
+            Some(&stored),
+            &context,
+        )?;
+        assert_eq!(
+            explicit_remote.options.browser_mode.as_deref(),
+            Some("remote-cdp")
+        );
+        assert_eq!(explicit_remote.options.browser_profile_id, None);
+        assert_eq!(explicit_remote.options.browser_local_browser, None);
+
+        Ok(())
+    }
+
+    #[test]
+    fn sdk_provider_run_config_passes_stored_cloud_key_to_harness_env() -> Result<()> {
+        let context = SdkServerContext::memory()?;
+        {
+            let store = context.store.lock().expect("sdk store mutex poisoned");
+            store.set_setting(BROWSER_USE_CLOUD_API_KEY_SETTING, "bu-store-key")?;
+            store.set_setting(BROWSER_PREFERENCE_MODE_SETTING, "cloud")?;
+            store.set_setting(BROWSER_SETTING, BROWSER_USE_CLOUD)?;
+        }
+        let stored = sdk_browser_preference_from_context(&context)?;
+
+        let config = sdk_provider_run_config(
+            &serde_json::json!({
+                "task": "inspect",
+                "llm": {"provider": "fake", "model": "fake"}
+            }),
+            Some("inspect"),
+            None,
+            Some(&stored),
+            &context,
+        )?;
+
+        assert_eq!(config.options.browser_mode.as_deref(), Some("cloud"));
+        assert!(config.options.python_env.iter().any(|(key, value)| {
+            key == BROWSER_USE_CLOUD_API_KEY_ENV && !value.trim().is_empty()
+        }));
+        Ok(())
+    }
+
+    #[test]
+    fn sdk_provider_run_config_uses_default_auth_store_cloud_key_for_fresh_state() -> Result<()> {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let previous_home = std::env::var_os("HOME");
+        let previous_key = std::env::var(BROWSER_USE_CLOUD_API_KEY_ENV).ok();
+        let home = tempfile::tempdir()?;
+        std::env::set_var("HOME", home.path());
+        std::env::remove_var(BROWSER_USE_CLOUD_API_KEY_ENV);
+
+        let default_store = Store::open(default_state_dir())?;
+        default_store.set_setting(BROWSER_USE_CLOUD_API_KEY_SETTING, "bu-default-key")?;
+
+        let context = SdkServerContext::memory()?;
+        {
+            let store = context.store.lock().expect("sdk store mutex poisoned");
+            store.set_setting(BROWSER_PREFERENCE_MODE_SETTING, "cloud")?;
+            store.set_setting(BROWSER_SETTING, BROWSER_USE_CLOUD)?;
+        }
+        let stored = sdk_browser_preference_from_context(&context)?;
+
+        let config = sdk_provider_run_config(
+            &serde_json::json!({
+                "task": "inspect",
+                "llm": {"provider": "fake", "model": "fake"}
+            }),
+            Some("inspect"),
+            None,
+            Some(&stored),
+            &context,
+        )?;
+
+        if let Some(value) = previous_key {
+            std::env::set_var(BROWSER_USE_CLOUD_API_KEY_ENV, value);
+        }
+        if let Some(home) = previous_home {
+            std::env::set_var("HOME", home);
+        } else {
+            std::env::remove_var("HOME");
+        }
+
+        assert_eq!(config.options.browser_mode.as_deref(), Some("cloud"));
+        assert!(config.options.python_env.iter().any(|(key, value)| {
+            key == BROWSER_USE_CLOUD_API_KEY_ENV && value == "bu-default-key"
+        }));
+        Ok(())
+    }
+
+    #[test]
     fn sdk_provider_run_config_maps_browser_use_options_to_rust_core() -> Result<()> {
         let params = serde_json::json!({
             "task": "inspect",
@@ -11075,16 +12129,21 @@ command = "test-mcp"
                 "allowed_domains": ["example.com"],
                 "blocked_domains": ["*.tracking.example"],
                 "proxy_country_code": "DE",
+                "profile_id": "google-chrome:Profile 1",
+                "profile": "Work",
+                "local_browser": "Google Chrome",
                 "no_viewport": true,
                 "accept_downloads": true
             },
             "python_env": {"CUSTOM_ENV": "custom-value"}
         });
 
-        let config = sdk_provider_run_config(&params, Some("inspect"), None)?;
+        let context = SdkServerContext::memory()?;
+        let config = sdk_provider_run_config(&params, Some("inspect"), None, None, &context)?;
 
         assert_eq!(config.model, "claude-sonnet-4-6");
         assert_eq!(config.options.max_turns, 12);
+        assert!(config.options.simple_harness);
         assert_eq!(config.options.browser_mode.as_deref(), Some("remote-cdp"));
         assert_eq!(
             config.options.final_output_json_schema,
@@ -11133,11 +12192,40 @@ command = "test-mcp"
             .python_env
             .iter()
             .any(|(key, value)| key == "BU_USE_CALCULATE_COST" && value == "true"));
+        assert_eq!(
+            config.options.browser_profile_id.as_deref(),
+            Some("google-chrome:Profile 1")
+        );
+        assert_eq!(
+            config.options.browser_profile_label.as_deref(),
+            Some("Work")
+        );
+        assert_eq!(
+            config.options.browser_local_browser.as_deref(),
+            Some("Google Chrome")
+        );
         assert!(config
             .options
             .python_env
             .iter()
             .any(|(key, value)| key == "CUSTOM_ENV" && value == "custom-value"));
+        Ok(())
+    }
+
+    #[test]
+    fn sdk_provider_run_config_allows_simple_harness_opt_out() -> Result<()> {
+        let params = serde_json::json!({
+            "task": "inspect",
+            "llm": {"provider": "fake", "model": "fake"},
+            "config_overrides": {
+                "simple_harness": false
+            }
+        });
+
+        let context = SdkServerContext::memory()?;
+        let config = sdk_provider_run_config(&params, Some("inspect"), None, None, &context)?;
+
+        assert!(!config.options.simple_harness);
         Ok(())
     }
 
@@ -11148,7 +12236,8 @@ command = "test-mcp"
             "llm": {"provider": "browser-use", "model": "bu-3-max"}
         });
 
-        let config = sdk_provider_run_config(&params, Some("inspect"), None)?;
+        let context = SdkServerContext::memory()?;
+        let config = sdk_provider_run_config(&params, Some("inspect"), None, None, &context)?;
 
         assert_eq!(config.backend, ProviderBackend::BrowserUse);
         assert_eq!(config.model, "bu-3-max");
@@ -11169,7 +12258,8 @@ command = "test-mcp"
             }
         });
 
-        let config = sdk_provider_run_config(&params, Some("inspect"), None)?;
+        let context = SdkServerContext::memory()?;
+        let config = sdk_provider_run_config(&params, Some("inspect"), None, None, &context)?;
 
         let allowlist = config
             .options
@@ -11232,6 +12322,8 @@ command = "test-mcp"
             }),
             Some("inspect"),
             None,
+            None,
+            &context,
         )?;
 
         assert!(config.options.child_agent_runner.is_none());
@@ -11840,6 +12932,268 @@ command = "test-mcp"
 
         std::fs::remove_dir_all(temp)?;
         Ok(())
+    }
+
+    #[test]
+    fn simple_harness_dataset_prompt_matches_shell_browser_harness_surface() {
+        let case = DatasetCase {
+            dataset: "real_v8".to_string(),
+            path: "datasets/real_v8.json".to_string(),
+            task_id: "1".to_string(),
+            confirmed_task: "Find the answer.".to_string(),
+            raw: serde_json::json!({}),
+        };
+
+        let simple_prompt = build_dataset_prompt(&case, true);
+        assert!(simple_prompt.contains("browser-harness"));
+        assert!(simple_prompt.contains("available Codex tools"));
+        assert!(simple_prompt.contains("Prefer the heredoc form"));
+        assert!(simple_prompt.contains("Hard-filter contract"));
+        assert!(simple_prompt.contains("Required-field contract"));
+        assert!(simple_prompt.contains("artifact-audit"));
+        assert!(!simple_prompt.contains("browser_script"));
+        assert!(!simple_prompt.contains("done("));
+        assert!(!simple_prompt.contains("audit_artifact"));
+
+        let default_prompt = build_dataset_prompt(&case, false);
+        assert!(default_prompt.contains("browser_script"));
+        assert!(default_prompt.contains("done("));
+        assert!(default_prompt.contains("audit_artifact"));
+    }
+
+    #[test]
+    fn simple_harness_dataset_session_persists_simple_prompt() -> Result<()> {
+        let temp = unique_cli_test_dir("dataset-simple-harness-prompt")?;
+        let state_dir = temp.join("state");
+        let store = Store::open(&state_dir)?;
+        let case = DatasetCase {
+            dataset: "real_v8".to_string(),
+            path: "datasets/real_v8.json".to_string(),
+            task_id: "1".to_string(),
+            confirmed_task: "Find the answer.".to_string(),
+            raw: serde_json::json!({}),
+        };
+
+        let (session_id, _paths) =
+            create_dataset_session(&store, "simple-prompt-run", &case, 1, true)?;
+        let input = store
+            .events_for_session(&session_id)?
+            .into_iter()
+            .find(|event| event.event_type == "session.input")
+            .context("session.input")?;
+        let text = input.payload["text"].as_str().context("prompt text")?;
+
+        assert!(text.contains("browser-harness"));
+        assert!(text.contains("Prefer the heredoc form"));
+        assert!(text.contains("Hard-filter contract"));
+        assert!(text.contains("Required-field contract"));
+        assert!(text.contains("artifact-audit"));
+        assert!(!text.contains("browser_script"));
+        assert!(!text.contains("done("));
+        assert!(!text.contains("audit_artifact"));
+
+        std::fs::remove_dir_all(temp)?;
+        Ok(())
+    }
+
+    #[test]
+    fn dataset_json_final_text_is_mirrored_to_result_json() -> Result<()> {
+        let temp = unique_cli_test_dir("dataset-json-final-mirror")?;
+        let cwd = temp.join("cwd");
+        std::fs::create_dir_all(&cwd)?;
+        let case = DatasetCase {
+            dataset: "Internal_Bench_hard".to_string(),
+            path: "/home/exedev/datasets/Internal_Bench_hard.json".to_string(),
+            task_id: "jgzlma".to_string(),
+            confirmed_task:
+                "Return the data as a JSON object with three arrays matching this schema."
+                    .to_string(),
+            raw: serde_json::json!({}),
+        };
+
+        let mirror = mirror_dataset_final_artifact(
+            &case,
+            &cwd,
+            Some(r#"{"amazon_de":[{"rank":1}],"galaxus_de":[],"kaufland_de":[]}"#),
+        )?;
+
+        assert!(mirror.is_some());
+        let mirrored: Value = serde_json::from_slice(&std::fs::read(cwd.join("result.json"))?)?;
+        assert_eq!(mirrored["amazon_de"][0]["rank"], 1);
+
+        std::fs::remove_dir_all(temp)?;
+        Ok(())
+    }
+
+    #[test]
+    fn dataset_json_final_text_mirror_does_not_overwrite_existing_result() -> Result<()> {
+        let temp = unique_cli_test_dir("dataset-json-final-mirror-existing")?;
+        let cwd = temp.join("cwd");
+        std::fs::create_dir_all(&cwd)?;
+        std::fs::write(cwd.join("result.json"), r#"{"model_file":true}"#)?;
+        let case = DatasetCase {
+            dataset: "Internal_Bench_hard".to_string(),
+            path: "/home/exedev/datasets/Internal_Bench_hard.json".to_string(),
+            task_id: "mvxpj4".to_string(),
+            confirmed_task: "COPY AND USE THIS EXACT TEMPLATE. Format them into valid JSON."
+                .to_string(),
+            raw: serde_json::json!({}),
+        };
+
+        let mirror =
+            mirror_dataset_final_artifact(&case, &cwd, Some(r#"{"jobs":[{"Title":"A"}]}"#))?;
+
+        assert!(mirror.is_none());
+        assert_eq!(
+            std::fs::read_to_string(cwd.join("result.json"))?,
+            r#"{"model_file":true}"#
+        );
+
+        std::fs::remove_dir_all(temp)?;
+        Ok(())
+    }
+
+    #[test]
+    fn dataset_plain_text_final_is_not_mirrored_to_result_file() -> Result<()> {
+        let temp = unique_cli_test_dir("dataset-plain-final-no-mirror")?;
+        let cwd = temp.join("cwd");
+        std::fs::create_dir_all(&cwd)?;
+        let case = DatasetCase {
+            dataset: "Internal_Bench_hard".to_string(),
+            path: "/home/exedev/datasets/Internal_Bench_hard.json".to_string(),
+            task_id: "6dpbhs".to_string(),
+            confirmed_task: "What was the name of the owner who was no longer listed?".to_string(),
+            raw: serde_json::json!({}),
+        };
+
+        let mirror = mirror_dataset_final_artifact(&case, &cwd, Some("A. M. Prentiss"))?;
+
+        assert!(mirror.is_none());
+        assert!(!cwd.join("result.json").exists());
+        assert!(!cwd.join("result.txt").exists());
+
+        std::fs::remove_dir_all(temp)?;
+        Ok(())
+    }
+
+    #[test]
+    fn dataset_marker_list_final_text_is_mirrored_to_result_txt() -> Result<()> {
+        let temp = unique_cli_test_dir("dataset-marker-final-mirror")?;
+        let cwd = temp.join("cwd");
+        std::fs::create_dir_all(&cwd)?;
+        let case = DatasetCase {
+            dataset: "Internal_Bench_hard".to_string(),
+            path: "/home/exedev/datasets/Internal_Bench_hard.json".to_string(),
+            task_id: "q85jsg".to_string(),
+            confirmed_task: "Format each listing with LISTING START and LISTING END markers."
+                .to_string(),
+            raw: serde_json::json!({}),
+        };
+
+        let mirror = mirror_dataset_final_artifact(
+            &case,
+            &cwd,
+            Some("LISTING START\nID: 123\nLISTING END\n"),
+        )?;
+
+        assert!(mirror.is_some());
+        assert_eq!(
+            std::fs::read_to_string(cwd.join("result.txt"))?,
+            "LISTING START\nID: 123\nLISTING END"
+        );
+
+        std::fs::remove_dir_all(temp)?;
+        Ok(())
+    }
+
+    #[test]
+    fn dataset_artifact_audit_rejects_empty_structured_result() -> Result<()> {
+        let temp = unique_cli_test_dir("dataset-artifact-audit")?;
+        let cwd = temp.join("cwd");
+        let artifacts = temp.join("artifacts");
+        std::fs::create_dir_all(&cwd)?;
+        std::fs::create_dir_all(&artifacts)?;
+        std::fs::write(cwd.join("result.json"), r#"{"properties":[]}"#)?;
+        let case = DatasetCase {
+            dataset: "real_v8".to_string(),
+            path: "datasets/real_v8.json".to_string(),
+            task_id: "9".to_string(),
+            confirmed_task: "Extract property URLs and names into {\"properties\": [...]}. Return all extracted properties when complete.".to_string(),
+            raw: serde_json::json!({}),
+        };
+
+        let audit = dataset_artifact_audit(&case, &cwd, &artifacts)?;
+
+        assert_eq!(audit["ok"], false);
+        assert_eq!(audit["status"], "failed");
+        assert!(audit["stdout"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("result is empty"));
+
+        std::fs::remove_dir_all(temp)?;
+        Ok(())
+    }
+
+    #[test]
+    fn dataset_artifact_audit_rejects_exact_field_placeholders() -> Result<()> {
+        let temp = unique_cli_test_dir("dataset-artifact-audit-placeholders")?;
+        let cwd = temp.join("cwd");
+        let artifacts = temp.join("artifacts");
+        std::fs::create_dir_all(&cwd)?;
+        std::fs::create_dir_all(&artifacts)?;
+        let rows: Vec<_> = (0..12)
+            .map(|idx| {
+                serde_json::json!({
+                    "product_name": format!("Product {idx}"),
+                    "product_description": "Exact displayed description",
+                    "brand_name": "Not displayed on website",
+                    "price": "$10.00",
+                    "image_urls": ["https://example.com/image.jpg"],
+                })
+            })
+            .collect();
+        std::fs::write(cwd.join("result.json"), serde_json::to_vec(&rows)?)?;
+        let case = DatasetCase {
+            dataset: "real_v8".to_string(),
+            path: "datasets/real_v8.json".to_string(),
+            task_id: "15".to_string(),
+            confirmed_task: "For each product, capture exact Product name, exact Product description, exact Brand name, Price, and Image URLs.".to_string(),
+            raw: serde_json::json!({}),
+        };
+
+        let audit = dataset_artifact_audit(&case, &cwd, &artifacts)?;
+
+        assert_eq!(audit["ok"], false);
+        assert_eq!(audit["status"], "failed");
+        let stdout = audit["stdout"].as_str().unwrap_or_default();
+        assert!(stdout.contains("brand_name"), "{stdout}");
+        assert!(
+            stdout.contains("missing/null/placeholder") || stdout.contains("missing brand values"),
+            "{stdout}"
+        );
+
+        std::fs::remove_dir_all(temp)?;
+        Ok(())
+    }
+
+    #[test]
+    fn dataset_provider_usage_limit_is_classified_as_run_blocker() {
+        let result = serde_json::json!({
+            "ok": false,
+            "error_type": "provider",
+            "error": "provider error: RateLimit: HTTP 429: {\"error\":{\"type\":\"usage_limit_reached\",\"message\":\"The usage limit has been reached\",\"resets_in_seconds\":8241}}",
+        });
+
+        assert!(is_usage_limit_provider_failure(&result));
+        assert!(!is_transient_provider_failure(&result));
+
+        let normalized = serde_json::json!({
+            "ok": false,
+            "error_type": "provider",
+            "error": "usage limit reached",
+        });
+        assert!(is_usage_limit_provider_failure(&normalized));
     }
 
     #[test]

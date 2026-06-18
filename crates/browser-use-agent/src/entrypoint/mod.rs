@@ -805,6 +805,11 @@ fn build_compaction_sampler(
 }
 
 fn base_instructions_for_config(config: &ProviderRunConfig) -> String {
+    if config.options.simple_harness {
+        return crate::simple_harness::simple_harness_system_prompt(
+            config.options.base_instructions.as_deref(),
+        );
+    }
     config
         .options
         .base_instructions
@@ -819,6 +824,10 @@ fn compact_prompt_for_config(config: &ProviderRunConfig) -> String {
         .clone()
         .or_else(|| config_override_string(&config.options.config_overrides, "compact_prompt"))
         .unwrap_or_else(|| crate::compact::SUMMARIZATION_PROMPT.to_string())
+}
+
+fn max_turns_for_config(config: &ProviderRunConfig) -> Option<usize> {
+    crate::simple_harness::max_turns_for_config(config)
 }
 
 fn config_override_string(overrides: &[(String, toml::Value)], key: &str) -> Option<String> {
@@ -3132,13 +3141,16 @@ async fn run_session_once_with_config_with_cancel(
 ) -> anyhow::Result<()> {
     let mut ctx = turn_ctx(&session_id, &config);
 
-    // Tell the model which saved credentials exist (names only) and that it can
-    // use them securely, so it logs in via `<secret>` placeholders instead of
-    // refusing. Built once per session; secret values are never included.
+    // Add product security context without leaking secret values. Simple harness
+    // gets only raw browser-harness-compatible domain guidance; the legacy Rust
+    // browser_script path can also describe saved credential placeholders.
     if let Ok(store_guard) = store.lock() {
-        if let Some(block) =
+        let context = if config.options.simple_harness {
+            crate::tools::handlers::secrets_admin::browser_harness_prompt_context(&store_guard)
+        } else {
             crate::tools::handlers::secrets_admin::secrets_prompt_context(&store_guard)
-        {
+        };
+        if let Some(block) = context {
             ctx.base_instructions.push_str(&block);
         }
     }
@@ -3271,7 +3283,7 @@ async fn run_session_once_with_config_with_cancel(
                 previous_model_compaction,
                 runtime_handle.clone(),
                 cancel.clone(),
-                Some(config.options.max_turns),
+                max_turns_for_config(&config),
             )
             .await?;
         }
@@ -3297,7 +3309,7 @@ async fn run_session_once_with_config_with_cancel(
                 None,
                 runtime_handle.clone(),
                 cancel.clone(),
-                Some(config.options.max_turns),
+                max_turns_for_config(&config),
             )
             .await?;
         }
@@ -4075,21 +4087,28 @@ mod tests {
     /// We assert the facade does NOT reject codex with a "cut" error anymore. With
     /// no codex login present at all, it surfaces an honest missing-credentials
     /// error (not the old "codex is cut" rejection).
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn config_facade_codex_backend_missing_creds_is_honest_error() {
-        // Ensure no env codex creds leak in from the test environment.
-        std::env::remove_var("CODEX_ACCESS_TOKEN");
-        std::env::remove_var("CODEX_ACCOUNT_ID");
         // Point CODEX_HOME at an empty dir so the on-disk `~/.codex/auth.json`
         // fallback resolves to "no login" rather than reading a real user file.
         let codex_home = tempfile::tempdir().expect("codex home");
-        std::env::set_var("CODEX_HOME", codex_home.path());
+        let product_home = tempfile::tempdir().expect("product home");
+        let _env = EnvRestore::set(&[
+            (
+                "CODEX_HOME",
+                codex_home.path().to_str().expect("utf-8 tempdir"),
+            ),
+            ("HOME", product_home.path().to_str().expect("utf-8 tempdir")),
+            ("CODEX_ACCESS_TOKEN", ""),
+            ("CODEX_ACCOUNT_ID", ""),
+        ]);
+        std::env::remove_var("CODEX_ACCESS_TOKEN");
+        std::env::remove_var("CODEX_ACCOUNT_ID");
         let (_dir, store, session_id) = store_with_session();
         let cfg = ProviderRunConfig::new(ProviderBackend::Codex, "codex-model");
         let err = run_session_with_config(store, &session_id, cfg)
             .await
             .expect_err("codex with no login must error on missing creds");
-        std::env::remove_var("CODEX_HOME");
         let msg = err.to_string();
         assert!(
             msg.contains("codex login") || msg.contains("CODEX_ACCESS_TOKEN"),

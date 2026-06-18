@@ -1297,6 +1297,7 @@ fn apply_unified_exec_env(mut env: HashMap<String, String>) -> HashMap<String, S
         env.insert(key.to_string(), value.to_string());
     }
     prepend_managed_agent_tools_dir(&mut env);
+    prepend_codex_home_local_bin(&mut env);
     env
 }
 
@@ -1309,6 +1310,16 @@ fn prepend_managed_agent_tools_dir(env: &mut HashMap<String, String>) {
         return;
     }
     prepend_path_dir(env, &agent_tools_dir);
+}
+
+fn prepend_codex_home_local_bin(env: &mut HashMap<String, String>) {
+    let Some(codex_home) = env.get("CODEX_HOME").filter(|value| !value.is_empty()) else {
+        return;
+    };
+    let local_bin = PathBuf::from(codex_home).join(".local").join("bin");
+    if local_bin.is_dir() {
+        prepend_path_dir(env, &local_bin);
+    }
 }
 
 fn agent_tools_dir_contains_ripgrep(dir: &Path) -> bool {
@@ -1492,7 +1503,7 @@ mod tests {
     use std::collections::HashMap;
     use std::time::Duration;
 
-    use super::{SpawnProcessRequest, UnifiedExecManager};
+    use super::{prepend_codex_home_local_bin, SpawnProcessRequest, UnifiedExecManager, PATH_ENV};
 
     fn request(argv: Vec<String>, cwd: std::path::PathBuf, timeout_ms: u64) -> SpawnProcessRequest {
         SpawnProcessRequest {
@@ -1509,6 +1520,45 @@ mod tests {
             emitter: None,
             cancel: None,
         }
+    }
+
+    #[test]
+    fn codex_home_local_bin_stays_first_when_present() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let codex_home = dir.path().join("home");
+        let harness_bin = codex_home.join(".local").join("bin");
+        std::fs::create_dir_all(&harness_bin).expect("create harness bin");
+        let managed_bin = dir.path().join("managed-bin");
+        std::fs::create_dir_all(&managed_bin).expect("create managed bin");
+
+        let separator = if cfg!(windows) { ';' } else { ':' };
+        let mut env = HashMap::from([
+            ("CODEX_HOME".to_string(), codex_home.display().to_string()),
+            (
+                PATH_ENV.to_string(),
+                format!(
+                    "{}{}{}",
+                    managed_bin.display(),
+                    separator,
+                    harness_bin.display()
+                ),
+            ),
+        ]);
+
+        prepend_codex_home_local_bin(&mut env);
+
+        let path = env.get(PATH_ENV).expect("PATH");
+        assert!(
+            path.starts_with(&harness_bin.display().to_string()),
+            "harness bin must be first, got {path}"
+        );
+        assert_eq!(
+            path.split(separator)
+                .filter(|entry| *entry == harness_bin.display().to_string())
+                .count(),
+            1,
+            "harness bin should not be duplicated: {path}"
+        );
     }
 
     #[cfg(unix)]
