@@ -222,10 +222,6 @@ pub fn browser_harness_interaction_skills() -> &'static [(&'static str, &'static
             include_str!("../../../../prompts/interaction-skills/dropdowns.md"),
         ),
         (
-            "interaction-skills/forms.md",
-            include_str!("../../../../prompts/interaction-skills/forms.md"),
-        ),
-        (
             "interaction-skills/iframes.md",
             include_str!("../../../../prompts/interaction-skills/iframes.md"),
         ),

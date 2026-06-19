@@ -1,50 +1,39 @@
 //! Browser tool handler.
 //!
-//! SANCTIONED DIVERGENCE: this is browser-use's product surface and has no
-//! codex analog. The handler is a THIN adapter over the existing
-//! `browser-use-browser` crate. It translates a typed [`BrowserRequest`] into
-//! the appropriate `browser-use-browser` call and maps the returned
-//! `BrowserCommandOutput` / `BrowserScriptOutput` into the seam's
-//! [`ExecOutput`].
+//! The production browser path is intentionally raw browser-harness: each
+//! `browser_script` invocation runs the vendored `browser_harness.run` Python
+//! entrypoint with the model's script on stdin. Browser lifecycle, local
+//! profiles, cloud browsers, the manager daemon, and CDP are owned by
+//! browser-harness itself.
 //!
-//! ## What it wraps
-//!
-//! Two legacy model-facing paths are modeled here:
-//!   * the hidden `browser <cmd-string>` command path
-//!     -> [`browser_use_browser::run_browser_command`]
-//!   * the start/observe/cancel script path
-//!     -> [`browser_use_browser::start_browser_script`] /
-//!        [`browser_use_browser::observe_browser_script`] /
-//!        [`browser_use_browser::cancel_browser_script`]
-//!
-//! ## Testability without Bun/Chrome
-//!
-//! The real `browser-use-browser` functions spawn a Bun + Chrome toolchain
-//! (external processes, a CDP websocket, a local bridge port) that is not
-//! present in CI/test environments. To keep the adapter testable we put the
-//! browser backend behind a small [`BrowserBackend`] trait. The production
-//! implementation, [`RealBackend`], delegates 1:1 to `browser-use-browser`;
-//! tests inject a fake backend instead and never touch Bun/Chrome/network.
+//! The Rust side only preserves the terminal tool contract: it parses the
+//! model-facing request, invokes browser-harness, and maps stdout/stderr into
+//! the existing `BrowserCommandOutput` / `BrowserScriptOutput` structs used by
+//! persistence and providers. Tests can still inject a fake [`BrowserBackend`]
+//! and never touch Chrome/network.
 //!
 //! ## Concurrency
 //!
-//! The `browser-use-browser` functions are synchronous and spawn external
-//! processes. To avoid blocking the async runtime, [`BrowserTool::run`] invokes
-//! the backend on a blocking thread via [`tokio::task::spawn_blocking`].
+//! Browser-harness is synchronous from Rust's point of view and spawns/uses
+//! external processes. To avoid blocking the async runtime, [`BrowserTool::run`]
+//! invokes the backend on a blocking thread via [`tokio::task::spawn_blocking`].
 //!
 //! Browser actions are NOT parallel-safe: a single browser session/CDP
 //! connection is shared and serialized, matching the legacy tool set where the
 //! browser tool is excluded from the parallel set.
 
+use std::ffi::{OsStr, OsString};
 use std::fs;
-use std::path::PathBuf;
+use std::io::{Read, Write};
+use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
-use anyhow::{anyhow, bail};
+use anyhow::{anyhow, bail, Context};
 use base64::{engine::general_purpose, Engine as _};
 use browser_use_browser::{BrowserCommandOutput, BrowserScriptOutput};
 use browser_use_llm::schema::ContentPart;
-use browser_use_python_worker::{PythonWorker, RunPythonResponse};
 use browser_use_store::Store;
 use regex::Regex;
 use serde_json::{json, Value};
@@ -103,8 +92,8 @@ const BROWSER_PREF_PROFILE_LABEL: &str = "browser.preference.profile_label";
 /// What the model wants the browser to do.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BrowserAction {
-    /// Hidden `browser` command tool: a single command string evaluated by the
-    /// browser runtime. Maps to [`browser_use_browser::run_browser_command`].
+    /// Hidden compatibility `browser` command tool. New page work should use
+    /// [`BrowserAction::Execute`] and raw browser-harness helpers.
     Command {
         /// The raw command string (e.g. `go https://example.com`).
         command: String,
@@ -118,14 +107,14 @@ pub enum BrowserAction {
         /// this concept; script execution always uses `start_browser_script`.
         background: bool,
     },
-    /// `observe`: poll an in-flight run.
-    /// Maps to [`browser_use_browser::observe_browser_script`].
+    /// `observe`: legacy poll action. Raw browser-harness MVP runs scripts
+    /// synchronously, so production returns an unsupported response.
     Observe {
         /// Run identifier returned by a backgrounded `Execute`.
         run_id: String,
     },
-    /// `cancel`: stop an in-flight run.
-    /// Maps to [`browser_use_browser::cancel_browser_script`].
+    /// `cancel`: legacy cancel action. Raw browser-harness MVP runs scripts
+    /// synchronously, so production returns an unsupported response.
     Cancel {
         /// Run identifier returned by a backgrounded `Execute`.
         run_id: String,
@@ -438,7 +427,9 @@ pub trait BrowserBackend: Send + Sync {
     }
 }
 
-/// Production backend: a thin delegation to `browser-use-browser`.
+/// Legacy backend retained for compatibility tests and non-MVP callers.
+///
+/// The model-facing production browser tool uses [`HarnessBackend`].
 #[derive(Debug, Clone)]
 pub struct RealBackend {
     browser_mode: Arc<Mutex<Option<String>>>,
@@ -810,14 +801,12 @@ impl BrowserBackend for RealBackend {
 
 pub struct HarnessBackend {
     browser_mode: Arc<Mutex<Option<String>>>,
-    worker: Mutex<Option<PythonWorker>>,
 }
 
 impl Default for HarnessBackend {
     fn default() -> Self {
         Self {
             browser_mode: Arc::new(Mutex::new(None)),
-            worker: Mutex::new(None),
         }
     }
 }
@@ -826,45 +815,25 @@ impl HarnessBackend {
     pub fn with_browser_mode(browser_mode: Option<String>) -> Self {
         Self {
             browser_mode: Arc::new(Mutex::new(browser_mode)),
-            worker: Mutex::new(None),
         }
     }
 
-    fn run_python(
+    fn run_harness_script(
         &self,
-        session_id: &str,
         cwd: &std::path::Path,
-        artifact_dir: &std::path::Path,
         code: &str,
         timeout_secs: u64,
-    ) -> anyhow::Result<RunPythonResponse> {
-        let mut worker = self
-            .worker
-            .lock()
-            .map_err(|_| anyhow!("browser-harness worker mutex poisoned"))?;
-        if worker.is_none() {
-            let browser_mode = self
-                .browser_mode
-                .lock()
-                .map_err(|_| anyhow!("browser-harness mode mutex poisoned"))?
-                .clone();
-            *worker = Some(PythonWorker::start_with_browser_mode_and_env(
-                browser_mode.as_deref(),
-                [("BH_MANAGER_MODE", "1")],
-            )?);
-        }
-        worker
-            .as_mut()
-            .expect("worker initialized")
-            .run_with_events_and_timeout(
-                session_id,
-                cwd,
-                artifact_dir,
-                code,
-                Some(timeout_secs as f64),
-                |_| {},
-            )
-            .map_err(Into::into)
+    ) -> anyhow::Result<HarnessProcessOutput> {
+        run_browser_harness(cwd, &[], Some(code), timeout_secs)
+    }
+
+    fn run_harness_cli(
+        &self,
+        cwd: &std::path::Path,
+        args: &[&str],
+        timeout_secs: u64,
+    ) -> anyhow::Result<HarnessProcessOutput> {
+        run_browser_harness(cwd, args, None, timeout_secs)
     }
 
     fn direct_command_output(command: &str) -> anyhow::Result<Option<BrowserCommandOutput>> {
@@ -896,24 +865,28 @@ impl HarnessBackend {
         }))
     }
 
-    fn command_code(command: &str) -> anyhow::Result<String> {
+    fn command_harness_invocation(command: &str) -> anyhow::Result<Option<HarnessInvocation>> {
         let argv = browser_command_words(command)?;
         let args = strip_browser_prefix(&argv);
         let first = args.first().map(String::as_str);
-        let code = match first {
-            None | Some("status") => r#"
-result = {
-    "status": "ok",
-    "browser_harness": "raw",
-    "browsers": browser_list(),
-    "note": "Use browser_script with browser-harness helpers for page work.",
-}
+        let invocation = match first {
+            None | Some("status") => None,
+            Some("list") => Some(HarnessInvocation::Script(
+                r#"
+import json
+print(json.dumps({"browsers": browser_list()}, indent=2, default=str))
 "#
-            .to_string(),
-            Some("list") => "result = {\"browsers\": browser_list()}".to_string(),
-            Some("profiles") => "result = browser_profiles(verbose=True)".to_string(),
+                .to_string(),
+            )),
+            Some("profiles") => Some(HarnessInvocation::Args(vec![
+                "profiles".to_string(),
+                "--verbose".to_string(),
+            ])),
             Some("local") if args.get(1).map(String::as_str) == Some("profiles") => {
-                "result = browser_profiles(verbose=True)".to_string()
+                Some(HarnessInvocation::Args(vec![
+                    "profiles".to_string(),
+                    "--verbose".to_string(),
+                ]))
             }
             Some("local") if args.get(1).map(String::as_str) == Some("open") => {
                 let profile = args
@@ -922,107 +895,313 @@ result = {
                     .and_then(|idx| args.get(idx + 1))
                     .cloned()
                     .unwrap_or_default();
-                format!(
-                    "result = browser_use_profile({})",
-                    serde_json::to_string(&profile)?
-                )
+                let mut cli_args = vec!["open-profile".to_string()];
+                if !profile.trim().is_empty() {
+                    cli_args.push(profile);
+                }
+                Some(HarnessInvocation::Args(cli_args))
             }
             Some("use-profile") => {
                 let profile = args.get(1).cloned().unwrap_or_default();
-                format!(
-                    "result = browser_use_profile({})",
-                    serde_json::to_string(&profile)?
-                )
+                Some(HarnessInvocation::Args(vec![
+                    "use-profile".to_string(),
+                    profile,
+                ]))
             }
-            _ => format!(
-                r#"
-result = {{
-    "status": "ok",
-    "browser_harness": "raw",
-    "command": {},
-    "message": "The legacy Rust browser command plane is disabled in this MVP. Use browser_script with browser-harness helpers.",
-}}
-"#,
-                serde_json::to_string(command)?
-            ),
+            _ => None,
         };
-        Ok(code)
+        Ok(invocation)
     }
 }
 
-fn browser_script_output_from_python(response: RunPythonResponse) -> BrowserScriptOutput {
-    let harness_error = response
-        .browser_harness_error
-        .as_deref()
-        .filter(|error| !error.trim().is_empty())
-        .map(str::to_string);
-    let ok = response.ok && harness_error.is_none();
+#[derive(Debug)]
+enum HarnessInvocation {
+    Args(Vec<String>),
+    Script(String),
+}
+
+#[derive(Debug)]
+struct HarnessProcessOutput {
+    ok: bool,
+    stdout: String,
+    stderr: String,
+    elapsed_ms: u64,
+    timed_out: bool,
+}
+
+fn browser_script_output_from_harness(output: HarnessProcessOutput) -> BrowserScriptOutput {
+    let ok = output.ok && !output.timed_out;
+    let error = if ok {
+        None
+    } else if output.timed_out {
+        Some("browser-harness timed out".to_string())
+    } else if output.stderr.trim().is_empty() {
+        Some("browser-harness exited unsuccessfully".to_string())
+    } else {
+        Some(output.stderr.clone())
+    };
     BrowserScriptOutput {
         ok,
         status: Some(if ok { "finished" } else { "failed" }.to_string()),
         run_id: None,
         next_observe_ms: None,
-        elapsed_ms: None,
+        elapsed_ms: Some(output.elapsed_ms),
         ms_since_last_output: None,
-        text: response.text,
-        error: response
-            .error
-            .or_else(|| harness_error.map(|error| format!("browser_harness_error: {error}"))),
+        text: output.stdout,
+        error,
         diagnosis: None,
-        data: response.data,
-        outputs: response.outputs,
+        data: serde_json::Value::Null,
+        outputs: Vec::new(),
         summary: Vec::new(),
-        artifacts: response.artifacts,
-        images: response.images,
-        browser_events: response.browser_events,
+        artifacts: Vec::new(),
+        images: Vec::new(),
+        browser_events: Vec::new(),
     }
+}
+
+fn run_browser_harness(
+    cwd: &std::path::Path,
+    args: &[&str],
+    stdin_code: Option<&str>,
+    timeout_secs: u64,
+) -> anyhow::Result<HarnessProcessOutput> {
+    let pythonpath = browser_harness_pythonpath()?;
+    let mut last_spawn_error: Option<anyhow::Error> = None;
+    for candidate in browser_harness_command_candidates() {
+        match run_browser_harness_candidate(
+            &candidate,
+            &pythonpath,
+            cwd,
+            args,
+            stdin_code,
+            timeout_secs,
+        ) {
+            Ok(output) => return Ok(output),
+            Err(error) if is_spawn_error(&error) => {
+                last_spawn_error = Some(error);
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    Err(last_spawn_error.unwrap_or_else(|| anyhow!("no browser-harness python command candidates")))
+}
+
+#[derive(Debug)]
+struct HarnessCommandCandidate {
+    program: PathBuf,
+    args: Vec<String>,
+}
+
+fn browser_harness_command_candidates() -> Vec<HarnessCommandCandidate> {
+    let mut candidates = Vec::new();
+    if let Some(python) = std::env::var_os("BROWSER_USE_PYTHON").filter(|value| !value.is_empty()) {
+        candidates.push(HarnessCommandCandidate {
+            program: PathBuf::from(python),
+            args: vec!["-m".to_string(), "browser_harness.run".to_string()],
+        });
+        return candidates;
+    }
+    candidates.push(HarnessCommandCandidate {
+        program: PathBuf::from("uv"),
+        args: vec![
+            "run".to_string(),
+            "--quiet".to_string(),
+            "--with".to_string(),
+            "cdp-use==1.4.5".to_string(),
+            "--with".to_string(),
+            "fetch-use==0.4.0".to_string(),
+            "--with".to_string(),
+            "pillow==12.2.0".to_string(),
+            "--with".to_string(),
+            "websockets==15.0.1".to_string(),
+            "python".to_string(),
+            "-m".to_string(),
+            "browser_harness.run".to_string(),
+        ],
+    });
+    for python in ["python3", "python"] {
+        candidates.push(HarnessCommandCandidate {
+            program: PathBuf::from(python),
+            args: vec!["-m".to_string(), "browser_harness.run".to_string()],
+        });
+    }
+    candidates
+}
+
+fn run_browser_harness_candidate(
+    candidate: &HarnessCommandCandidate,
+    pythonpath: &OsStr,
+    cwd: &std::path::Path,
+    args: &[&str],
+    stdin_code: Option<&str>,
+    timeout_secs: u64,
+) -> anyhow::Result<HarnessProcessOutput> {
+    let mut command = Command::new(&candidate.program);
+    command
+        .args(&candidate.args)
+        .args(args)
+        .current_dir(cwd)
+        .env("PYTHONUNBUFFERED", "1")
+        .env("PYTHONPATH", pythonpath)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut child = command.spawn().with_context(|| {
+        format!(
+            "spawn browser-harness via {}",
+            candidate.program.to_string_lossy()
+        )
+    })?;
+    if let Some(code) = stdin_code {
+        let mut stdin = child
+            .stdin
+            .take()
+            .context("browser-harness stdin missing")?;
+        stdin.write_all(code.as_bytes())?;
+    }
+    drop(child.stdin.take());
+
+    let mut stdout = child
+        .stdout
+        .take()
+        .context("browser-harness stdout missing")?;
+    let mut stderr = child
+        .stderr
+        .take()
+        .context("browser-harness stderr missing")?;
+    let stdout_reader = std::thread::spawn(move || {
+        let mut text = String::new();
+        let _ = stdout.read_to_string(&mut text);
+        text
+    });
+    let stderr_reader = std::thread::spawn(move || {
+        let mut text = String::new();
+        let _ = stderr.read_to_string(&mut text);
+        text
+    });
+
+    let started = Instant::now();
+    let timeout = Duration::from_secs(timeout_secs.max(1));
+    let (success, timed_out) = loop {
+        if let Some(status) = child.try_wait()? {
+            break (status.success(), false);
+        }
+        if started.elapsed() >= timeout {
+            let _ = child.kill();
+            let _ = child.wait();
+            break (false, true);
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    };
+    let stdout = stdout_reader.join().unwrap_or_default();
+    let stderr = stderr_reader.join().unwrap_or_default();
+    Ok(HarnessProcessOutput {
+        ok: success,
+        stdout,
+        stderr,
+        elapsed_ms: started.elapsed().as_millis().try_into().unwrap_or(u64::MAX),
+        timed_out,
+    })
+}
+
+fn is_spawn_error(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        cause.downcast_ref::<std::io::Error>().is_some_and(|io| {
+            matches!(
+                io.kind(),
+                std::io::ErrorKind::NotFound | std::io::ErrorKind::PermissionDenied
+            )
+        })
+    })
+}
+
+fn browser_harness_pythonpath() -> anyhow::Result<OsString> {
+    let mut paths = Vec::new();
+    if let Some(path) = installed_browser_harness_python_path() {
+        paths.push(path);
+    }
+    let repo_root = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .and_then(Path::parent)
+        .context("repo root")?;
+    let workspace_python = repo_root.join("python");
+    if workspace_python.exists() {
+        paths.push(workspace_python);
+    }
+    if let Some(path) = std::env::var_os("BROWSER_HARNESS_SRC") {
+        paths.push(path.into());
+    }
+    if let Some(path) = std::env::var_os("PYTHONPATH") {
+        paths.extend(std::env::split_paths(&path));
+    }
+    Ok(std::env::join_paths(paths)?)
+}
+
+fn installed_browser_harness_python_path() -> Option<PathBuf> {
+    let exe = std::env::current_exe().ok()?;
+    let exe_dir = exe.parent()?;
+    let release_python = exe_dir.parent()?.join("python");
+    if release_python.exists() {
+        return Some(release_python);
+    }
+    let sibling_python = exe_dir.join("python");
+    sibling_python.exists().then_some(sibling_python)
 }
 
 impl BrowserBackend for HarnessBackend {
     fn command(
         &self,
-        session_id: &str,
+        _session_id: &str,
         cwd: &std::path::Path,
-        artifact_dir: &std::path::Path,
+        _artifact_dir: &std::path::Path,
         command: &str,
     ) -> anyhow::Result<BrowserCommandOutput> {
         if let Some(output) = Self::direct_command_output(command)? {
             return Ok(output);
         }
-        let response = self.run_python(
-            session_id,
-            cwd,
-            artifact_dir,
-            &Self::command_code(command)?,
-            60,
-        )?;
-        let content = if response.data.is_null() {
+        let Some(invocation) = Self::command_harness_invocation(command)? else {
+            return Ok(BrowserCommandOutput {
+                content: json!({
+                    "status": "ok",
+                    "browser_harness": "raw",
+                    "command": command,
+                    "message": "The legacy Rust browser command plane is disabled. Use browser_script or the bundled browser-harness command.",
+                }),
+                events: Vec::new(),
+            });
+        };
+        let response = match invocation {
+            HarnessInvocation::Args(args) => {
+                let borrowed = args.iter().map(String::as_str).collect::<Vec<_>>();
+                self.run_harness_cli(cwd, &borrowed, 60)?
+            }
+            HarnessInvocation::Script(code) => self.run_harness_script(cwd, &code, 60)?,
+        };
+        let parsed = serde_json::from_str::<Value>(response.stdout.trim()).ok();
+        let content = parsed.unwrap_or_else(|| {
             json!({
                 "status": if response.ok { "ok" } else { "failed" },
                 "browser_harness": "raw",
-                "text": response.text,
-                "error": response.error,
-                "browser_harness_error": response.browser_harness_error,
+                "text": response.stdout,
+                "error": if response.stderr.trim().is_empty() { Value::Null } else { Value::String(response.stderr.clone()) },
             })
-        } else {
-            response.data
-        };
+        });
         Ok(BrowserCommandOutput {
             content,
-            events: response.browser_events,
+            events: Vec::new(),
         })
     }
 
     fn run_script(
         &self,
-        session_id: &str,
+        _session_id: &str,
         cwd: &std::path::Path,
-        artifact_dir: &std::path::Path,
+        _artifact_dir: &std::path::Path,
         code: &str,
         timeout_secs: u64,
     ) -> anyhow::Result<BrowserScriptOutput> {
-        let response = self.run_python(session_id, cwd, artifact_dir, code, timeout_secs)?;
-        Ok(browser_script_output_from_python(response))
+        let response = self.run_harness_script(cwd, code, timeout_secs)?;
+        Ok(browser_script_output_from_harness(response))
     }
 
     fn start_script(
@@ -2900,9 +3079,9 @@ fn browser_script_error_detail(error: &str) -> String {
 
 /// Browser tool handler.
 ///
-/// Generic over the backend so production code uses [`RealBackend`] and tests
-/// inject a fake. Construct with [`BrowserTool::new`] for the real backend or
-/// [`BrowserTool::with_backend`] for a custom one.
+/// Generic over the backend so production code uses [`HarnessBackend`] and
+/// tests inject a fake. Construct with [`BrowserTool::new`] for the raw
+/// browser-harness backend or [`BrowserTool::with_backend`] for a custom one.
 #[derive(Clone)]
 pub struct BrowserTool {
     backend: Arc<dyn BrowserBackend>,
@@ -3729,5 +3908,23 @@ mod browser_mode_tests {
         .unwrap();
 
         assert_eq!(resolved, "browser recover restart-owned-browser");
+    }
+
+    #[test]
+    fn harness_backend_runs_browser_harness_entrypoint() {
+        let dir = tempfile::tempdir().unwrap();
+        let backend = HarnessBackend::default();
+        let output = backend
+            .run_script(
+                "harness-entrypoint-test",
+                dir.path(),
+                &dir.path().join("artifacts"),
+                "print(browser_profiles())",
+                30,
+            )
+            .unwrap();
+
+        assert!(output.ok, "{output:?}");
+        assert!(output.text.contains("profiles"));
     }
 }

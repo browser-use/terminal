@@ -529,6 +529,8 @@ release_dir_is_complete() {
   [ -d "$release_dir" ] &&
     [ -x "$release_dir/bin/but" ] &&
     [ -x "$release_dir/bin/browser-use-terminal" ] &&
+    [ -x "$release_dir/bin/browser-harness" ] &&
+    [ -x "$release_dir/bin/browser-harness-manager" ] &&
     [ -x "$release_dir/bin/agent-tools/rg" ] &&
     [ -f "$release_dir/python/llm_browser_worker/worker.py" ] &&
     [ -f "$release_dir/python/browser_harness/run.py" ] &&

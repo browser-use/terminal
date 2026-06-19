@@ -1040,9 +1040,6 @@ def _namespace(session_id: str, cwd: Path, artifact_dir: Path) -> Dict[str, Any]
     os.environ["BH_AGENT_WORKSPACE"] = str(workspace)
     os.environ["BH_RUN_ID"] = session_id
     os.environ.setdefault("BH_AGENT_ID", "main")
-    os.environ.setdefault("BH_MANAGER_MODE", "1")
-    os.environ["BH_MANAGER_ROOT"] = str(artifact_dir / ".browser-harness-manager")
-    os.environ["BH_MANAGER_SOCKET"] = str(artifact_dir / ".browser-harness-manager" / "manager.sock")
     ns = _namespaces.setdefault(
         session_id,
         {

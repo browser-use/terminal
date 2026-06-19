@@ -85,6 +85,40 @@ cp "$PACKAGE_SRC/README.md" "$STAGE/README.md"
 cp "$PACKAGE_SRC/src/browser_use_core/"*.py "$STAGE/src/browser_use_core/"
 cp "$BUILD_DIR/but$EXE_SUFFIX" "$STAGE/src/browser_use_core/bin/but$EXE_SUFFIX"
 cp "$BUILD_DIR/browser-use-terminal$EXE_SUFFIX" "$STAGE/src/browser_use_core/bin/browser-use-terminal$EXE_SUFFIX"
+cat >"$STAGE/src/browser_use_core/bin/browser-harness" <<'EOF'
+#!/bin/sh
+ROOT="$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)"
+export PYTHONPATH="$ROOT/python${PYTHONPATH:+:$PYTHONPATH}"
+if [ -n "${BROWSER_USE_PYTHON:-}" ]; then
+  exec "$BROWSER_USE_PYTHON" -m browser_harness.run "$@"
+fi
+if command -v uv >/dev/null 2>&1; then
+  exec uv run --quiet \
+    --with cdp-use==1.4.5 \
+    --with fetch-use==0.4.0 \
+    --with pillow==12.2.0 \
+    --with websockets==15.0.1 \
+    python -m browser_harness.run "$@"
+fi
+exec python3 -m browser_harness.run "$@"
+EOF
+cat >"$STAGE/src/browser_use_core/bin/browser-harness-manager" <<'EOF'
+#!/bin/sh
+ROOT="$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)"
+export PYTHONPATH="$ROOT/python${PYTHONPATH:+:$PYTHONPATH}"
+if [ -n "${BROWSER_USE_PYTHON:-}" ]; then
+  exec "$BROWSER_USE_PYTHON" -m browser_harness.manager_daemon "$@"
+fi
+if command -v uv >/dev/null 2>&1; then
+  exec uv run --quiet \
+    --with cdp-use==1.4.5 \
+    --with fetch-use==0.4.0 \
+    --with pillow==12.2.0 \
+    --with websockets==15.0.1 \
+    python -m browser_harness.manager_daemon "$@"
+fi
+exec python3 -m browser_harness.manager_daemon "$@"
+EOF
 cp -R "$ROOT/python/browser_harness" "$STAGE/src/browser_use_core/python/browser_harness"
 cp -R "$ROOT/python/browser_harness_skill" "$STAGE/src/browser_use_core/python/browser_harness_skill"
 cp -R "$ROOT/python/llm_browser_worker" "$STAGE/src/browser_use_core/python/llm_browser_worker"
@@ -103,7 +137,7 @@ else
   "$ROOT/scripts/install-agent-ripgrep.sh" "$STAGE/src/browser_use_core/bin/agent-tools" "$TARGET_TRIPLE"
 fi
 
-chmod 0755 "$STAGE/src/browser_use_core/bin/but$EXE_SUFFIX" "$STAGE/src/browser_use_core/bin/browser-use-terminal$EXE_SUFFIX"
+chmod 0755 "$STAGE/src/browser_use_core/bin/but$EXE_SUFFIX" "$STAGE/src/browser_use_core/bin/browser-use-terminal$EXE_SUFFIX" "$STAGE/src/browser_use_core/bin/browser-harness" "$STAGE/src/browser_use_core/bin/browser-harness-manager"
 if [[ -d "$STAGE/src/browser_use_core/bin/agent-tools" ]]; then
   find "$STAGE/src/browser_use_core/bin/agent-tools" -type f -exec chmod 0755 {} +
 fi

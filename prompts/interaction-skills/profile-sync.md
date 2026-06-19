@@ -1,26 +1,81 @@
-# Profiles And Cookies
+# Profile sync
 
-Use explicit profile commands for login-sensitive browser work. Never dump raw cookie values by default.
+Advanced only. Use this when the user explicitly asks to upload local Chrome cookies into Browser Use cloud profiles. For normal cloud browser work, use `browser_new("cloud")`, keep the returned `id`, and call `browser(id)` before page helpers.
 
-What is available:
+This file manages cloud cookie profiles. It does not replace the explicit browser id flow.
 
-- `browser local profiles --json`: list local profiles with built-in Rust filesystem discovery. No external CLI is required.
-- `browser local profiles inspect <profile-id-or-name> --domains-only`: copy the selected profile to a temporary profile, inspect cookies through CDP, and show domain-level cookie summaries only.
-- `browser remote profiles --json`: list Browser Use cloud profiles with ID/name/domain summary/last-used metadata.
-- `browser remote start --profile-id <uuid>`: start and connect a cloud browser using an existing cloud profile.
-- `browser remote start --profile-name <name>`: resolve one exact cloud profile name and start/connect it.
-- `browser remote stop`: stop the Rust-owned cloud browser so billing ends and cloud profile cookie changes can persist.
+## One-time install
 
-Chat-driven flow:
+```bash
+curl -fsSL https://browser-use.com/profile.sh | sh
+```
 
-1. If the user wants to use an existing cloud login, show cloud profiles with `browser remote profiles --json`, then run `browser remote start --profile-id <uuid>` or `browser remote start --profile-name <name>`.
-2. If the user wants a real local logged-in browser, use `browser connect local`; do not sync or copy profiles unless the user asks for cloud cookie sync.
-3. If cookies need to be synced, nudge the user to use `/sync-cookies`. Do not construct site-specific cookie sync commands in chat.
-4. After the user syncs cookies, show cloud profiles again and use the selected profile with `browser remote start --profile-id <uuid>` or `browser remote start --profile-name <name>`.
+Downloads `profile-use` (macOS / Linux, x64 / arm64). The Python helpers shell out to it; you don't run `profile-use` directly.
 
-Important limits:
+## Python API (pre-imported in `browser-harness`)
 
-- Cookie sync is user-driven through `/sync-cookies`, including any Browser Use Cloud key setup.
-- Local real profiles are used by attaching to an already-open browser with `browser connect local`.
-- Do not launch the user's real default Chrome profile with remote-debugging flags.
-- Raw cookie values are never returned by default. Profile inspection and sync output should expose only domain/count/expiry summaries.
+```python
+list_cloud_profiles()
+# [{id, name, userId, cookieDomains, lastUsedAt}, ...] — every profile under this API key
+
+browser_profiles(verbose=True)
+# {"profiles": [{"id", "profile_name", "display_name", "profile_path", ...}, ...]}
+
+sync_local_profile(profile_name, browser=None,
+                   cloud_profile_id=None,      # update an existing cloud profile instead of creating new
+                   include_domains=None,       # only these domains (and subdomains); leading dot optional
+                   exclude_domains=None)       # drop these domains; applied before include
+# Shells out to `profile-use sync`. Returns the cloud profile UUID
+# (the existing one if cloud_profile_id was passed, else the newly-created one).
+```
+
+`sync_local_profile` prints `♻️  Using existing cloud profile` when `cloud_profile_id` is accepted, or `📝  Creating remote profile...` → `✓ Profile created: <uuid>` when it creates a new one. Check that line if you want to confirm which path ran.
+
+## Chat-driven flow (don't guess — ask the user)
+
+Cookies are real auth. Don't sync or pick a profile unilaterally.
+
+```python
+# 1. Show what's already in the cloud.
+for p in list_cloud_profiles():
+    print(f"{p['name']:25}  {len(p['cookieDomains']):3} domains  {p['id']}")
+```
+→ Agent: *"You have these cloud profiles (<N> domains each). Want to reuse one, sync a local profile, or start clean?"*
+
+```python
+# 2. Sync local first. Show the options:
+for lp in browser_profiles(verbose=True)["profiles"]:
+    print(lp["id"], lp["display_name"])
+```
+→ Agent: *"Which local profile?"* → user picks → before syncing, inspect domain-level cookie counts with `profile-use inspect --profile <name>` (or `--verbose` for individual cookies) and report the summary; never dump 500 cookies into chat.
+
+```python
+# 3. Sync. Returns the cloud profile UUID.
+uuid = sync_local_profile("browser-use.com")
+print({"cloud_profile_id": uuid})
+
+# 3b. Refresh that same cloud profile later (idempotent — no duplicate profiles).
+sync_local_profile("browser-use.com", cloud_profile_id=uuid)
+
+# 3c. Scoped: push *only* Stripe cookies into a dedicated cloud profile.
+sync_local_profile("browser-use.com",
+                   cloud_profile_id=uuid,
+                   include_domains=["stripe.com"])
+```
+
+## What actually gets synced
+
+**Cookies only.** No localStorage, no IndexedDB, no extensions. Enough for session-cookie sites (Google, GitHub, Stripe, most SaaS); not for sites that store auth in localStorage.
+
+## Cloud profile CRUD
+
+- UI: https://cloud.browser-use.com/settings?tab=profiles
+- API: `GET /profiles`, `GET/PATCH/DELETE /profiles/{id}` (paths are relative to `BU_API = "https://api.browser-use.com/api/v3"` in `admin.py`). Fields: `id`, `name`, `userId`, `lastUsedAt`, `cookieDomains[]`. `list_cloud_profiles()` wraps this.
+- Need the UUID for an existing profile? `matches = [p["id"] for p in list_cloud_profiles() if p["name"] == "<name>"]` — then verify `len(matches) == 1` before using it. Profile names are not unique; syncs create duplicates unless you pass `cloud_profile_id=`.
+- Lower-level raw calls: `from browser_harness.admin import _browser_use; _browser_use("/profiles/<id>", "DELETE")`. Pass the path *without* the `/api/v3` prefix — it's already on `BU_API`.
+
+## Traps
+
+- **Default proxy (`proxyCountryCode="us"`) blocks some destinations** with `ERR_TUNNEL_CONNECTION_FAILED` (e.g. `cloud.browser-use.com` itself). `proxyCountryCode=None` disables the BU proxy; a different country code picks a different exit.
+- **Prefer a dedicated work profile over your personal one.** Especially while testing.
+- **Older than `profile-use` v1.0.5?** Pre-1.0.5 the sync needed the Chrome profile to be closed (exclusive SQLite lock on the `Cookies` DB). v1.0.5+ copies the profile dir to a temp and syncs from the copy — Chrome can stay open.

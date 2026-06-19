@@ -27,6 +27,8 @@ dependencies = [
 browser-use-terminal = "browser_use_core.cli:main"
 but = "browser_use_core.cli:tui_main"
 browser-use-terminal-ui = "browser_use_core.cli:tui_main"
+browser-harness = "browser_use_core.cli:browser_harness_main"
+browser-harness-manager = "browser_use_core.cli:browser_harness_manager_main"
 
 [tool.setuptools.package-dir]
 "" = "src"

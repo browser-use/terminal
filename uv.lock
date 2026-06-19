@@ -63,7 +63,7 @@ requires-dist = [
     { name = "fetch-use", specifier = "==0.4.0" },
     { name = "lxml", specifier = ">=6.1.0" },
     { name = "pandas", specifier = ">=2.3.3" },
-    { name = "pillow", specifier = ">=11.3.0" },
+    { name = "pillow", specifier = "==12.2.0" },
     { name = "pypdf", specifier = ">=6.10.2" },
     { name = "requests", specifier = ">=2.31" },
     { name = "tabulate", specifier = ">=0.9.0" },

@@ -25,6 +25,28 @@ def tui_main() -> None:
     _exec_or_run_from_source("browser-use-tui", "but", sys.argv[1:])
 
 
+def browser_harness_main() -> None:
+    package_python = _package_dir() / "python"
+    source_root = _source_repo_root(_package_dir())
+    if source_root:
+        package_python = source_root / "python"
+    sys.path.insert(0, str(package_python))
+    from browser_harness.run import main as run_browser_harness
+
+    run_browser_harness()
+
+
+def browser_harness_manager_main() -> None:
+    package_python = _package_dir() / "python"
+    source_root = _source_repo_root(_package_dir())
+    if source_root:
+        package_python = source_root / "python"
+    sys.path.insert(0, str(package_python))
+    from browser_harness.manager_daemon import main as run_browser_harness_manager
+
+    run_browser_harness_manager()
+
+
 def _exec_or_run_from_source(package: str, binary: str, args: list[str]) -> None:
     os.environ.setdefault("BROWSER_USE_PYTHON", sys.executable)
     try:

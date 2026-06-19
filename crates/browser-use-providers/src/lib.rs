@@ -5432,10 +5432,6 @@ fn browser_harness_interaction_skills() -> &'static [(&'static str, &'static str
             include_str!("../../../prompts/interaction-skills/dropdowns.md"),
         ),
         (
-            "interaction-skills/forms.md",
-            include_str!("../../../prompts/interaction-skills/forms.md"),
-        ),
-        (
             "interaction-skills/iframes.md",
             include_str!("../../../prompts/interaction-skills/iframes.md"),
         ),
@@ -12409,8 +12405,7 @@ mod tests {
             "interaction-skills/screenshots.md",
             "interaction-skills/tabs.md",
             "interaction-skills/dialogs.md",
-            "interaction-skills/forms.md",
-            "JS may inspect forms; browser input actions mutate forms",
+            "interaction-skills/profile-sync.md",
         ] {
             assert!(
                 instructions.contains(expected),

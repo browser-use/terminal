@@ -75,10 +75,9 @@ fn browser_agent_system_prompt_loads_main_interaction_skills() {
     let prompt = browser_agent_system_prompt();
     assert!(prompt.starts_with(system_prompt()));
     assert!(prompt.contains("Loaded Browser-Harness Interaction Skills"));
-    assert!(prompt.contains("interaction-skills/forms.md"));
     assert!(prompt.contains("interaction-skills/screenshots.md"));
     assert!(prompt.contains("interaction-skills/profile-sync.md"));
-    assert_eq!(browser_harness_interaction_skills().len(), 18);
+    assert_eq!(browser_harness_interaction_skills().len(), 17);
 }
 
 #[test]

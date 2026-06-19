@@ -3503,17 +3503,6 @@ fn python(store: &Store, task_id: &str, code: String) -> Result<()> {
 fn browser_script(store: &Store, task_id: &str, code: String) -> Result<()> {
     let task = ensure_task_exists(store, task_id)?;
     let tool_call_id = format!("browser_script-cli-{task_id}");
-    if let Some(connect_command) = remote_cdp_connect_command_from_env() {
-        let connect = browser_use_browser::run_browser_command(
-            task_id,
-            &task.cwd,
-            &task.artifact_root,
-            &connect_command,
-        )?;
-        if connect.content.get("status").and_then(Value::as_str) != Some("connected") {
-            bail!("browser connect remote-cdp failed: {}", connect.content);
-        }
-    }
     store.append_event(
         task_id,
         "tool.started",
@@ -3523,13 +3512,25 @@ fn browser_script(store: &Store, task_id: &str, code: String) -> Result<()> {
             "arguments": { "code": code.clone() },
         }),
     )?;
-    let response = browser_use_browser::run_browser_script(
+    let shared: SharedStore = Arc::new(Mutex::new(Store::open(store.state_dir())?));
+    let cwd = PathBuf::from(&task.cwd);
+    let artifact_root = PathBuf::from(&task.artifact_root);
+    let response = match browser_use_agent::tools::handlers::browser::run_external_browser_script(
+        &shared,
         task_id,
-        &task.cwd,
-        &task.artifact_root,
+        &cwd,
+        &artifact_root,
         &code,
         30,
-    )?;
+    )? {
+        browser_use_agent::tools::handlers::browser::ExternalBrowserScriptOutcome::Ran(out) => out,
+        browser_use_agent::tools::handlers::browser::ExternalBrowserScriptOutcome::Blocked(
+            content,
+        ) => {
+            println!("{}", serde_json::to_string_pretty(&content)?);
+            bail!("browser needs user action before scripts can run (see JSON above)");
+        }
+    };
     record_browser_script_response_events(store, task_id, &tool_call_id, &response)?;
     if response.ok {
         store.append_event(
@@ -3562,10 +3563,6 @@ fn browser_script(store: &Store, task_id: &str, code: String) -> Result<()> {
 const SKILL_MD: &str = include_str!("../../../SKILL.md");
 const SKILL_DIR_NAME: &str = "browser-use-terminal";
 const EXTERNAL_BROWSER_SESSION_PREFIX: &str = "browser-cli-";
-/// Screenshot downscale ceiling for the external CLI surface. Assistants view
-/// screenshots through their file-read tools, several of which resize or
-/// reject images above ~2000 px per side (Codex `view_image` caps at 2048).
-const EXTERNAL_SCREENSHOT_MAX_DIM: &str = "1800";
 
 /// One parsed `browser` CLI invocation: either Python to exec or a
 /// control-plane command string.
@@ -3576,9 +3573,8 @@ enum ExternalBrowserAction {
 
 /// `browser-use-terminal browser ...`: browser management for external coding
 /// assistants. One-shot invocations run against a durable named session and
-/// route through a long-lived per-state-dir daemon that holds the CDP
-/// connection (so Chrome's per-connection permission prompt fires once, like
-/// the TUI), falling back to in-process execution if the daemon can't start.
+/// call the raw browser-harness-backed handler directly; browser-harness owns
+/// the browser manager, profiles, cloud sessions, and CDP connection.
 fn browser_cli(
     store: Store,
     session: &str,
@@ -3639,29 +3635,6 @@ fn browser_cli(
         }
     };
 
-    if external_browser_daemon_enabled() {
-        match ensure_external_browser_daemon(&state_dir) {
-            Ok(socket) => {
-                drop(store);
-                return browser_cli_via_daemon(
-                    &socket,
-                    &session_id,
-                    &cwd,
-                    &artifact_dir,
-                    timeout,
-                    json,
-                    action,
-                );
-            }
-            Err(error) => {
-                eprintln!(
-                    "warning: browser daemon unavailable ({error:#}); running in-process. \
-                     Local Chrome may re-prompt its debugging permission."
-                );
-            }
-        }
-    }
-    apply_external_browser_env_defaults(&state_dir);
     let shared: SharedStore = Arc::new(Mutex::new(store));
     browser_cli_in_process(
         &shared,
@@ -3672,39 +3645,6 @@ fn browser_cli(
         json,
         action,
     )
-}
-
-/// Persistence + screenshot env defaults shared by the daemon and the
-/// in-process fallback: Rust-owned browsers must survive process exit so
-/// later invocations (or a restarted daemon) reattach instead of relaunching.
-fn apply_external_browser_env_defaults(state_dir: &Path) {
-    unsafe {
-        std::env::set_var("BROWSER_USE_TERMINAL_PERSIST_BROWSERS", "1");
-        if std::env::var_os("BU_EXTERNAL_BROWSER_STATE_DIR").is_none() {
-            std::env::set_var(
-                "BU_EXTERNAL_BROWSER_STATE_DIR",
-                state_dir.join("external-browser"),
-            );
-        }
-        if std::env::var_os("BU_BROWSER_SCREENSHOT_MAX_DIM").is_none()
-            && std::env::var_os("BROWSER_USE_SCREENSHOT_MAX_DIM").is_none()
-        {
-            std::env::set_var("BU_BROWSER_SCREENSHOT_MAX_DIM", EXTERNAL_SCREENSHOT_MAX_DIM);
-        }
-    }
-}
-
-fn external_browser_daemon_enabled() -> bool {
-    if !cfg!(unix) {
-        return false;
-    }
-    match std::env::var("BUT_BROWSER_EXTERNAL_DAEMON") {
-        Ok(value) => !matches!(
-            value.trim().to_ascii_lowercase().as_str(),
-            "0" | "false" | "no" | "off"
-        ),
-        Err(_) => true,
-    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -3887,147 +3827,7 @@ fn external_daemon_send(
     bail!("the external browser daemon is only supported on unix")
 }
 
-/// Ping the daemon; spawn it if missing; restart it on version mismatch so a
-/// CLI update never talks to a stale daemon. Returns the socket path.
-fn ensure_external_browser_daemon(state_dir: &Path) -> Result<PathBuf> {
-    let socket = external_daemon_socket_path(state_dir);
-    let version = env!("CARGO_PKG_VERSION");
-    if let Ok(response) =
-        external_daemon_send(&socket, &ExternalBrowserDaemonRequest::Ping, PING_TIMEOUT)
-    {
-        if response.ok && response.version.as_deref() == Some(version) {
-            return Ok(socket);
-        }
-        let _ = external_daemon_send(
-            &socket,
-            &ExternalBrowserDaemonRequest::Shutdown,
-            PING_TIMEOUT,
-        );
-        let gone_deadline = Instant::now() + Duration::from_secs(5);
-        while Instant::now() < gone_deadline {
-            if external_daemon_send(&socket, &ExternalBrowserDaemonRequest::Ping, PING_TIMEOUT)
-                .is_err()
-            {
-                break;
-            }
-            thread::sleep(Duration::from_millis(100));
-        }
-    }
-    let _ = fs::remove_file(&socket);
-
-    let log_path = external_daemon_log_path(state_dir);
-    if let Some(parent) = log_path.parent() {
-        fs::create_dir_all(parent)
-            .with_context(|| format!("create daemon log dir {}", parent.display()))?;
-    }
-    let log = fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&log_path)
-        .with_context(|| format!("open daemon log {}", log_path.display()))?;
-    let exe = std::env::current_exe().context("resolve current executable")?;
-    let mut command = std::process::Command::new(exe);
-    command
-        .arg("--state-dir")
-        .arg(state_dir)
-        .arg("browser-daemon")
-        .stdin(std::process::Stdio::null())
-        .stdout(log.try_clone().context("clone daemon log handle")?)
-        .stderr(log);
-    #[cfg(unix)]
-    {
-        // New process group: the daemon must survive the assistant's shell
-        // (and any group-wide interrupt) ending this CLI invocation.
-        std::os::unix::process::CommandExt::process_group(&mut command, 0);
-    }
-    command.spawn().context("spawn browser daemon")?;
-
-    let ready_deadline = Instant::now() + Duration::from_secs(10);
-    while Instant::now() < ready_deadline {
-        if let Ok(response) =
-            external_daemon_send(&socket, &ExternalBrowserDaemonRequest::Ping, PING_TIMEOUT)
-        {
-            if response.ok {
-                return Ok(socket);
-            }
-        }
-        thread::sleep(Duration::from_millis(100));
-    }
-    bail!(
-        "browser daemon did not become ready; see {}",
-        log_path.display()
-    )
-}
-
 const PING_TIMEOUT: Duration = Duration::from_secs(3);
-/// Generous request timeout: `browser connect local` can legitimately wait on
-/// the user clicking Allow in Chrome's permission popup.
-const EXTERNAL_DAEMON_COMMAND_TIMEOUT: Duration = Duration::from_secs(900);
-
-#[allow(clippy::too_many_arguments)]
-fn browser_cli_via_daemon(
-    socket: &Path,
-    session_id: &str,
-    cwd: &Path,
-    artifact_dir: &Path,
-    timeout: u64,
-    json: bool,
-    action: ExternalBrowserAction,
-) -> Result<()> {
-    match action {
-        ExternalBrowserAction::Exec { code } => {
-            let response = external_daemon_send(
-                socket,
-                &ExternalBrowserDaemonRequest::Exec {
-                    session_id: session_id.to_string(),
-                    cwd: cwd.to_path_buf(),
-                    artifact_dir: artifact_dir.to_path_buf(),
-                    code,
-                    timeout_secs: timeout,
-                },
-                Duration::from_secs(timeout).saturating_add(EXTERNAL_DAEMON_COMMAND_TIMEOUT),
-            )?;
-            if let Some(blocked) = response.blocked {
-                return print_external_blocked(&blocked);
-            }
-            if !response.ok {
-                bail!(
-                    "{}",
-                    response
-                        .error
-                        .unwrap_or_else(|| "browser daemon request failed".to_string())
-                );
-            }
-            let script = response
-                .script
-                .ok_or_else(|| anyhow::anyhow!("browser daemon returned no script output"))?;
-            print_external_exec_result(&script, json)
-        }
-        ExternalBrowserAction::Command { command } => {
-            let response = external_daemon_send(
-                socket,
-                &ExternalBrowserDaemonRequest::Command {
-                    session_id: session_id.to_string(),
-                    cwd: cwd.to_path_buf(),
-                    artifact_dir: artifact_dir.to_path_buf(),
-                    command,
-                },
-                EXTERNAL_DAEMON_COMMAND_TIMEOUT,
-            )?;
-            if !response.ok {
-                bail!(
-                    "{}",
-                    response
-                        .error
-                        .unwrap_or_else(|| "browser daemon request failed".to_string())
-                );
-            }
-            let content = response.content.unwrap_or(Value::Null);
-            print_external_command_content(&content);
-            Ok(())
-        }
-    }
-}
 
 /// `browser daemon status|stop|logs` — operate the daemon itself.
 fn browser_external_daemon_control(state_dir: &Path, argv: &[String]) -> Result<()> {
@@ -4079,7 +3879,6 @@ fn browser_external_daemon(store: Store) -> Result<()> {
     use std::os::unix::net::UnixListener;
 
     let state_dir = store.state_dir().to_path_buf();
-    apply_external_browser_env_defaults(&state_dir);
     let socket = external_daemon_socket_path(&state_dir);
     let _ = fs::remove_file(&socket);
     let listener = UnixListener::bind(&socket)
@@ -4394,30 +4193,6 @@ fn user_home_dir() -> Result<PathBuf> {
         .or_else(|| std::env::var_os("USERPROFILE").filter(|value| !value.is_empty()))
         .map(PathBuf::from)
         .context("could not resolve the home directory (HOME/USERPROFILE unset)")
-}
-
-fn remote_cdp_connect_command_from_env() -> Option<String> {
-    std::env::var("BU_CDP_WS")
-        .ok()
-        .map(|value| value.trim().to_string())
-        .filter(|value| !value.is_empty())
-        .or_else(|| {
-            std::env::var("BU_CDP_URL")
-                .ok()
-                .map(|value| value.trim().to_string())
-                .filter(|value| !value.is_empty())
-        })
-        .map(|endpoint| {
-            let flag = if endpoint.starts_with("ws://") || endpoint.starts_with("wss://") {
-                "--ws"
-            } else {
-                "--url"
-            };
-            format!(
-                "browser connect remote-cdp {flag} {}",
-                shell_quote_arg(&endpoint)
-            )
-        })
 }
 
 #[derive(Clone, Debug)]

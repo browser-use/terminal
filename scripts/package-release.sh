@@ -47,6 +47,40 @@ trap 'rm -rf "$STAGE"' EXIT
 mkdir -p "$STAGE/$PACKAGE_NAME/bin" "$STAGE/$PACKAGE_NAME/python"
 cp "$BUILD_DIR/but" "$STAGE/$PACKAGE_NAME/bin/but"
 cp "$BUILD_DIR/browser-use-terminal" "$STAGE/$PACKAGE_NAME/bin/browser-use-terminal"
+cat >"$STAGE/$PACKAGE_NAME/bin/browser-harness" <<'EOF'
+#!/bin/sh
+ROOT="$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)"
+export PYTHONPATH="$ROOT/python${PYTHONPATH:+:$PYTHONPATH}"
+if [ -n "${BROWSER_USE_PYTHON:-}" ]; then
+  exec "$BROWSER_USE_PYTHON" -m browser_harness.run "$@"
+fi
+if command -v uv >/dev/null 2>&1; then
+  exec uv run --quiet \
+    --with cdp-use==1.4.5 \
+    --with fetch-use==0.4.0 \
+    --with pillow==12.2.0 \
+    --with websockets==15.0.1 \
+    python -m browser_harness.run "$@"
+fi
+exec python3 -m browser_harness.run "$@"
+EOF
+cat >"$STAGE/$PACKAGE_NAME/bin/browser-harness-manager" <<'EOF'
+#!/bin/sh
+ROOT="$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)"
+export PYTHONPATH="$ROOT/python${PYTHONPATH:+:$PYTHONPATH}"
+if [ -n "${BROWSER_USE_PYTHON:-}" ]; then
+  exec "$BROWSER_USE_PYTHON" -m browser_harness.manager_daemon "$@"
+fi
+if command -v uv >/dev/null 2>&1; then
+  exec uv run --quiet \
+    --with cdp-use==1.4.5 \
+    --with fetch-use==0.4.0 \
+    --with pillow==12.2.0 \
+    --with websockets==15.0.1 \
+    python -m browser_harness.manager_daemon "$@"
+fi
+exec python3 -m browser_harness.manager_daemon "$@"
+EOF
 ln -sf but "$STAGE/$PACKAGE_NAME/bin/browser"
 ln -sf but "$STAGE/$PACKAGE_NAME/bin/browser-use"
 "$ROOT/scripts/install-agent-ripgrep.sh" "$STAGE/$PACKAGE_NAME/bin/agent-tools" "$TARGET_TRIPLE"
@@ -55,7 +89,7 @@ cp -R "$ROOT/python/browser_harness_skill" "$STAGE/$PACKAGE_NAME/python/browser_
 cp -R "$ROOT/python/llm_browser_worker" "$STAGE/$PACKAGE_NAME/python/llm_browser_worker"
 find "$STAGE/$PACKAGE_NAME/python" -type d -name __pycache__ -prune -exec rm -rf {} +
 find "$STAGE/$PACKAGE_NAME/python" -type f -name '*.pyc' -delete
-chmod 0755 "$STAGE/$PACKAGE_NAME/bin/but" "$STAGE/$PACKAGE_NAME/bin/browser-use-terminal"
+chmod 0755 "$STAGE/$PACKAGE_NAME/bin/but" "$STAGE/$PACKAGE_NAME/bin/browser-use-terminal" "$STAGE/$PACKAGE_NAME/bin/browser-harness" "$STAGE/$PACKAGE_NAME/bin/browser-harness-manager"
 
 mkdir -p "$OUT_DIR"
 ARCHIVE="$OUT_DIR/$PACKAGE_NAME-$TARGET_TRIPLE.tar.gz"

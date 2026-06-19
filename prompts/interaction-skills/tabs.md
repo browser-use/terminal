@@ -14,10 +14,6 @@ print(current_tab())
 print(page_info())
 ```
 
-`new_tab(url)` and `goto_url(url)` have zero implicit wait: they send the CDP navigation command and then return without waiting for readyState, network idle, selectors, paint, or sleeps.
-If you chain more work in the same script after navigation, explicitly wait or poll before reading/clicking.
-If navigation is the last action before yielding to the model, the LLM call itself may provide enough elapsed time; the next call must still inspect state before assuming the page loaded.
-
 What CDP is good at:
 - attach to a tab
 - open a tab
