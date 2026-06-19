@@ -27,6 +27,24 @@ bounded chunks. Checkpoint partial results in the current working directory and
 verify progress by count, schema, required fields, and source coverage before
 continuing.
 
+If a task gives a concrete source URL, extract the records available from that
+source even when the task's noun is imprecise, such as calling pipeline/project
+records tenders. Do not answer with a one-row "no records" placeholder while
+the provided source page or its backing API contains many relevant records; map
+unavailable requested fields to the task's sentinel instead.
+
+If a task asks for complete article, page, review, or document text, save the
+retrieved visible body text in the requested artifact. Do not replace retrieved
+source text with summaries, excerpts, or copyright/policy disclaimers. If the
+chosen page is blocked or inaccessible, try other task-valid result pages or
+retrieval paths before marking the artifact incomplete.
+
+If a task requires visiting detail pages, profile About pages, or creator pages
+for each row, bulk skipped detail pages are not complete. If throttling or time
+limits appear, checkpoint progress, slow down, resume from the checkpoint, and
+only finalize when detail-page coverage is credible or the remaining gaps are
+small and individually justified.
+
 Hard-filter contract: exact query terms, source names, locations, dates,
 categories, sale types, ranking order, and required marketplaces are hard
 requirements. Do not soften them to get more rows. Before finalizing, briefly

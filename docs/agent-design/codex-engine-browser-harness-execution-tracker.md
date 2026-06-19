@@ -431,11 +431,31 @@ Latest checkpoint:
   - Creator website fields can be `N/A` only when individually unavailable;
     declared bulk creator About-page fetch incompleteness is blocked.
   - Focused runs now pass the effective expected total into judge prep.
+- Focused rerun 2:
+  - root:
+    `/home/exedev/eval-runs/ibh-focused-remaining-prompt-20260619`
+  - task ids: `zcotoh`, `v18kgy`, `82kkzm`
+  - runner: `3/3`
+  - strict fallback judge: `2/3`
+  - passed: `82kkzm`, `zcotoh`
+  - failed: `v18kgy`
+  - mechanical completion audit with `--require-judged`: passed.
+  - caveat: Claude print-mode judging returned `401 Invalid authentication
+    credentials`; one Codex subagent judged the single packet chunk with the
+    saved rubric/schema.
+- Latest prompt/audit refinements:
+  - The dataset prompt now tells the agent to extract concrete source records
+    even when the task noun is imprecise.
+  - The dataset prompt now tells the agent to save visible article body text
+    when complete article/page text is requested.
+  - The dataset prompt now calls bulk skipped detail/profile/About pages
+    incomplete.
+  - `artifact-audit` now rejects bounded two-page Kickstarter/Gamefound samples
+    when the task requires broad paginated upcoming marketplace coverage.
 
 Next concrete action:
 
-1. Rebuild and rerun the remaining focused subset:
-   `zcotoh`, `v18kgy`, `82kkzm`.
+1. Rebuild and rerun/fix the remaining focused task: `v18kgy`.
 2. Decide whether `jgzlma` should be rerun with a larger one-task safety cap or
    treated as an acceptable eval-runner guard failure.
 3. Verify the remaining unchecked TUI/SDK product gates before claiming the full

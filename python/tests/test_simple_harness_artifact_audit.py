@@ -384,6 +384,45 @@ def test_artifact_audit_rejects_creator_about_fetch_incomplete(tmp_path: Path) -
     assert "creator About-page website extraction skipped 2443 creator profiles" in audit.stdout
 
 
+def test_artifact_audit_rejects_bounded_upcoming_marketplace_sample(tmp_path: Path) -> None:
+    (tmp_path / "result.json").write_text(
+        json.dumps(
+            {
+                "metadata": {
+                    "kickstarter_pages_fetched": 2,
+                    "kickstarter_total_pages_available": 220,
+                    "kickstarter_total_hits_reported": 2640,
+                    "gamefound_pages_fetched": 2,
+                    "gamefound_total_pages_available": 21,
+                    "gamefound_total_hits_reported": 491,
+                    "row_count": 72,
+                    "scope_warning": "Default run is bounded to two newest pages per platform. Re-run with --all to attempt all pages.",
+                },
+                "rows": [
+                    {
+                        "Platform": "Kickstarter",
+                        "Game Name": f"Game {index}",
+                        "Game URL": f"https://example.com/project/{index}",
+                        "Description": "Upcoming tabletop game",
+                        "Date Added": "2026-06-19",
+                        "Creator Websites": ["N/A"],
+                    }
+                    for index in range(72)
+                ],
+            }
+        )
+    )
+
+    audit = run_audit(
+        tmp_path,
+        "Create an automated report that compiles upcoming tabletop game projects from Kickstarter and Gamefound into a spreadsheet. Implement pagination handling.",
+    )
+
+    assert audit.returncode == 2
+    assert "upcoming marketplace report is explicitly bounded" in audit.stdout
+    assert "kickstarter pagination incomplete" in audit.stdout
+
+
 def test_artifact_audit_rejects_eib_pipeline_no_tenders_answer(tmp_path: Path) -> None:
     (tmp_path / "result.json").write_text(
         json.dumps(

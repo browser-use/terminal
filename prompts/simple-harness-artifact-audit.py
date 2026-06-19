@@ -229,6 +229,7 @@ def audit_expected_groups(path, rows, doc, task):
     issues.extend(audit_ungm_it_scope(path, doc, lower_task))
     issues.extend(audit_eib_pipeline_scope(path, rows, doc, lower_task))
     issues.extend(audit_creator_website_fetch_completeness(path, doc, lower_task))
+    issues.extend(audit_upcoming_tabletop_report_scope(path, rows, doc, lower_task))
 
     return issues
 
@@ -536,6 +537,46 @@ def audit_creator_website_fetch_completeness(path, doc, lower_task):
     lower_text = json.dumps(doc, ensure_ascii=False).lower()
     if "profile_about_fetch_incomplete" in lower_text or "about-page fetching was stopped" in lower_text:
         issues.append(f"{path}: creator About-page website extraction is self-marked incomplete")
+    return issues
+
+
+def audit_upcoming_tabletop_report_scope(path, rows, doc, lower_task):
+    if "kickstarter" not in lower_task or "gamefound" not in lower_task:
+        return []
+    if "upcoming" not in lower_task or "pagination" not in lower_task:
+        return []
+
+    lower_text = json.dumps(doc, ensure_ascii=False).lower()
+    issues = []
+    row_count = len(rows)
+    if isinstance(doc, dict):
+        metadata = doc.get("metadata")
+        if isinstance(metadata, dict):
+            raw_row_count = metadata.get("row_count")
+            if isinstance(raw_row_count, int):
+                row_count = raw_row_count
+            if "bounded to two" in str(metadata.get("scope_warning", "")).lower():
+                issues.append(f"{path}: upcoming marketplace report is explicitly bounded to a small page sample")
+
+            for platform in ("kickstarter", "gamefound"):
+                fetched = metadata.get(f"{platform}_pages_fetched")
+                available = metadata.get(f"{platform}_total_pages_available")
+                total_hits = metadata.get(f"{platform}_total_hits_reported")
+                if (
+                    isinstance(fetched, int)
+                    and isinstance(available, int)
+                    and available > fetched
+                    and isinstance(total_hits, int)
+                    and total_hits > row_count
+                ):
+                    issues.append(
+                        f"{path}: {platform} pagination incomplete ({fetched}/{available} pages fetched)"
+                    )
+
+    if "run with --all" in lower_text or "attempt every available page" in lower_text:
+        issues.append(f"{path}: artifact/final metadata says full pagination requires a separate --all rerun")
+    if row_count and row_count < 500:
+        issues.append(f"{path}: upcoming marketplace report has only {row_count} rows despite broad paginated sources")
     return issues
 
 

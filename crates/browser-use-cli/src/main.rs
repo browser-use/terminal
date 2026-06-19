@@ -13189,6 +13189,9 @@ command = "test-mcp"
         assert!(simple_prompt.contains("Prefer the heredoc form"));
         assert!(simple_prompt.contains("Hard-filter contract"));
         assert!(simple_prompt.contains("Required-field contract"));
+        assert!(simple_prompt.contains("task's noun is imprecise"));
+        assert!(simple_prompt.contains("retrieved visible body text"));
+        assert!(simple_prompt.contains("bulk skipped detail pages are not complete"));
         assert!(simple_prompt.contains("artifact-audit"));
         assert!(!simple_prompt.contains("browser_script"));
         assert!(!simple_prompt.contains("done("));
@@ -13226,6 +13229,9 @@ command = "test-mcp"
         assert!(text.contains("Prefer the heredoc form"));
         assert!(text.contains("Hard-filter contract"));
         assert!(text.contains("Required-field contract"));
+        assert!(text.contains("task's noun is imprecise"));
+        assert!(text.contains("retrieved visible body text"));
+        assert!(text.contains("bulk skipped detail pages are not complete"));
         assert!(text.contains("artifact-audit"));
         assert!(!text.contains("browser_script"));
         assert!(!text.contains("done("));

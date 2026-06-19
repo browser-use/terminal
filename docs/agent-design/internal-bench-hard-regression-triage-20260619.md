@@ -136,3 +136,50 @@ zcotoh v18kgy 82kkzm
 
 After these pass a focused judge, rerun the full 106-task Internal_Bench_hard
 path and compare against the raw Codex + browser-harness reference.
+
+## Focused Rerun 2
+
+Prompt/audit changes before this run:
+
+- Dataset prompt now tells the agent to extract concrete source records even
+  when the task's noun is imprecise, rather than answering with a one-row no
+  records placeholder.
+- Dataset prompt now tells the agent to save visible article body text when
+  complete article/page text is requested, rather than substituting summaries or
+  policy disclaimers.
+- Dataset prompt now calls bulk skipped detail/profile/About pages incomplete.
+- Audit now rejects small bounded Kickstarter/Gamefound pagination samples when
+  the task asks for broad upcoming marketplace coverage with pagination.
+
+Run:
+
+- run root: `/home/exedev/eval-runs/ibh-focused-remaining-prompt-20260619`
+- run id: `ibh-focused-remaining-prompt-20260619`
+- task ids: `zcotoh`, `v18kgy`, `82kkzm`
+- runner: `3/3`
+- strict judge: `2/3`
+- judge aggregate:
+  `/home/exedev/eval-runs/ibh-focused-remaining-prompt-20260619/judge/judge_aggregate.json`
+- comparison:
+  `/home/exedev/eval-runs/ibh-focused-remaining-prompt-20260619/current-vs-raw-judged-delta.md`
+- mechanical completion audit with `--require-judged`: passed.
+- Claude judge caveat: Claude print mode still returned `401 Invalid
+  authentication credentials`, so the single chunk was judged by one Codex
+  subagent with the saved rubric and schema.
+
+Focused judgments:
+
+| Task | Strict result | Notes |
+| --- | --- | --- |
+| `82kkzm` | Pass | The agent saved five Google News article records with retrieved visible article text instead of `N/A`/summaries. |
+| `zcotoh` | Pass | The agent extracted 1,033 EIB pipeline records and mapped unavailable tender-specific fields to `N/A`. |
+| `v18kgy` | Fail | The agent produced a real workbook, but only 72 rows from 2 Kickstarter pages and 2 Gamefound pages despite metadata showing 220 Kickstarter pages and 21 Gamefound pages available. |
+
+Current focused status:
+
+- Fixed under focused judge: `m5zja8`, `82kkzm`, `zcotoh`.
+- Still failing: `v18kgy`.
+- Next targeted fix: force the upcoming Kickstarter/Gamefound report to use the
+  unbounded/all-pages scraper path or fail audit before finalizing. The current
+  artifact itself says to rerun with `--all`, so this is model behavior and audit
+  discipline, not a browser-harness capability gap.
