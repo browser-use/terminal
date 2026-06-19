@@ -278,6 +278,14 @@ Gate 7 attempt log:
   workers needs a higher limit.
 - Fix: the eval runner now raises `ulimit -n` up to `ULIMIT_NOFILE`, capped by
   the shell hard limit, and records the actual limit in `run-env.txt`.
+- Aborted run:
+  `/home/exedev/eval-runs/ibh-simple-harness-openai-simple-harness-parity-test-20260618-20260619-031849`.
+- Reason: task `he7ur2` hit `Codex app-server event stream lagged by 3 events`
+  during a very large trace. Lossless event capture is required for judged
+  evals, so lag remains terminal.
+- Fix: the embedded CodexEngine in-process app-server channel capacity is now
+  65,536 events instead of 1,024, matching the high-throughput eval path rather
+  than the small default transport path.
 
 ## Stop Conditions
 

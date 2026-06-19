@@ -35,6 +35,8 @@ use crate::CodexTerminalOutcome;
 use crate::CodexThreadStartSpec;
 use crate::CodexTurnStartSpec;
 
+const CODEX_ENGINE_CHANNEL_CAPACITY: usize = 65_536;
+
 #[derive(Clone, Debug)]
 pub struct CodexEngineRunSpec {
     pub session_id: String,
@@ -222,7 +224,7 @@ async fn start_in_process_client(codex_home: Option<&Path>) -> Result<InProcessA
         client_version: env!("CARGO_PKG_VERSION").to_string(),
         experimental_api: true,
         opt_out_notification_methods: Vec::new(),
-        channel_capacity: 1024,
+        channel_capacity: CODEX_ENGINE_CHANNEL_CAPACITY,
     })
     .await
     .map_err(Into::into)
@@ -311,5 +313,10 @@ mod tests {
             codex_app_server_protocol::ThreadStartParams::default().with_cautious_eval_defaults();
         assert_eq!(params.approval_policy, Some(AskForApproval::Never));
         assert_eq!(params.sandbox, Some(SandboxMode::DangerFullAccess));
+    }
+
+    #[test]
+    fn event_channel_capacity_is_large_enough_for_eval_traces() {
+        assert!(CODEX_ENGINE_CHANNEL_CAPACITY >= 32_768);
     }
 }
