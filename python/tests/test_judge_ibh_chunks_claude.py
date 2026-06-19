@@ -85,7 +85,7 @@ def test_judge_runner_writes_validated_chunks_with_fake_claude(tmp_path: Path) -
 import json
 import re
 import sys
-prompt = sys.argv[-1]
+prompt = sys.stdin.read() or sys.argv[-1]
 match = re.search(r"(/\\S*packets_[0-9_]+\\.json)", prompt)
 packet_path = match.group(0)
 with open(packet_path) as handle:

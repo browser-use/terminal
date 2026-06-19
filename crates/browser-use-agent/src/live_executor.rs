@@ -618,6 +618,9 @@ fn prompt_text_from_event(event: &EventRecord) -> Option<String> {
 }
 
 fn codex_model_provider_id(config: &ProviderRunConfig) -> String {
+    if config.backend == ProviderBackend::Codex {
+        return "openai".to_string();
+    }
     if let Some(provider_id) = config
         .options
         .model_provider_id
@@ -629,7 +632,7 @@ fn codex_model_provider_id(config: &ProviderRunConfig) -> String {
         return provider_id.to_string();
     }
     match config.backend {
-        ProviderBackend::Codex => "codex",
+        ProviderBackend::Codex => "openai",
         ProviderBackend::Openai => OPENAI_API_PROVIDER_ID,
         ProviderBackend::BrowserUse => "browser-use",
         ProviderBackend::Anthropic => "anthropic",
@@ -888,6 +891,26 @@ mod tests {
         let persistence: Arc<dyn LiveThreadPersistence> = journal.clone();
         let state_index: Arc<dyn StateIndex> = journal;
         BrowserUseRuntime::new(persistence, state_index).handle()
+    }
+
+    #[test]
+    fn codex_engine_model_provider_ids_match_codex_app_server() {
+        let codex_config = ProviderRunConfig::new(ProviderBackend::Codex, "gpt-5.1-codex")
+            .with_options(AgentRunOptions::default().with_model_provider_id("codex"));
+        assert_eq!(codex_model_provider_id(&codex_config), "openai");
+
+        let openai_config = ProviderRunConfig::new(ProviderBackend::Openai, "gpt-5.5");
+        assert_eq!(
+            codex_model_provider_id(&openai_config),
+            OPENAI_API_PROVIDER_ID
+        );
+
+        let explicit_openai_config = ProviderRunConfig::new(ProviderBackend::Openai, "gpt-5.5")
+            .with_options(AgentRunOptions::default().with_model_provider_id("custom-openai"));
+        assert_eq!(
+            codex_model_provider_id(&explicit_openai_config),
+            "custom-openai"
+        );
     }
 
     #[test]

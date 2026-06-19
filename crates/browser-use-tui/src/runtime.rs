@@ -1178,6 +1178,7 @@ mod tests {
         .unwrap();
         assert_eq!(options.browser_mode.as_deref(), Some("local"));
         assert!(options.simple_harness);
+        assert!(options.codex_engine);
         assert!(!options.dynamic_browser_mode_from_store);
         assert!(options.python_env.is_empty());
     }
@@ -1208,6 +1209,7 @@ mod tests {
             Some("Google Chrome")
         );
         assert!(options.simple_harness);
+        assert!(options.codex_engine);
         assert!(!options.dynamic_browser_mode_from_store);
     }
 
@@ -1228,6 +1230,7 @@ mod tests {
         .unwrap();
         assert_eq!(options.browser_mode.as_deref(), Some("managed-headless"));
         assert!(options.simple_harness);
+        assert!(options.codex_engine);
         assert!(!options.dynamic_browser_mode_from_store);
         assert!(options.python_env.is_empty());
     }
@@ -1268,6 +1271,7 @@ mod tests {
         .unwrap();
         assert_eq!(options.browser_mode.as_deref(), Some("cloud"));
         assert!(options.simple_harness);
+        assert!(options.codex_engine);
         assert!(!options.dynamic_browser_mode_from_store);
         assert!(options.python_env.is_empty());
     }
@@ -1293,6 +1297,7 @@ mod tests {
             Some("bu-test")
         );
         assert!(options.simple_harness);
+        assert!(options.codex_engine);
     }
 
     #[test]
@@ -1564,6 +1569,7 @@ mod tests {
         .unwrap();
         assert_eq!(options.browser_mode.as_deref(), Some("local"));
         assert_eq!(options.model_provider_id, None);
+        assert!(options.codex_engine);
     }
 
     #[test]
@@ -1589,6 +1595,7 @@ mod tests {
 
         assert_eq!(options.config_profile.as_deref(), Some("work"));
         assert!(options.simple_harness);
+        assert!(options.codex_engine);
         assert_eq!(
             options.developer_instructions.as_deref(),
             Some("Stay precise.")

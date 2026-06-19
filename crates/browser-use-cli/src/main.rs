@@ -285,12 +285,12 @@ enum Command {
     /// (`auth login codex` / `auth import-codex`).
     RunCodex {
         text: String,
-        #[arg(long, default_value = "gpt-5.1-codex")]
+        #[arg(long, default_value = "gpt-5.5")]
         model: String,
     },
     RunCodexSession {
         task_id: String,
-        #[arg(long, default_value = "gpt-5.1-codex")]
+        #[arg(long, default_value = "gpt-5.5")]
         model: String,
     },
     RunOpenaiSession {
@@ -589,7 +589,7 @@ enum Command {
         task_ids: Vec<String>,
         #[arg(long)]
         all: bool,
-        #[arg(long, default_value = "gpt-5.1-codex")]
+        #[arg(long, default_value = "gpt-5.5")]
         model: String,
         #[arg(long, default_value_t = DATASET_PROVIDER_DEFAULT_MAX_TURNS)]
         max_turns: usize,
@@ -8059,6 +8059,25 @@ fn sdk_run_agent_with_runtime(
     initial_input: Option<Value>,
     mut config: ProviderRunConfig,
 ) -> Result<()> {
+    if sdk_should_run_via_codex_executor(&config) {
+        let runtime = context.runtime.clone();
+        let state_dir = {
+            let store = context.store.lock().expect("sdk store mutex poisoned");
+            store.state_dir().to_path_buf()
+        };
+        let store = Store::open(&state_dir)?;
+        let _local_runtime_server =
+            CliLocalRuntimeServer::ensure_for_state_dir(&state_dir, &runtime)?;
+        let executor = cli_runtime_agent_executor(&store, runtime)?;
+        attach_cli_child_agent_runner(&store, executor.clone(), &mut config);
+        let mut request = RuntimeAgentRunRequest::new(session_id.as_str().to_string(), config);
+        if let Some(browser_id) = browser_id {
+            request = request.with_browser_id(browser_id);
+        }
+        executor.run_blocking(request)?;
+        return Ok(());
+    }
+
     let runtime = context.runtime.clone();
     attach_sdk_child_agent_runner(context, &mut config)?;
     let driver_runtime = runtime.clone();
@@ -8109,6 +8128,10 @@ fn sdk_run_agent_with_runtime(
             .await?;
         Ok::<(), anyhow::Error>(())
     })
+}
+
+fn sdk_should_run_via_codex_executor(config: &ProviderRunConfig) -> bool {
+    config.options.codex_engine && config.backend != ProviderBackend::Fake
 }
 
 fn attach_sdk_child_agent_runner(
@@ -12239,6 +12262,8 @@ command = "test-mcp"
             &context,
         )?;
         assert_eq!(config.options.browser_mode.as_deref(), Some("local"));
+        assert!(config.options.simple_harness);
+        assert!(config.options.codex_engine);
         assert_eq!(
             config.options.browser_profile_id.as_deref(),
             Some("brave:Default")
@@ -12267,6 +12292,8 @@ command = "test-mcp"
             explicit_remote.options.browser_mode.as_deref(),
             Some("remote-cdp")
         );
+        assert!(explicit_remote.options.simple_harness);
+        assert!(explicit_remote.options.codex_engine);
         assert_eq!(explicit_remote.options.browser_profile_id, None);
         assert_eq!(explicit_remote.options.browser_local_browser, None);
 
@@ -12296,6 +12323,8 @@ command = "test-mcp"
         )?;
 
         assert_eq!(config.options.browser_mode.as_deref(), Some("cloud"));
+        assert!(config.options.simple_harness);
+        assert!(config.options.codex_engine);
         assert!(config.options.python_env.iter().any(|(key, value)| {
             key == BROWSER_USE_CLOUD_API_KEY_ENV && !value.trim().is_empty()
         }));
@@ -12343,6 +12372,8 @@ command = "test-mcp"
         }
 
         assert_eq!(config.options.browser_mode.as_deref(), Some("cloud"));
+        assert!(config.options.simple_harness);
+        assert!(config.options.codex_engine);
         assert!(config.options.python_env.iter().any(|(key, value)| {
             key == BROWSER_USE_CLOUD_API_KEY_ENV && value == "bu-default-key"
         }));
@@ -12383,6 +12414,7 @@ command = "test-mcp"
         assert_eq!(config.model, "claude-sonnet-4-6");
         assert_eq!(config.options.max_turns, 12);
         assert!(config.options.simple_harness);
+        assert!(config.options.codex_engine);
         assert_eq!(config.options.browser_mode.as_deref(), Some("remote-cdp"));
         assert_eq!(
             config.options.final_output_json_schema,
@@ -12465,6 +12497,47 @@ command = "test-mcp"
         let config = sdk_provider_run_config(&params, Some("inspect"), None, None, &context)?;
 
         assert!(!config.options.simple_harness);
+        assert!(!config.options.codex_engine);
+        Ok(())
+    }
+
+    #[test]
+    fn sdk_real_providers_route_through_codex_executor() -> Result<()> {
+        let context = SdkServerContext::memory()?;
+        let openai = sdk_provider_run_config(
+            &serde_json::json!({
+                "task": "inspect",
+                "llm": {"provider": "openai", "model": "gpt-5.5"}
+            }),
+            Some("inspect"),
+            None,
+            None,
+            &context,
+        )?;
+        let anthropic = sdk_provider_run_config(
+            &serde_json::json!({
+                "task": "inspect",
+                "llm": {"provider": "anthropic", "model": "claude-sonnet-4-6"}
+            }),
+            Some("inspect"),
+            None,
+            None,
+            &context,
+        )?;
+        let fake = sdk_provider_run_config(
+            &serde_json::json!({
+                "task": "inspect",
+                "llm": {"provider": "fake", "model": "fake"}
+            }),
+            Some("inspect"),
+            None,
+            None,
+            &context,
+        )?;
+
+        assert!(sdk_should_run_via_codex_executor(&openai));
+        assert!(sdk_should_run_via_codex_executor(&anthropic));
+        assert!(!sdk_should_run_via_codex_executor(&fake));
         Ok(())
     }
 

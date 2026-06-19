@@ -232,7 +232,7 @@ import json
 import re
 import sys
 
-prompt = sys.argv[-1]
+prompt = sys.stdin.read() or sys.argv[-1]
 match = re.search(r"(/\\S*packets_[0-9_]+\\.json)", prompt)
 if not match:
     raise SystemExit("packet path not found in prompt")
