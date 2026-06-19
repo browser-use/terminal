@@ -212,22 +212,29 @@ impl CodexEventMapper {
                     terminal,
                 }
             }
-            ServerNotification::Error(payload) => CodexMappedEvent {
-                projected: vec![CodexProjectedEvent::new(
-                    "model.turn.error",
-                    json!({
-                        "error": payload.error.message,
-                        "additional_details": payload.error.additional_details,
-                        "will_retry": payload.will_retry,
-                        "thread_id": payload.thread_id,
-                        "turn_id": payload.turn_id,
-                        "source": "codex_app_server",
-                    }),
-                )],
-                terminal: Some(CodexTerminalOutcome::Failed {
-                    error: payload.error.message,
-                }),
-            },
+            ServerNotification::Error(payload) => {
+                let terminal = if payload.will_retry {
+                    None
+                } else {
+                    Some(CodexTerminalOutcome::Failed {
+                        error: payload.error.message.clone(),
+                    })
+                };
+                CodexMappedEvent {
+                    projected: vec![CodexProjectedEvent::new(
+                        "model.turn.error",
+                        json!({
+                            "error": payload.error.message,
+                            "additional_details": payload.error.additional_details,
+                            "will_retry": payload.will_retry,
+                            "thread_id": payload.thread_id,
+                            "turn_id": payload.turn_id,
+                            "source": "codex_app_server",
+                        }),
+                    )],
+                    terminal,
+                }
+            }
             other => CodexMappedEvent {
                 projected: vec![CodexProjectedEvent::new(
                     "codex.notification",
@@ -329,8 +336,8 @@ impl CodexEventMapper {
 mod tests {
     use super::*;
     use codex_app_server_protocol::{
-        AgentMessageDeltaNotification, ItemCompletedNotification,
-        RawResponseItemCompletedNotification, ThreadItem, TurnCompletedNotification,
+        AgentMessageDeltaNotification, ErrorNotification, ItemCompletedNotification,
+        RawResponseItemCompletedNotification, ThreadItem, TurnCompletedNotification, TurnError,
     };
     use serde_json::json;
 
@@ -469,6 +476,48 @@ mod tests {
         assert_eq!(
             mapped.projected[0].payload["item"]["content"][0]["text"],
             json!("grounded value")
+        );
+    }
+
+    #[test]
+    fn retryable_error_notification_is_not_terminal() {
+        let mut mapper = CodexEventMapper::new();
+        let mapped = mapper.map_server_notification(ServerNotification::Error(ErrorNotification {
+            error: TurnError {
+                message: "Reconnecting... 1/5".to_string(),
+                codex_error_info: None,
+                additional_details: Some("transient stream disconnect".to_string()),
+            },
+            will_retry: true,
+            thread_id: "thread-1".to_string(),
+            turn_id: "turn-1".to_string(),
+        }));
+
+        assert_eq!(mapped.projected[0].event_type, "model.turn.error");
+        assert_eq!(mapped.projected[0].payload["will_retry"], json!(true));
+        assert_eq!(mapped.terminal, None);
+    }
+
+    #[test]
+    fn non_retryable_error_notification_is_terminal() {
+        let mut mapper = CodexEventMapper::new();
+        let mapped = mapper.map_server_notification(ServerNotification::Error(ErrorNotification {
+            error: TurnError {
+                message: "fatal provider error".to_string(),
+                codex_error_info: None,
+                additional_details: None,
+            },
+            will_retry: false,
+            thread_id: "thread-1".to_string(),
+            turn_id: "turn-1".to_string(),
+        }));
+
+        assert_eq!(mapped.projected[0].event_type, "model.turn.error");
+        assert_eq!(
+            mapped.terminal,
+            Some(CodexTerminalOutcome::Failed {
+                error: "fatal provider error".to_string()
+            })
         );
     }
 }

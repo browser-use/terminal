@@ -256,6 +256,21 @@ Gate 5 verification:
 - [ ] Score is `>= 93/106` or within 3 tasks of fresh raw reference.
 - [ ] Every remaining failure has a code/evidence/root-cause classification.
 
+Gate 7 attempt log:
+
+- Aborted run:
+  `/home/exedev/eval-runs/ibh-simple-harness-openai-simple-harness-parity-test-20260618-20260619-025439`.
+- Reason: implementation bug found before enough completions to score. Codex
+  emitted a retryable app-server `error` notification with `willRetry=true`
+  (`Reconnecting... 1/5` after a transient stream disconnect), but
+  `CodexEventMapper` incorrectly treated all `error` notifications as terminal
+  failures.
+- Fix: retryable Codex app-server errors are now projected as
+  `model.turn.error` evidence but do not abort the Browser Use session;
+  non-retryable errors remain terminal.
+- Regression coverage:
+  `cargo test -p browser-use-codex-engine`.
+
 ## Stop Conditions
 
 Stop and do not claim completion if any of these occur:
