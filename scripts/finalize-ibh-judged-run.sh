@@ -14,6 +14,9 @@ Usage:
                                             [--reference-aggregate FILE]
                                             [--out FILE]
                                             [--expected-total N]
+                                            [--current-expected-total N]
+                                            [--reference-expected-total N]
+                                            [--task-id ID ...]
 USAGE
 }
 
@@ -23,10 +26,13 @@ cd "$REPO_ROOT"
 
 REFERENCE_AGGREGATE="${REFERENCE_AGGREGATE:-/home/exedev/eval-runs/ibh-purecodex-175254-rejudge-jsonl-20260613/judge_aggregate.json}"
 EXPECTED_TOTAL="${EXPECTED_TOTAL:-106}"
+CURRENT_EXPECTED_TOTAL=""
+REFERENCE_EXPECTED_TOTAL=""
 RUN_ROOT=""
 RUN_ID=""
 JUDGE_DIR=""
 OUT=""
+TASK_IDS=()
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -52,6 +58,18 @@ while [[ $# -gt 0 ]]; do
       ;;
     --expected-total)
       EXPECTED_TOTAL="${2:?--expected-total requires a value}"
+      shift 2
+      ;;
+    --current-expected-total)
+      CURRENT_EXPECTED_TOTAL="${2:?--current-expected-total requires a value}"
+      shift 2
+      ;;
+    --reference-expected-total)
+      REFERENCE_EXPECTED_TOTAL="${2:?--reference-expected-total requires a value}"
+      shift 2
+      ;;
+    --task-id)
+      TASK_IDS+=("${2:?--task-id requires a value}")
       shift 2
       ;;
     -h|--help)
@@ -81,6 +99,8 @@ RUN_ROOT="$(cd "$RUN_ROOT" && pwd)"
 RUN_ID="${RUN_ID:-$(basename "$RUN_ROOT")}"
 JUDGE_DIR="${JUDGE_DIR:-$RUN_ROOT/judge}"
 OUT="${OUT:-$RUN_ROOT/current-vs-raw-judged-delta.md}"
+CURRENT_EXPECTED_TOTAL="${CURRENT_EXPECTED_TOTAL:-$EXPECTED_TOTAL}"
+REFERENCE_EXPECTED_TOTAL="${REFERENCE_EXPECTED_TOTAL:-$EXPECTED_TOTAL}"
 
 if [[ ! -d "$JUDGE_DIR" ]]; then
   echo "judge dir not found: $JUDGE_DIR" >&2
@@ -95,15 +115,28 @@ fi
 "$REPO_ROOT/scripts/aggregate-ibh-judgments.py" "$JUDGE_DIR" \
   --run-root "$RUN_ROOT" \
   --run-id "$RUN_ID" \
-  --expected-total "$EXPECTED_TOTAL"
+  --expected-total "$CURRENT_EXPECTED_TOTAL"
 
-"$REPO_ROOT/scripts/compare-judged-runs.py" \
-  --current-aggregate "$JUDGE_DIR/judge_aggregate.json" \
-  --reference-aggregate "$REFERENCE_AGGREGATE" \
-  --current-label "$RUN_ID" \
-  --reference-label raw-codex-browser-harness-96 \
-  --expected-total "$EXPECTED_TOTAL" \
+compare_args=(
+  "$REPO_ROOT/scripts/compare-judged-runs.py"
+  --current-aggregate "$JUDGE_DIR/judge_aggregate.json"
+  --reference-aggregate "$REFERENCE_AGGREGATE"
+  --current-label "$RUN_ID"
+  --reference-label raw-codex-browser-harness-96
+  --current-expected-total "$CURRENT_EXPECTED_TOTAL"
+  --reference-expected-total "$REFERENCE_EXPECTED_TOTAL"
   --out "$OUT"
+)
+
+if [[ "${#TASK_IDS[@]}" -gt 0 ]]; then
+  for task_id in "${TASK_IDS[@]}"; do
+    compare_args+=(--task-id "$task_id")
+  done
+else
+  compare_args+=(--expected-total "$EXPECTED_TOTAL")
+fi
+
+"${compare_args[@]}"
 
 jq -r '
   "score=\(.passed)/\(.expected_total) failed=\(.failed) failed_ids=\(.failed_ids | join(","))"

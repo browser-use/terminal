@@ -49,6 +49,12 @@ incompleteness, fix the file and rerun the audit when possible. If the source
 is genuinely blocked or insufficient, final output must explicitly mark the
 result incomplete and name the missing requirements.
 
+If the task explicitly tells you to use `N/A`, `unknown`, or another sentinel
+for unavailable fields, do not mark an otherwise complete artifact incomplete
+solely because those unavailable fields remain sentinel values. Keep the exact
+requested rows/records, use the requested sentinel, and explain the source
+limitation in the artifact or final answer.
+
 Completion discipline: complete the requested task before finalizing. Do not
 present a partial result as complete. If the source is blocked or insufficient,
 say exactly what was checked and what remains unknown.

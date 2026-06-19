@@ -390,9 +390,35 @@ Stop and do not claim completion if any of these occur:
 
 Active phase: post-Gate-7 regression triage.
 
+Latest checkpoint:
+
+- Regression triage report:
+  `docs/agent-design/internal-bench-hard-regression-triage-20260619.md`
+- Implemented artifact-audit and prompt fixes for four judged regressions:
+  - `zcotoh`: task-allowed `N/A` fields no longer force an incomplete result.
+  - `82kkzm`: self-withheld/missing complete article text is blocked.
+  - `m5zja8`: likely non-IT UNGM rows are blocked as scope drift.
+  - `v18kgy`: `complete: false`, `is_complete: false`, and
+    `ready_for_done: false` are blocked.
+- Added `--task-id ID` support to
+  `scripts/run-internal-bench-hard-openai.sh` for focused reruns using the same
+  CodexEngine/simple-harness path as the full run.
+- Added subset-aware finalization/comparison while preserving the default
+  full-run `106` task validation.
+- Verification:
+  - `python3 -m py_compile prompts/simple-harness-artifact-audit.py scripts/compare-judged-runs.py scripts/audit-ibh-run-completion.py`
+  - `bash -n scripts/run-internal-bench-hard-openai.sh scripts/finalize-ibh-judged-run.sh`
+  - `uv run --with pytest python -m pytest -q python/tests/test_simple_harness_artifact_audit.py`
+  - targeted dry-run: `EXPECTED_TOTAL=4`, task ids
+    `zcotoh,m5zja8,v18kgy,82kkzm`
+  - full dry-run still uses `--all` and `EXPECTED_TOTAL=106`
+  - existing full judged run finalizes successfully at `91/106` with no
+    validation errors.
+
 Next concrete action:
 
-1. Triage the 10 current-only regressions against the raw Codex reference.
+1. Run and judge the focused subset:
+   `zcotoh`, `m5zja8`, `v18kgy`, `82kkzm`.
 2. Decide whether `jgzlma` should be rerun with a larger one-task safety cap or
    treated as an acceptable eval-runner guard failure.
 3. Verify the remaining unchecked TUI/SDK product gates before claiming the full

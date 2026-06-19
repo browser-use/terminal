@@ -141,6 +141,32 @@ def test_artifact_audit_rejects_blocked_article_text(tmp_path: Path) -> None:
     assert "blocker/security-verification text" in audit.stdout
 
 
+def test_artifact_audit_rejects_self_withheld_article_text(tmp_path: Path) -> None:
+    (tmp_path / "result.json").write_text(
+        json.dumps(
+            {
+                "complete_article_text_fulfilled": False,
+                "articles": [
+                    {
+                        "headline": "Article",
+                        "url": "https://example.com/article",
+                        "article_text": "N/A - copyrighted full text not reproduced",
+                        "summary": "Short summary substituted for article body.",
+                    }
+                ],
+            }
+        )
+    )
+
+    audit = run_audit(
+        tmp_path,
+        "Extract the full headline, URL, and complete article text for each article.",
+    )
+
+    assert audit.returncode == 2
+    assert "complete article text is self-marked unavailable" in audit.stdout
+
+
 def test_artifact_audit_rejects_visible_only_reviews_for_complete_list(
     tmp_path: Path,
 ) -> None:
@@ -262,6 +288,86 @@ def test_artifact_audit_rejects_non_supplement_products(tmp_path: Path) -> None:
 
     assert audit.returncode == 2
     assert "likely non-supplement products" in audit.stdout
+
+
+def test_artifact_audit_accepts_task_allowed_na_fields(tmp_path: Path) -> None:
+    (tmp_path / "result.json").write_text(
+        json.dumps(
+            [
+                {
+                    "title": "TECHEU BAYER PHARMACEUTICAL RDI",
+                    "reference_number": "20250676",
+                    "submission_deadline": "N/A",
+                    "estimated_budget": "EUR 1100 million",
+                    "brief_description_of_scope": "Research and development pipeline project.",
+                    "eligibility_criteria": "N/A",
+                    "type_of_procedure": "N/A",
+                    "dedicated_url": "https://www.eib.org/en/projects/pipelines/all/20250676",
+                }
+            ]
+        )
+    )
+
+    audit = run_audit(
+        tmp_path,
+        "Extract title, reference number, submission deadline, estimated budget, brief description of the scope, eligibility criteria, type of procedure, and dedicated URL. If any piece of the requested information is unavailable, return 'N/A' for that field.",
+    )
+
+    assert audit.returncode == 0
+    assert "artifact-audit passed" in audit.stdout
+
+
+def test_artifact_audit_rejects_complete_false(tmp_path: Path) -> None:
+    (tmp_path / "result.json").write_text(
+        json.dumps(
+            {
+                "complete": False,
+                "records": [{"name": "Only partial page"}],
+            }
+        )
+    )
+
+    audit = run_audit(
+        tmp_path,
+        "Create a complete Excel report with pagination support.",
+    )
+
+    assert audit.returncode == 2
+    assert "`complete` is false" in audit.stdout
+
+
+def test_artifact_audit_rejects_ungm_non_it_scope_drift(tmp_path: Path) -> None:
+    (tmp_path / "result.json").write_text(
+        json.dumps(
+            {
+                "tenders": [
+                    {
+                        "rank": 1,
+                        "title": "Extended Systematic Review and Meta-analysis on VAC",
+                        "url": "https://www.ungm.org/Public/Notice/1",
+                    },
+                    {
+                        "rank": 2,
+                        "title": "Development of Policy Brief Zambia",
+                        "url": "https://www.ungm.org/Public/Notice/1",
+                    },
+                    {
+                        "rank": 3,
+                        "title": "REOI - Cybersecurity Awareness Services",
+                        "url": "https://www.ungm.org/Public/Notice/2",
+                    },
+                ]
+            }
+        )
+    )
+
+    audit = run_audit(
+        tmp_path,
+        "Scrape the first 20 tenders for UN-related IT projects from the UN Global Marketplace at https://www.ungm.org/Public/Notice",
+    )
+
+    assert audit.returncode == 2
+    assert "UNGM IT-project result contains likely non-IT scope drift" in audit.stdout
 
 
 def test_artifact_audit_rejects_dice_remote_and_old_rows(tmp_path: Path) -> None:

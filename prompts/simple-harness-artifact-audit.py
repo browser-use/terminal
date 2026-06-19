@@ -160,6 +160,7 @@ def audit_rows(path, rows, task):
     issues = []
     keys = sorted({str(key) for row in rows for key in row.keys()})
     lower_task = task.lower()
+    allow_unavailable_fields = task_explicitly_allows_unavailable_fields(lower_task)
     for key in keys:
         key_lower = key.lower()
         if key_lower.replace("_", " ") in {"discounted price", "discounted_price"}:
@@ -171,6 +172,8 @@ def audit_rows(path, rows, task):
             continue
         missing = sum(is_missing(value) for value in values)
         ratio = missing / max(len(values), 1)
+        if allow_unavailable_fields and missing == len(values) and all(is_explicit_na(value) for value in values):
+            continue
         if missing == len(values) and is_likely_required_field(key_lower, lower_task):
             issues.append(f"{path}: field `{key}` is missing/null/placeholder for every row")
         elif "email" in key_lower and missing > 0 and "if no direct email" in lower_task:
@@ -221,6 +224,7 @@ def audit_expected_groups(path, rows, doc, task):
             issues.append(f"{path}: at least one required packages array is empty")
 
     issues.extend(audit_incomplete_markers(path, doc, lower_task))
+    issues.extend(audit_ungm_it_scope(path, doc, lower_task))
 
     return issues
 
@@ -364,6 +368,21 @@ def audit_task_specific_text(path, text, task):
     ):
         issues.append(f"{path}: article extraction includes blocker/security-verification text instead of complete article text")
 
+    if "complete article text" in lower_task or "complete text of the article" in lower_task:
+        if any(
+            marker in lower_text
+            for marker in (
+                "complete_article_text_fulfilled\": false",
+                "complete article text fulfilled\": false",
+                "copyrighted full text not reproduced",
+                "article_text\": \"n/a",
+                "article text: n/a",
+                "full text unavailable",
+                "full text withheld",
+            )
+        ):
+            issues.append(f"{path}: complete article text is self-marked unavailable or replaced with summaries")
+
     if "review" in lower_task and "complete list" in lower_task and any(
         marker in lower_text
         for marker in ("sign-in page", "redirected to sign-in", "only the complete visible", "only visible")
@@ -419,6 +438,75 @@ def audit_task_specific_text(path, text, task):
     return issues
 
 
+def audit_ungm_it_scope(path, doc, lower_task):
+    if "ungm" not in lower_task and "un global marketplace" not in lower_task:
+        return []
+    if "it project" not in lower_task and "it-related" not in lower_task and "information technology" not in lower_task:
+        return []
+
+    rows = []
+    if isinstance(doc, dict) and isinstance(doc.get("tenders"), list):
+        rows = [row for row in doc["tenders"] if isinstance(row, dict)]
+    elif isinstance(doc, list):
+        rows = [row for row in doc if isinstance(row, dict)]
+    if not rows:
+        return []
+
+    non_it_markers = (
+        "meta-analysis",
+        "meta analysis",
+        "policy brief",
+        "communication materials",
+        "consultant for communication",
+        "videography",
+        "costing and financing",
+        "electoral process",
+    )
+    positive_it_markers = (
+        "api",
+        "application",
+        "cyber",
+        "data centre",
+        "data center",
+        "database",
+        "dhis2",
+        "digital",
+        "ict",
+        "information system",
+        "information technology",
+        "lms",
+        "network",
+        "platform",
+        "software",
+        "system",
+        "technology",
+        "ui",
+        "ux",
+        "vapt",
+        "web",
+    )
+
+    bad = []
+    for index, row in enumerate(rows, start=1):
+        title = str(row.get("title") or row.get("detail_title") or row.get("name") or "")
+        description = str(row.get("description") or "")
+        haystack = f"{title} {description}".lower()
+        has_non_it = any(contains_phrase(haystack, marker) for marker in non_it_markers)
+        has_positive_it = any(contains_phrase(haystack, marker) for marker in positive_it_markers)
+        if has_non_it and not has_positive_it:
+            bad.append((index, title[:120] or "(untitled)"))
+
+    if not bad:
+        return []
+    examples = "; ".join(f"row {index}: {title}" for index, title in bad[:5])
+    return [f"{path}: UNGM IT-project result contains likely non-IT scope drift ({examples})"]
+
+
+def contains_phrase(text, phrase):
+    escaped = re.escape(phrase)
+    return bool(re.search(rf"(?<![a-z0-9]){escaped}(?![a-z0-9])", text))
+
+
 def parse_datetime_like(value):
     text = value.strip()
     for fmt in (
@@ -450,6 +538,12 @@ def is_last_three_days_label(value):
 
 def audit_incomplete_markers(path, doc, lower_task):
     issues = []
+    if not task_explicitly_allows_incomplete_artifact(lower_task):
+        for key in ("complete", "is_complete", "ready_for_done"):
+            for value in find_values_for_key(doc, key):
+                if value is False:
+                    issues.append(f"{path}: `{key}` is false")
+
     missing_requirements = find_values_for_key(doc, "missing_requirements")
     for value in missing_requirements:
         if isinstance(value, list) and value:
@@ -492,6 +586,26 @@ def is_likely_required_field(key, lower_task):
     return any(hint in key and hint in lower_task for hint in CORE_FIELD_HINTS)
 
 
+def task_explicitly_allows_unavailable_fields(lower_task):
+    return bool(
+        re.search(r"if .*unavailable.*return ['`\"]?n/?a", lower_task)
+        or re.search(r"if .*unavailable.*use ['`\"]?n/?a", lower_task)
+        or re.search(r"return ['`\"]?n/?a['`\"]? for (that|the) field", lower_task)
+        or re.search(r"use ['`\"]?n/?a['`\"]? (for|when).*unavailable", lower_task)
+    )
+
+
+def task_explicitly_allows_incomplete_artifact(lower_task):
+    return "partial result" in lower_task or "incomplete result" in lower_task
+
+
+def is_explicit_na(value):
+    if not isinstance(value, str):
+        return False
+    normalized = re.sub(r"\s+", " ", value.strip().lower())
+    return normalized in {"n/a", "na"} or normalized.startswith("n/a ")
+
+
 def is_missing(value):
     if value is None:
         return True
@@ -499,6 +613,7 @@ def is_missing(value):
         normalized = re.sub(r"\s+", " ", value.strip().lower())
         return (
             normalized in PLACEHOLDER
+            or normalized.startswith("n/a")
             or normalized.startswith("not found")
             or normalized.startswith("not displayed")
             or normalized.startswith("not provided")

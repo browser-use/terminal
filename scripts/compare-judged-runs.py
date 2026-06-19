@@ -63,6 +63,18 @@ def normalize_results(path: Path, expected_total: int | None) -> tuple[dict[str,
     return aggregate, by_task
 
 
+def filter_results(
+    *,
+    label: str,
+    by_task: dict[str, dict[str, Any]],
+    task_ids: list[str],
+) -> dict[str, dict[str, Any]]:
+    missing = [task_id for task_id in task_ids if task_id not in by_task]
+    if missing:
+        raise SystemExit(f"{label}: missing requested task ids: {', '.join(missing)}")
+    return {task_id: by_task[task_id] for task_id in task_ids}
+
+
 def cell(value: Any, *, limit: int | None = None) -> str:
     text = "" if value is None else str(value)
     text = " ".join(text.replace("\r", " ").replace("\n", " ").split())
@@ -226,11 +238,23 @@ def main() -> int:
     parser.add_argument("--current-label", default="current")
     parser.add_argument("--reference-label", default="reference")
     parser.add_argument("--expected-total", type=int, default=106)
+    parser.add_argument("--current-expected-total", type=int)
+    parser.add_argument("--reference-expected-total", type=int)
+    parser.add_argument("--task-id", action="append", dest="task_ids", default=[])
     parser.add_argument("--out", type=Path)
     args = parser.parse_args()
 
-    current_aggregate, current = normalize_results(args.current_aggregate, args.expected_total)
-    reference_aggregate, reference = normalize_results(args.reference_aggregate, args.expected_total)
+    current_expected_total = (
+        args.current_expected_total if args.current_expected_total is not None else args.expected_total
+    )
+    reference_expected_total = (
+        args.reference_expected_total if args.reference_expected_total is not None else args.expected_total
+    )
+    current_aggregate, current = normalize_results(args.current_aggregate, current_expected_total)
+    reference_aggregate, reference = normalize_results(args.reference_aggregate, reference_expected_total)
+    if args.task_ids:
+        current = filter_results(label="current", by_task=current, task_ids=args.task_ids)
+        reference = filter_results(label="reference", by_task=reference, task_ids=args.task_ids)
     report = build_report(
         current_path=args.current_aggregate,
         reference_path=args.reference_aggregate,

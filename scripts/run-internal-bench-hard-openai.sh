@@ -31,6 +31,7 @@ Optional environment:
 Usage:
   scripts/run-internal-bench-hard-openai.sh [--run-id ID] [--root DIR]
                                            [--concurrency N] [--skip-build]
+                                           [--task-id ID ...]
                                            [--dry-run] [--judge]
 USAGE
 }
@@ -65,6 +66,7 @@ JUDGE_CONCURRENCY="${JUDGE_CONCURRENCY:-5}"
 JUDGE_CLAUDE_BIN="${JUDGE_CLAUDE_BIN:-claude}"
 REFERENCE_AGGREGATE="${REFERENCE_AGGREGATE:-/home/exedev/eval-runs/ibh-purecodex-175254-rejudge-jsonl-20260613/judge_aggregate.json}"
 JUDGE_OVERWRITE=0
+TASK_IDS=()
 RUN_ID=""
 ROOT=""
 SKIP_BUILD=0
@@ -87,6 +89,10 @@ while [[ $# -gt 0 ]]; do
       ;;
     --concurrency)
       CONCURRENCY="${2:?--concurrency requires a value}"
+      shift 2
+      ;;
+    --task-id)
+      TASK_IDS+=("${2:?--task-id requires a value}")
       shift 2
       ;;
     --skip-build)
@@ -182,6 +188,22 @@ if [[ "$ULIMIT_NOFILE" -lt 1024 ]]; then
   exit 2
 fi
 
+if [[ "${#TASK_IDS[@]}" -gt 0 ]]; then
+  declare -A seen_task_ids=()
+  for task_id in "${TASK_IDS[@]}"; do
+    if [[ -n "${seen_task_ids[$task_id]:-}" ]]; then
+      echo "duplicate --task-id: $task_id" >&2
+      exit 2
+    fi
+    seen_task_ids[$task_id]=1
+  done
+fi
+
+EXPECTED_TOTAL_EFFECTIVE=106
+if [[ "${#TASK_IDS[@]}" -gt 0 ]]; then
+  EXPECTED_TOTAL_EFFECTIVE="${#TASK_IDS[@]}"
+fi
+
 NOFILE_TARGET="$ULIMIT_NOFILE"
 NOFILE_HARD="$(ulimit -Hn)"
 if [[ "$NOFILE_HARD" != "unlimited" && "$NOFILE_TARGET" -gt "$NOFILE_HARD" ]]; then
@@ -275,7 +297,15 @@ cmd=(
   -c disable_local_search=true
   --state-dir "$STATE_DIR"
   dataset-run-openai "$DATASET"
-  --all
+)
+if [[ "${#TASK_IDS[@]}" -gt 0 ]]; then
+  for task_id in "${TASK_IDS[@]}"; do
+    cmd+=(--task-id "$task_id")
+  done
+else
+  cmd+=(--all)
+fi
+cmd+=(
   --model "$MODEL"
   --max-turns "$MAX_TURNS"
   --python-timeout-seconds "$PYTHON_TIMEOUT_SECONDS"
@@ -298,7 +328,12 @@ export BROWSER_USE_DATASET_TASK_SAFETY_POLL_SECONDS="$TASK_SAFETY_POLL_SECONDS"
 unset BU_CDP_URL BU_CDP_WS BU_BROWSER_ID
 
 if [[ "$DRY_RUN" == "1" ]]; then
-  printf 'RUN_ID=%s\nROOT=%s\nDATASET=%s\n' "$RUN_ID" "$ROOT" "$DATASET"
+  printf 'RUN_ID=%s\nROOT=%s\nDATASET=%s\nEXPECTED_TOTAL=%s\n' "$RUN_ID" "$ROOT" "$DATASET" "$EXPECTED_TOTAL_EFFECTIVE"
+  if [[ "${#TASK_IDS[@]}" -gt 0 ]]; then
+    printf 'TASK_IDS=%s\n' "$(IFS=,; echo "${TASK_IDS[*]}")"
+  else
+    printf 'TASK_IDS=all\n'
+  fi
   printf 'command:'
   printf ' %q' "${cmd[@]}"
   printf '\n'
@@ -344,6 +379,8 @@ python_timeout_seconds=$PYTHON_TIMEOUT_SECONDS
 task_timeout_seconds=$TASK_TIMEOUT_SECONDS
 task_token_cap=$TASK_TOKEN_CAP
 task_safety_poll_seconds=$TASK_SAFETY_POLL_SECONDS
+expected_total=$EXPECTED_TOTAL_EFFECTIVE
+task_ids=$([[ "${#TASK_IDS[@]}" -gt 0 ]] && (IFS=,; echo "${TASK_IDS[*]}") || echo all)
 ulimit_nofile=$(ulimit -n)
 browser_mode=cloud
 simple_harness=true
@@ -442,7 +479,7 @@ if [[ -f "$MANIFEST" ]]; then
   "$REPO_ROOT/scripts/audit-ibh-run-completion.py" \
     --run-root "$ROOT" \
     --run-id "$RUN_ID" \
-    --expected-total 106
+    --expected-total "$EXPECTED_TOTAL_EFFECTIVE"
 
   if [[ "$JUDGE_AFTER_RUN" == "1" ]]; then
     judge_args=(
@@ -470,15 +507,25 @@ if [[ -f "$MANIFEST" ]]; then
         final_status="$judge_status"
       fi
     else
+      finalize_args=(
+        "$REPO_ROOT/scripts/finalize-ibh-judged-run.sh"
+        --run-root "$ROOT"
+        --run-id "$RUN_ID"
+        --judge-dir "$ROOT/judge"
+        --reference-aggregate "$REFERENCE_AGGREGATE"
+        --current-expected-total "$EXPECTED_TOTAL_EFFECTIVE"
+        --reference-expected-total 106
+      )
+      if [[ "${#TASK_IDS[@]}" -gt 0 ]]; then
+        for task_id in "${TASK_IDS[@]}"; do
+          finalize_args+=(--task-id "$task_id")
+        done
+      fi
+
       set +e
       (
         set -o pipefail
-        "$REPO_ROOT/scripts/finalize-ibh-judged-run.sh" \
-          --run-root "$ROOT" \
-          --run-id "$RUN_ID" \
-          --judge-dir "$ROOT/judge" \
-          --reference-aggregate "$REFERENCE_AGGREGATE" \
-          2>&1 | tee "$LOG_DIR/judge-finalize.log"
+        "${finalize_args[@]}" 2>&1 | tee "$LOG_DIR/judge-finalize.log"
       )
       finalize_status=$?
       set -e
@@ -492,7 +539,7 @@ if [[ -f "$MANIFEST" ]]; then
         "$REPO_ROOT/scripts/audit-ibh-run-completion.py" \
           --run-root "$ROOT" \
           --run-id "$RUN_ID" \
-          --expected-total 106 \
+          --expected-total "$EXPECTED_TOTAL_EFFECTIVE" \
           --require-judged \
           2>&1 | tee "$LOG_DIR/completion-audit.log"
         audit_status=$?
