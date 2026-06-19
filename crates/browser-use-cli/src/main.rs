@@ -13192,6 +13192,8 @@ command = "test-mcp"
         assert!(simple_prompt.contains("task's noun is imprecise"));
         assert!(simple_prompt.contains("retrieved visible body text"));
         assert!(simple_prompt.contains("bulk skipped detail pages are not complete"));
+        assert!(simple_prompt.contains("execute the full rerun path before finalizing"));
+        assert!(simple_prompt.contains("Do not give the user a command to run later"));
         assert!(simple_prompt.contains("artifact-audit"));
         assert!(!simple_prompt.contains("browser_script"));
         assert!(!simple_prompt.contains("done("));
@@ -13232,6 +13234,8 @@ command = "test-mcp"
         assert!(text.contains("task's noun is imprecise"));
         assert!(text.contains("retrieved visible body text"));
         assert!(text.contains("bulk skipped detail pages are not complete"));
+        assert!(text.contains("execute the full rerun path before finalizing"));
+        assert!(text.contains("Do not give the user a command to run later"));
         assert!(text.contains("artifact-audit"));
         assert!(!text.contains("browser_script"));
         assert!(!text.contains("done("));

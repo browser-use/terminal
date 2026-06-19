@@ -183,3 +183,49 @@ Current focused status:
   unbounded/all-pages scraper path or fail audit before finalizing. The current
   artifact itself says to rerun with `--all`, so this is model behavior and audit
   discipline, not a browser-harness capability gap.
+
+## Focused Rerun 3
+
+Prompt/test changes before this run:
+
+- Dataset prompt now has a full-run contract for paginated marketplace/report
+  tasks: if the script, metadata, artifact, audit, or notes say to rerun with
+  `--all`, attempt every available page, or fetched fewer pages than available,
+  the agent must execute the full rerun before finalizing.
+- CLI prompt embedding tests assert that this full-run contract is present in
+  both the simple harness prompt and persisted dataset session prompt.
+
+Run:
+
+- run root:
+  `/home/exedev/eval-runs/ibh-focused-v18kgy-fullrun-prompt-20260619-083651`
+- run id: `ibh-focused-v18kgy-fullrun-prompt-20260619-083651`
+- task ids: `v18kgy`
+- runner: `0/1`
+- task timeout setting: `7200s`
+- judge status: not usable. Claude print mode returned `401 Invalid
+  authentication credentials`; runner failed before a final answer/artifact, so
+  there is no strict correctness judgment to salvage.
+
+Observed behavior:
+
+- The previous 72-row early-finalization failure did not recur.
+- The agent fetched all 200 Kickstarter discovery pages it found, producing
+  `2,388` Kickstarter projects.
+- The agent fetched all 5 Gamefound API pages, producing `491` Gamefound
+  projects and `437` Gamefound creator About pages.
+- The agent fetched/retried Kickstarter creator About pages in multiple shards
+  and recovery waves, reaching `2,178` unique Kickstarter creator records
+  (`2,051` HTTP 200, `127` HTTP 403).
+- The run failed with `CodexEngine run cancelled` before writing `result.xlsx`,
+  `result.json`, or `result.csv`.
+
+Interpretation:
+
+- The prompt/audit change moved `v18kgy` from "finalized a known partial
+  sample" to "kept working on the full scrape but cancelled before final
+  report generation."
+- The remaining gap is not another generic instruction. This task likely needs
+  either a deterministic report helper for long marketplace scrapes or a
+  finalization path that writes the best complete-enough workbook after bounded
+  creator About-page retries, with explicit unavailable/403 evidence.

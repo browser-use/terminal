@@ -241,6 +241,26 @@ Gate 5 verification:
 - [ ] Subset is judged with the locked rubric.
 - [ ] Any current-only regression is mapped to code/runtime/evidence.
 
+Gate 6 focused regression log:
+
+- Focused run:
+  `/home/exedev/eval-runs/ibh-focused-v18kgy-fullrun-prompt-20260619-083651`.
+- Task: `v18kgy`.
+- Runner result: failed, `0/1`.
+- Failure: `CodexEngine run cancelled` before final report artifact generation.
+- Evidence captured before cancellation:
+  - Kickstarter discovery: 200 pages, 2,388 projects.
+  - Gamefound: 5 pages, 491 projects, 437 creator About pages.
+  - Kickstarter creator/About retries: 2,178 unique creator records
+    (`2,051` HTTP 200, `127` HTTP 403).
+  - Missing final deliverables: `result.xlsx`, `result.json`, and `result.csv`.
+- Interpretation: the full-run prompt/test patch prevented the old early
+  72-row finalization behavior, but this task still needs a deterministic
+  long-scrape finalization strategy before it should be counted as fixed.
+- Judge caveat: Claude print-mode judge failed with `401 Invalid authentication
+  credentials`; because the runner itself failed with no final answer, no
+  fallback LLM judgment was required to classify this run.
+
 ### Gate 7: Full Judged Internal_Bench_hard
 
 - [x] Full 106-task run launched with cloud browser mode.

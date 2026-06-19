@@ -27,6 +27,12 @@ bounded chunks. Checkpoint partial results in the current working directory and
 verify progress by count, schema, required fields, and source coverage before
 continuing.
 
+Full-run contract: for paginated marketplace/report tasks, use every available
+page unless the task explicitly asks for a sample or limit. If your script,
+metadata, artifact, audit, or notes say to rerun with `--all`, attempt every
+available page, or report fetched pages lower than available pages, execute the full rerun path before finalizing. Do not give the user a command to run later
+as the final deliverable when the task asks for the completed report now.
+
 If a task gives a concrete source URL, extract the records available from that
 source even when the task's noun is imprecise, such as calling pipeline/project
 records tenders. Do not answer with a one-row "no records" placeholder while
