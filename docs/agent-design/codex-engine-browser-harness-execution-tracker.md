@@ -273,7 +273,7 @@ Gate 6 focused regression log:
 - [x] Raw Codex + browser-harness reference is run or explicitly recorded as
       unavailable.
 - [x] Task-by-task comparison against raw reference is produced.
-- [ ] Score is `>= 93/106` or within 3 tasks of fresh raw reference.
+- [x] Score is `>= 93/106` or within 3 tasks of fresh raw reference.
 - [x] Every remaining failure has a code/evidence/root-cause classification.
 
 Gate 7 attempt log:
@@ -389,6 +389,59 @@ Gate 7 attempt log:
     `2vxyzx`, `84xyjo`, `az39pe`, `h42m44`, `up8ijl`
   - shared failures:
     `c856wp`, `eo2t8f`, `pvs7hz`, `r5l8a7`, `togn1w`
+- Completed judged run after focused prompt/audit fixes:
+  `/home/exedev/eval-runs/ibh-full-simple-harness-b1552e9-20260619-102304`.
+- Run metadata:
+  - branch: `simple-harness-parity-test-20260618`
+  - commit: `b1552e959bf698fa62914e8976ad1a604e28144a`
+  - provider/model: OpenAI API, `gpt-5.5`
+  - browser mode: cloud
+  - concurrency: `25`
+  - max turns: `10000`
+  - safety guard: `TASK_TIMEOUT_SECONDS=2700`,
+    `TASK_TOKEN_CAP=30000000`, `TASK_SAFETY_POLL_SECONDS=10`
+  - simple harness: `true`
+  - CodexEngine: `true`
+- Runner result:
+  - 106/106 completed.
+  - 106 judge packets, 106 native event logs, no missing task ids.
+- Judge result:
+  - 106 judgments across 5 packet chunks.
+  - Mechanical completion audit with `--require-judged`: passed.
+  - Score: `94/106` (`88.7%`).
+  - Failed ids:
+    `0x65mu`, `afeyuh`, `c856wp`, `h42m44`, `jgzlma`, `s3kkv9`,
+    `swebnv`, `taxp0w`, `togn1w`, `trp0j4`, `v18kgy`, `y0bvr6`.
+  - Failure classes:
+    - `missing-required-fields`: `0x65mu`, `taxp0w`
+    - `site-blocked`: `afeyuh`, `c856wp`, `s3kkv9`
+    - `wrong-record`: `h42m44`, `trp0j4`, `y0bvr6`
+    - `synthetic-or-unsupported`: `jgzlma`
+    - `source-scope-drift`: `swebnv`
+    - `result-final-mismatch`: `togn1w`
+    - `source-limited`: `v18kgy`
+  - Judge caveat: Claude Code print-mode judging still returned `401 Invalid
+    authentication credentials`. Five Codex subagents judged the prepared
+    chunks with the same saved rubric/schema; aggregate validation passed with
+    no validation errors.
+- Raw-reference comparison:
+  - reference aggregate:
+    `/home/exedev/eval-runs/ibh-purecodex-175254-rejudge-jsonl-20260613/judge_aggregate.json`
+  - reference score: `96/106` (`90.6%`)
+  - comparison:
+    `/home/exedev/eval-runs/ibh-full-simple-harness-b1552e9-20260619-102304/current-vs-raw-judged-delta.md`
+  - both pass: `87`
+  - both fail: `3`
+  - current-only regressions: `9`
+  - current-only improvements: `7`
+  - regressions:
+    `0x65mu`, `afeyuh`, `jgzlma`, `s3kkv9`, `swebnv`, `taxp0w`,
+    `trp0j4`, `v18kgy`, `y0bvr6`
+  - improvements:
+    `2vxyzx`, `84xyjo`, `az39pe`, `eo2t8f`, `pvs7hz`, `r5l8a7`,
+    `up8ijl`
+  - shared failures:
+    `c856wp`, `h42m44`, `togn1w`
 
 ## Stop Conditions
 
@@ -408,7 +461,7 @@ Stop and do not claim completion if any of these occur:
 
 ## Current Status
 
-Active phase: post-Gate-7 regression triage.
+Active phase: benchmark target met; product-gate verification remains.
 
 Latest checkpoint:
 
@@ -475,8 +528,7 @@ Latest checkpoint:
 
 Next concrete action:
 
-1. Rebuild and rerun/fix the remaining focused task: `v18kgy`.
-2. Decide whether `jgzlma` should be rerun with a larger one-task safety cap or
-   treated as an acceptable eval-runner guard failure.
-3. Verify the remaining unchecked TUI/SDK product gates before claiming the full
+1. Verify the remaining unchecked TUI/SDK product gates before claiming the full
    product integration is complete.
+2. Optional score-chasing: target the current-only regressions from the
+   `94/106` run, especially `v18kgy`, `jgzlma`, `s3kkv9`, and `swebnv`.

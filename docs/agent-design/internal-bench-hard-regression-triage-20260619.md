@@ -229,3 +229,59 @@ Interpretation:
   either a deterministic report helper for long marketplace scrapes or a
   finalization path that writes the best complete-enough workbook after bounded
   creator About-page retries, with explicit unavailable/403 evidence.
+
+## Full Rerun After Focused Fixes
+
+Run:
+
+- run root:
+  `/home/exedev/eval-runs/ibh-full-simple-harness-b1552e9-20260619-102304`
+- run id: `ibh-full-simple-harness-b1552e9-20260619-102304`
+- commit under test: `b1552e959bf698fa62914e8976ad1a604e28144a`
+- provider/model: OpenAI API, `gpt-5.5`
+- browser mode: cloud
+- concurrency: `25`
+- runner: `106/106`
+- judge packets/native event logs: `106/106`
+- strict judge: `94/106`
+- judged completion audit with `--require-judged`: passed.
+- comparison:
+  `/home/exedev/eval-runs/ibh-full-simple-harness-b1552e9-20260619-102304/current-vs-raw-judged-delta.md`
+- Claude judge caveat: Claude print mode still returned `401 Invalid
+  authentication credentials`, so the five packet chunks were judged by five
+  Codex subagents with the saved rubric/schema.
+
+Compared with raw Codex + browser-harness reference:
+
+- current: `94/106`
+- reference: `96/106`
+- both pass: `87`
+- both fail: `3`
+- current-only regressions: `9`
+- current-only improvements: `7`
+
+Remaining current failures:
+
+| Task | Failure class | Short reason |
+| --- | --- | --- |
+| `0x65mu` | missing-required-fields | Required bedroom/bathroom/car-space selectors were `N/A`. |
+| `afeyuh` | site-blocked | Amazon review pagination redirected to sign-in; complete review list missing. |
+| `c856wp` | site-blocked | Google SERP pages 1-5 were blocked by unusual-traffic reCAPTCHA. |
+| `h42m44` | wrong-record | Hard date filter was unsupported; relative dates were normalized to the target date. |
+| `jgzlma` | synthetic-or-unsupported | Galaxus/Kaufland supplement rows were unsupported or hardcoded under site blocks. |
+| `s3kkv9` | site-blocked | VRBO private-pool/date/rating extraction was blocked by Bot-or-Not/429. |
+| `swebnv` | source-scope-drift | Yelp task used fallback local data after Yelp/DataDome block. |
+| `taxp0w` | missing-required-fields | WindTre extraction omitted a material Super Fibra e Netflix offer. |
+| `togn1w` | result-final-mismatch | Southwest final dates conflicted with retrieved page evidence. |
+| `trp0j4` | wrong-record | HiNative answer mixed unrelated snippets instead of top voted pronunciation answers. |
+| `v18kgy` | source-limited | Workbook was produced, but Kickstarter pagination and creator About coverage were incomplete. |
+| `y0bvr6` | wrong-record | Ben & Jerry's answer used a different retired flavor's epitaph. |
+
+Net:
+
+- The 93+ benchmark target is met under strict judging.
+- The main focused fixes held in the full run: `82kkzm`, `zcotoh`, `m5zja8`,
+  and `6dpbhs` all passed.
+- `v18kgy` improved from no final artifact in the focused rerun to a workbook
+  in the full run, but still failed strict completeness because source coverage
+  was short of the reported Kickstarter hit/page totals.
