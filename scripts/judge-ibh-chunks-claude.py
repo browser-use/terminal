@@ -188,6 +188,8 @@ def run_chunk(
     command = [
         claude_bin,
         "-p",
+        "--input-format",
+        "text",
         "--model",
         model,
         "--permission-mode",
@@ -201,7 +203,6 @@ def run_chunk(
         str(judge_dir),
         "--add-dir",
         str(run_root),
-        prompt,
     ]
 
     if dry_run:
@@ -221,6 +222,7 @@ def run_chunk(
         text=True,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
+        input=prompt,
         timeout=timeout_seconds,
         env=env,
     )

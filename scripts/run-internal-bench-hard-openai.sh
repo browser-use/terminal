@@ -150,6 +150,18 @@ require_dir() {
 require_file "$DATASET" "Internal_Bench_hard dataset"
 require_dir "$BROWSER_HARNESS_SRC/browser_harness" "browser-harness source"
 
+dataset_sha256() {
+  if command -v sha256sum >/dev/null 2>&1; then
+    sha256sum "$DATASET" | awk '{print $1}'
+    return
+  fi
+  if command -v shasum >/dev/null 2>&1; then
+    shasum -a 256 "$DATASET" | awk '{print $1}'
+    return
+  fi
+  echo "unavailable"
+}
+
 if [[ "$CONCURRENCY" -lt 1 ]]; then
   echo "CONCURRENCY must be >= 1" >&2
   exit 2
@@ -324,6 +336,7 @@ repo=$REPO_ROOT
 branch=$BRANCH
 commit=$(git rev-parse HEAD)
 dataset=$DATASET
+dataset_sha256=$(dataset_sha256)
 model=$MODEL
 concurrency=$CONCURRENCY
 max_turns=$MAX_TURNS

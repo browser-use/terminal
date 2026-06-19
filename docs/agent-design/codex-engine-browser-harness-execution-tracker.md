@@ -72,7 +72,7 @@ Dataset:
 - [x] Browser-harness dirty changes are either committed or archived in eval
       metadata.
 - [x] Dataset hash is recorded in this tracker.
-- [ ] Dataset hash is recorded in every full eval run.
+- [x] Dataset hash is recorded in every full eval run.
 - [x] Internal_Bench_hard runner dry-run shows cloud, simple harness, 10k turns,
       expected model, expected concurrency.
 - [x] `MAX_TURNS=80` dry-run fails before launching.
@@ -243,18 +243,18 @@ Gate 5 verification:
 
 ### Gate 7: Full Judged Internal_Bench_hard
 
-- [ ] Full 106-task run launched with cloud browser mode.
-- [ ] Full run uses no 80-turn cap.
-- [ ] Full run has 106 unique task ids.
-- [ ] Full run has 106 judge packets.
-- [ ] Full run has 106 judgments.
-- [ ] Mechanical audit passes.
-- [ ] Strict judged score is recorded.
-- [ ] Raw Codex + browser-harness reference is run or explicitly recorded as
+- [x] Full 106-task run launched with cloud browser mode.
+- [x] Full run uses no 80-turn cap.
+- [x] Full run has 106 unique task ids.
+- [x] Full run has 106 judge packets.
+- [x] Full run has 106 judgments.
+- [x] Mechanical audit passes.
+- [x] Strict judged score is recorded.
+- [x] Raw Codex + browser-harness reference is run or explicitly recorded as
       unavailable.
-- [ ] Task-by-task comparison against raw reference is produced.
+- [x] Task-by-task comparison against raw reference is produced.
 - [ ] Score is `>= 93/106` or within 3 tasks of fresh raw reference.
-- [ ] Every remaining failure has a code/evidence/root-cause classification.
+- [x] Every remaining failure has a code/evidence/root-cause classification.
 
 Gate 7 attempt log:
 
@@ -309,6 +309,66 @@ Gate 7 attempt log:
   - `cargo test`
   - `uv run --with pytest python -m pytest -q`
   - `bash -n scripts/run-internal-bench-hard-openai.sh`
+- Completed judged run:
+  `/home/exedev/eval-runs/ibh-simple-harness-openai-simple-harness-parity-test-20260618-20260619-053010`.
+- Run metadata:
+  - branch: `simple-harness-parity-test-20260618`
+  - commit: `f7cb1f93356bb192d56fac2cc60d9c630ed47f32`
+  - dataset sha256:
+    `62ca711571e3337234efb54e7708d5768dec8c849bb8a2a54e010c4e31e988c4`
+  - provider/model: OpenAI API, `gpt-5.5`
+  - browser mode: cloud
+  - concurrency: `25`
+  - max turns: `10000`
+  - safety guard: `TASK_TIMEOUT_SECONDS=2700`,
+    `TASK_TOKEN_CAP=30000000`, `TASK_SAFETY_POLL_SECONDS=10`
+  - simple harness: `true`
+  - CodexEngine: `true`
+- Runner result:
+  - 105/106 completed.
+  - `jgzlma` was cancelled by the dataset safety guard after the 2700s
+    wall-clock cap.
+  - No missing packet/task ids.
+- Judge result:
+  - 106 judge packets, 106 native event logs, 5 chunk files, 106 judgments.
+  - Mechanical completion audit with `--require-judged`: passed.
+  - Score: `91/106` (`85.8%`).
+  - Failed ids:
+    `0kqsos`, `6dpbhs`, `82kkzm`, `c856wp`, `eo2t8f`, `jgzlma`,
+    `l3gywi`, `m5zja8`, `pvs7hz`, `q46nou`, `r5l8a7`, `s3kkv9`,
+    `togn1w`, `v18kgy`, `zcotoh`.
+  - Failure classes:
+    - `site-access-blocked`: `0kqsos`, `q46nou`, `r5l8a7`, `s3kkv9`
+    - `missing-required-fields`: `82kkzm`, `jgzlma`, `l3gywi`
+    - `source-scope-drift`: `m5zja8`, `pvs7hz`
+    - `incomplete-artifact`: `v18kgy`
+    - `missing-core-fields`: `zcotoh`
+    - `site-blocked`: `c856wp`
+    - `source-limited`: `eo2t8f`
+    - `weak-evidence`: `6dpbhs`
+    - `wrong-scope`: `togn1w`
+  - Judge caveat: Claude Code print-mode judging could not run in this VM
+    because Claude auth returned `401 Invalid authentication credentials`.
+    Five Codex subagents judged the prepared chunks with the same saved rubric
+    and packet contract, and the existing aggregate/comparison validators
+    accepted the outputs with no validation errors.
+- Raw-reference comparison:
+  - reference aggregate:
+    `/home/exedev/eval-runs/ibh-purecodex-175254-rejudge-jsonl-20260613/judge_aggregate.json`
+  - reference score: `96/106` (`90.6%`)
+  - comparison:
+    `/home/exedev/eval-runs/ibh-simple-harness-openai-simple-harness-parity-test-20260618-20260619-053010/current-vs-raw-judged-delta.md`
+  - both pass: `86`
+  - both fail: `5`
+  - current-only regressions: `10`
+  - current-only improvements: `5`
+  - regressions:
+    `0kqsos`, `6dpbhs`, `82kkzm`, `jgzlma`, `l3gywi`, `m5zja8`,
+    `q46nou`, `s3kkv9`, `v18kgy`, `zcotoh`
+  - improvements:
+    `2vxyzx`, `84xyjo`, `az39pe`, `h42m44`, `up8ijl`
+  - shared failures:
+    `c856wp`, `eo2t8f`, `pvs7hz`, `r5l8a7`, `togn1w`
 
 ## Stop Conditions
 
@@ -328,13 +388,12 @@ Stop and do not claim completion if any of these occur:
 
 ## Current Status
 
-Active phase: Gate 7 full eval, rerun after eval safety guard.
+Active phase: post-Gate-7 regression triage.
 
 Next concrete action:
 
-1. Commit the dataset safety guard checkpoint.
-2. Relaunch full Internal_Bench_hard with `JUDGE_AFTER_RUN=1`,
-   `CONCURRENCY=25`, cloud browser mode, CodexEngine, simple harness, 10k
-   model-turn cap, and the eval safety guard enabled.
-3. Judge and compare task-by-task against the raw Codex + browser-harness
-   reference aggregate.
+1. Triage the 10 current-only regressions against the raw Codex reference.
+2. Decide whether `jgzlma` should be rerun with a larger one-task safety cap or
+   treated as an acceptable eval-runner guard failure.
+3. Verify the remaining unchecked TUI/SDK product gates before claiming the full
+   product integration is complete.
