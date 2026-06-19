@@ -270,6 +270,14 @@ Gate 7 attempt log:
   non-retryable errors remain terminal.
 - Regression coverage:
   `cargo test -p browser-use-codex-engine`.
+- Aborted run:
+  `/home/exedev/eval-runs/ibh-simple-harness-openai-simple-harness-parity-test-20260618-20260619-030044`.
+- Reason: runner hit `Too many open files (os error 24)` while writing the
+  dataset manifest after 43 extracted packets. The VM shell soft open-file
+  limit was 1024, while concurrency 25 with embedded Codex plus browser-harness
+  workers needs a higher limit.
+- Fix: the eval runner now raises `ulimit -n` up to `ULIMIT_NOFILE`, capped by
+  the shell hard limit, and records the actual limit in `run-env.txt`.
 
 ## Stop Conditions
 

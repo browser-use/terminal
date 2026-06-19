@@ -17,6 +17,7 @@ Optional environment:
   BROWSER_HARNESS_SRC=/home/exedev/repos/browser-harness/src
   MODEL=gpt-5.5
   CONCURRENCY=25
+  ULIMIT_NOFILE=65535
   OUT_BASE=/home/exedev/eval-runs
   JUDGE_AFTER_RUN=0
   JUDGE_MODEL=sonnet
@@ -49,6 +50,7 @@ MODEL="${MODEL:-gpt-5.5}"
 CONCURRENCY="${CONCURRENCY:-25}"
 MAX_TURNS="${MAX_TURNS:-10000}"
 PYTHON_TIMEOUT_SECONDS="${PYTHON_TIMEOUT_SECONDS:-180}"
+ULIMIT_NOFILE="${ULIMIT_NOFILE:-65535}"
 OUT_BASE="${OUT_BASE:-/home/exedev/eval-runs}"
 HEALTH_AFTER_SECONDS="${HEALTH_AFTER_SECONDS:-30}"
 JUDGE_AFTER_RUN="${JUDGE_AFTER_RUN:-0}"
@@ -155,6 +157,22 @@ fi
 if [[ "$MAX_TURNS" -lt 10000 ]]; then
   echo "MAX_TURNS must stay >= 10000 for Internal_Bench_hard parity" >&2
   exit 2
+fi
+
+if [[ "$ULIMIT_NOFILE" -lt 1024 ]]; then
+  echo "ULIMIT_NOFILE must be >= 1024" >&2
+  exit 2
+fi
+
+NOFILE_TARGET="$ULIMIT_NOFILE"
+NOFILE_HARD="$(ulimit -Hn)"
+if [[ "$NOFILE_HARD" != "unlimited" && "$NOFILE_TARGET" -gt "$NOFILE_HARD" ]]; then
+  NOFILE_TARGET="$NOFILE_HARD"
+fi
+
+if ! ulimit -n "$NOFILE_TARGET" 2>/dev/null; then
+  actual_nofile="$(ulimit -n)"
+  echo "warning: failed to raise open-file limit to $NOFILE_TARGET; current limit is $actual_nofile" >&2
 fi
 
 auth_status_connected() {
@@ -301,6 +319,7 @@ model=$MODEL
 concurrency=$CONCURRENCY
 max_turns=$MAX_TURNS
 python_timeout_seconds=$PYTHON_TIMEOUT_SECONDS
+ulimit_nofile=$(ulimit -n)
 browser_mode=cloud
 simple_harness=true
 codex_engine=true
