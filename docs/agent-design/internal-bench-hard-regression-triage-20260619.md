@@ -71,14 +71,68 @@ Historical artifact audit checks:
 - `m5zja8`: old `result.json` now fails for non-IT UNGM scope drift.
 - `v18kgy`: old `result.json` now fails on `complete: false`.
 
+## Focused Rerun
+
+Invalid run:
+
+- `/home/exedev/eval-runs/ibh-focused-audit-fixes-20260619`
+- Stopped manually because it was launched with `--skip-build` before the Rust
+  binary had been rebuilt. The dataset prompt and `artifact-audit` are embedded
+  with `include_str!`, so this run used stale prompt/audit text and is not valid
+  evidence for the patch.
+
+Valid run:
+
+- run root: `/home/exedev/eval-runs/ibh-focused-audit-fixes-built-20260619`
+- run id: `ibh-focused-audit-fixes-built-20260619`
+- commit under test: `e3b3b1b3eba036b1b6ee639f38254b1e2c460a4a`
+- task ids: `zcotoh`, `m5zja8`, `v18kgy`, `82kkzm`
+- runner: `4/4`
+- strict judge: `2/4`
+- judge aggregate:
+  `/home/exedev/eval-runs/ibh-focused-audit-fixes-built-20260619/judge/judge_aggregate.json`
+- comparison:
+  `/home/exedev/eval-runs/ibh-focused-audit-fixes-built-20260619/current-vs-raw-judged-delta.md`
+- mechanical completion audit with `--require-judged`: passed.
+- Claude judge caveat: Claude print mode still returned `401 Invalid
+  authentication credentials`, so the single chunk was judged by one Codex
+  subagent with the saved rubric and schema.
+
+Focused judgments:
+
+| Task | Strict result | Notes |
+| --- | --- | --- |
+| `m5zja8` | Pass | The new UNGM audit blocked broad non-IT rows, the agent repaired, and the final artifact had 20 IT-related UNGM tenders. |
+| `zcotoh` | Pass by judge | The fallback judge accepted the one-row honest-null EIB answer. We still added an EIB pipeline sanity audit afterward because the raw reference solved this by extracting ~1k pipeline records, so future runs should not settle for the low-value no-tenders answer. |
+| `82kkzm` | Fail | The result still replaced complete article text with `N/A`/summaries and self-marked the full text limitation. The audit catches it; the model behavior is not fixed yet. |
+| `v18kgy` | Fail | The report had 3,117 rows and a workbook, but declared 2,443 Kickstarter creator About pages not fetched due HTTP 429; the strict judge treated creator website extraction as incomplete. |
+
+Additional audit refinements after the focused run:
+
+- EIB pipeline tasks now fail if answered as “no tender records” or with a tiny
+  row count instead of extracting pipeline records.
+- Creator website fields may be `N/A` when the task says “if available,” but
+  artifacts now fail if they declare bulk creator About-page fetch
+  incompleteness such as `creator_profiles_not_fetched`.
+- `scripts/run-internal-bench-hard-openai.sh` now passes the focused
+  `EXPECTED_TOTAL` into `prepare-ibh-judge.py`; the valid run exposed that
+  omission before manual judging.
+
 ## Next Eval Step
 
-Run a focused judged subset for:
+Rebuild the binary, then rerun the focused judged subset for:
 
 ```text
-zcotoh m5zja8 v18kgy 82kkzm
+zcotoh v18kgy 82kkzm
 ```
 
-If those improve or fail for a different reason, rerun the full 106-task
-Internal_Bench_hard path and compare against the raw Codex + browser-harness
-reference.
+`m5zja8` is fixed under the focused judge. The remaining fixes should target:
+
+- `82kkzm`: source-text capture/retrieval strategy for complete article text.
+- `v18kgy`: avoid 429 or continue creator About-page fetching until the website
+  field is complete enough for the strict judge.
+- `zcotoh`: force EIB pipeline record extraction instead of an honest-null
+  no-tenders answer, despite the focused judge accepting the latter.
+
+After these pass a focused judge, rerun the full 106-task Internal_Bench_hard
+path and compare against the raw Codex + browser-harness reference.

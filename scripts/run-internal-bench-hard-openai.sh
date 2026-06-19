@@ -474,7 +474,8 @@ if [[ -f "$MANIFEST" ]]; then
     --packets "$PACKETS" \
     --state-db "$STATE_DIR/state.db" \
     --out-dir "$ROOT/judge" \
-    --run-label "Internal_Bench_hard simple-harness OpenAI cloud"
+    --run-label "Internal_Bench_hard simple-harness OpenAI cloud" \
+    --expected-total "$EXPECTED_TOTAL_EFFECTIVE"
 
   "$REPO_ROOT/scripts/audit-ibh-run-completion.py" \
     --run-root "$ROOT" \

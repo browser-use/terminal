@@ -317,6 +317,96 @@ def test_artifact_audit_accepts_task_allowed_na_fields(tmp_path: Path) -> None:
     assert "artifact-audit passed" in audit.stdout
 
 
+def test_artifact_audit_accepts_creator_websites_if_available(tmp_path: Path) -> None:
+    (tmp_path / "result.json").write_text(
+        json.dumps(
+            {
+                "rows": [
+                    {
+                        "platform": "Kickstarter",
+                        "game_name": f"Game {index}",
+                        "project_url": f"https://example.com/project/{index}",
+                        "description": "Upcoming tabletop game",
+                        "date_added": "2026-06-19",
+                        "creator_websites": "N/A",
+                    }
+                    for index in range(20)
+                ]
+            }
+        )
+    )
+
+    audit = run_audit(
+        tmp_path,
+        "Create an automated report of upcoming tabletop game projects with clickable links to both the campaign and the creator's website. Each entry should show the creator's external website (if available).",
+    )
+
+    assert audit.returncode == 0
+    assert "artifact-audit passed" in audit.stdout
+
+
+def test_artifact_audit_rejects_creator_about_fetch_incomplete(tmp_path: Path) -> None:
+    (tmp_path / "result.json").write_text(
+        json.dumps(
+            {
+                "sources": {
+                    "kickstarter": {
+                        "errors": [
+                            {
+                                "type": "profile_about_fetch_incomplete",
+                                "message": "Creator About-page fetching was stopped because Kickstarter returned HTTP 429 throttling.",
+                                "creator_profiles_not_fetched": 2443,
+                            }
+                        ]
+                    }
+                },
+                "rows": [
+                    {
+                        "platform": "Kickstarter",
+                        "game_name": "Game",
+                        "project_url": "https://example.com/project",
+                        "description": "Upcoming tabletop game",
+                        "date_added": "2026-06-19",
+                        "creator_about_urls": ["https://example.com/profile/about"],
+                        "creator_websites": ["N/A"],
+                    }
+                ],
+            }
+        )
+    )
+
+    audit = run_audit(
+        tmp_path,
+        "Create an automated report of upcoming tabletop game projects. For each project, visit the creator's About page and extract website link(s); creator website is if available.",
+    )
+
+    assert audit.returncode == 2
+    assert "creator About-page website extraction skipped 2443 creator profiles" in audit.stdout
+
+
+def test_artifact_audit_rejects_eib_pipeline_no_tenders_answer(tmp_path: Path) -> None:
+    (tmp_path / "result.json").write_text(
+        json.dumps(
+            [
+                {
+                    "title": "No tender records found on the specified EIB projects pipeline page",
+                    "reference_number": "N/A",
+                    "brief_description_of_scope": "The specified URL lists EIB projects to be financed, not tender/procurement opportunities.",
+                    "dedicated_url": "https://www.eib.org/en/projects/pipelines/index.htm",
+                }
+            ]
+        )
+    )
+
+    audit = run_audit(
+        tmp_path,
+        "scrape tender information from https://www.eib.org/en/projects/pipelines/index.htm and extract title, reference number, submission deadline, estimated budget, brief description of the scope, eligibility criteria, type of procedure, and dedicated URL. If any piece of the requested information is unavailable, return 'N/A' for that field. Return the results as a JSON array of objects.",
+    )
+
+    assert audit.returncode == 2
+    assert "EIB pipeline task was answered as no tenders" in audit.stdout
+
+
 def test_artifact_audit_rejects_complete_false(tmp_path: Path) -> None:
     (tmp_path / "result.json").write_text(
         json.dumps(

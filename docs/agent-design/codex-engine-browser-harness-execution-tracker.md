@@ -414,11 +414,28 @@ Latest checkpoint:
   - full dry-run still uses `--all` and `EXPECTED_TOTAL=106`
   - existing full judged run finalizes successfully at `91/106` with no
     validation errors.
+- Focused judged rerun after rebuilding:
+  - root:
+    `/home/exedev/eval-runs/ibh-focused-audit-fixes-built-20260619`
+  - task ids: `zcotoh`, `m5zja8`, `v18kgy`, `82kkzm`
+  - runner: `4/4`
+  - strict fallback judge: `2/4`
+  - passed: `m5zja8`, `zcotoh`
+  - failed: `82kkzm`, `v18kgy`
+  - mechanical completion audit with `--require-judged`: passed.
+  - caveat: Claude print-mode judging returned `401 Invalid authentication
+    credentials`; one Codex subagent judged the single packet chunk with the
+    saved rubric/schema.
+- Additional audit refinements from the focused run:
+  - EIB pipeline tasks now fail if answered as a tiny/no-tenders artifact.
+  - Creator website fields can be `N/A` only when individually unavailable;
+    declared bulk creator About-page fetch incompleteness is blocked.
+  - Focused runs now pass the effective expected total into judge prep.
 
 Next concrete action:
 
-1. Run and judge the focused subset:
-   `zcotoh`, `m5zja8`, `v18kgy`, `82kkzm`.
+1. Rebuild and rerun the remaining focused subset:
+   `zcotoh`, `v18kgy`, `82kkzm`.
 2. Decide whether `jgzlma` should be rerun with a larger one-task safety cap or
    treated as an acceptable eval-runner guard failure.
 3. Verify the remaining unchecked TUI/SDK product gates before claiming the full

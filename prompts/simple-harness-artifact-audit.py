@@ -172,6 +172,8 @@ def audit_rows(path, rows, task):
             continue
         missing = sum(is_missing(value) for value in values)
         ratio = missing / max(len(values), 1)
+        if field_allows_unavailable_values(key_lower, lower_task):
+            continue
         if allow_unavailable_fields and missing == len(values) and all(is_explicit_na(value) for value in values):
             continue
         if missing == len(values) and is_likely_required_field(key_lower, lower_task):
@@ -225,6 +227,8 @@ def audit_expected_groups(path, rows, doc, task):
 
     issues.extend(audit_incomplete_markers(path, doc, lower_task))
     issues.extend(audit_ungm_it_scope(path, doc, lower_task))
+    issues.extend(audit_eib_pipeline_scope(path, rows, doc, lower_task))
+    issues.extend(audit_creator_website_fetch_completeness(path, doc, lower_task))
 
     return issues
 
@@ -502,6 +506,39 @@ def audit_ungm_it_scope(path, doc, lower_task):
     return [f"{path}: UNGM IT-project result contains likely non-IT scope drift ({examples})"]
 
 
+def audit_eib_pipeline_scope(path, rows, doc, lower_task):
+    if "eib.org/en/projects/pipelines" not in lower_task:
+        return []
+    if "tender" not in lower_task and "pipeline" not in lower_task:
+        return []
+
+    lower_text = json.dumps(doc, ensure_ascii=False).lower()
+    if "no tender records found" in lower_text or "not a tender/procurement" in lower_text:
+        return [f"{path}: EIB pipeline task was answered as no tenders instead of extracting pipeline records"]
+
+    if rows and len(rows) < 100:
+        return [f"{path}: EIB pipeline extraction has only {len(rows)} rows; expected many pipeline records"]
+    return []
+
+
+def audit_creator_website_fetch_completeness(path, doc, lower_task):
+    if "creator" not in lower_task or "website" not in lower_task:
+        return []
+    if "about page" not in lower_task and "about-page" not in lower_task and "/about" not in lower_task:
+        return []
+
+    issues = []
+    not_fetched_values = find_values_for_key(doc, "creator_profiles_not_fetched")
+    for value in not_fetched_values:
+        if isinstance(value, int) and value > 0:
+            issues.append(f"{path}: creator About-page website extraction skipped {value} creator profiles")
+
+    lower_text = json.dumps(doc, ensure_ascii=False).lower()
+    if "profile_about_fetch_incomplete" in lower_text or "about-page fetching was stopped" in lower_text:
+        issues.append(f"{path}: creator About-page website extraction is self-marked incomplete")
+    return issues
+
+
 def contains_phrase(text, phrase):
     escaped = re.escape(phrase)
     return bool(re.search(rf"(?<![a-z0-9]){escaped}(?![a-z0-9])", text))
@@ -593,6 +630,15 @@ def task_explicitly_allows_unavailable_fields(lower_task):
         or re.search(r"return ['`\"]?n/?a['`\"]? for (that|the) field", lower_task)
         or re.search(r"use ['`\"]?n/?a['`\"]? (for|when).*unavailable", lower_task)
     )
+
+
+def field_allows_unavailable_values(key_lower, lower_task):
+    normalized = key_lower.replace("_", " ")
+    if "if available" not in lower_task:
+        return False
+    if "creator" in normalized and ("website" in normalized or "websites" in normalized):
+        return "creator" in lower_task and "website" in lower_task
+    return False
 
 
 def task_explicitly_allows_incomplete_artifact(lower_task):
