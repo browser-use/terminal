@@ -912,22 +912,37 @@ def _load_browser_harness(ns: Dict[str, Any]) -> None:
         cwd = Path(str(ns.get("cwd") or ".")).expanduser()
         os.environ.setdefault("BH_AGENT_WORKSPACE", str(_agent_workspace_path(cwd)))
         admin = importlib.import_module("browser_harness.admin")
-        _patch_browser_harness_admin(admin)
-        _ensure_managed_chrome(admin)
-        _ensure_cloud_browser(admin)
         helpers = importlib.import_module("browser_harness.helpers")
-        _patch_browser_harness_cdp(helpers, admin)
+        try:
+            context = importlib.import_module("browser_harness.context")
+        except Exception:
+            context = None
+        try:
+            manager_helpers = importlib.import_module("browser_harness.manager_helpers")
+        except Exception:
+            manager_helpers = None
+        _patch_browser_harness_cdp(helpers, admin, context)
         names = getattr(helpers, "__all__", None) or [name for name in dir(helpers) if not name.startswith("_")]
         ns.update({name: getattr(helpers, name) for name in names})
+        if manager_helpers is not None:
+            manager_names = getattr(manager_helpers, "__all__", None) or [
+                name for name in dir(manager_helpers) if not name.startswith("_")
+            ]
+            ns.update({name: getattr(manager_helpers, name) for name in manager_names})
         def ensure_browser_connection() -> Any:
-            if _browser_mode() == "cloud":
-                return _ensure_cloud_browser(admin)
+            if context is not None:
+                with contextlib.suppress(Exception):
+                    binding = context.get_active_binding()
+                    if binding is not None and getattr(binding, "manager_mode", False):
+                        return binding.to_public_dict()
             return admin.ensure_daemon()
 
         ns["ensure_browser_connection"] = ensure_browser_connection
         ns["browser_daemon_alive"] = admin.daemon_alive
         ns["__browser_harness_helpers__"] = helpers
         ns["__browser_harness_admin__"] = admin
+        ns["__browser_harness_context__"] = context
+        ns["__browser_harness_manager_helpers__"] = manager_helpers
         ns["browser_harness_available"] = True
         ns["browser_harness_error"] = None
     except Exception as exc:  # pragma: no cover - environment dependent
@@ -935,16 +950,18 @@ def _load_browser_harness(ns: Dict[str, Any]) -> None:
         ns["browser_harness_error"] = str(exc)
 
 
-def _patch_browser_harness_cdp(helpers: Any, admin: Any) -> None:
+def _patch_browser_harness_cdp(helpers: Any, admin: Any, context: Any | None = None) -> None:
     if getattr(helpers, "__llm_browser_cdp_patched__", False):
         return
     original_cdp = helpers.cdp
     applied_browser_profile_state: set[tuple[Any, ...]] = set()
 
     def cdp_with_daemon(method: str, session_id: Any = None, **params: Any) -> Any:
-        if _browser_mode() == "cloud":
-            _ensure_cloud_browser(admin)
-        else:
+        binding = None
+        if context is not None:
+            with contextlib.suppress(Exception):
+                binding = context.get_active_binding()
+        if not (binding is not None and getattr(binding, "manager_mode", False)):
             admin.ensure_daemon()
         _enforce_browser_domain_constraints(method, params)
         if method != "Browser.grantPermissions":
@@ -1019,6 +1036,13 @@ def _record_browser_event(
 
 
 def _namespace(session_id: str, cwd: Path, artifact_dir: Path) -> Dict[str, Any]:
+    workspace = _agent_workspace_path(cwd)
+    os.environ["BH_AGENT_WORKSPACE"] = str(workspace)
+    os.environ["BH_RUN_ID"] = session_id
+    os.environ.setdefault("BH_AGENT_ID", "main")
+    os.environ.setdefault("BH_MANAGER_MODE", "1")
+    os.environ["BH_MANAGER_ROOT"] = str(artifact_dir / ".browser-harness-manager")
+    os.environ["BH_MANAGER_SOCKET"] = str(artifact_dir / ".browser-harness-manager" / "manager.sock")
     ns = _namespaces.setdefault(
         session_id,
         {
@@ -1028,7 +1052,6 @@ def _namespace(session_id: str, cwd: Path, artifact_dir: Path) -> Dict[str, Any]
     )
     artifact_dir.mkdir(parents=True, exist_ok=True)
     _outputs_dir_path(cwd).mkdir(parents=True, exist_ok=True)
-    workspace = _agent_workspace_path(cwd)
     workspace.mkdir(parents=True, exist_ok=True)
     (workspace / "agent_helpers.py").touch(exist_ok=True)
     ns["cwd"] = cwd
@@ -1040,6 +1063,19 @@ def _namespace(session_id: str, cwd: Path, artifact_dir: Path) -> Dict[str, Any]
     ns["browser_events"] = []
     _load_browser_harness(ns)
     return ns
+
+
+def _reset_browser_harness_selection(ns: Dict[str, Any]) -> None:
+    context = ns.get("__browser_harness_context__")
+    manager_helpers = ns.get("__browser_harness_manager_helpers__")
+    if context is None:
+        return
+    with contextlib.suppress(Exception):
+        context.clear_active_binding()
+    browser_id = os.environ.get("BH_BROWSER_ID")
+    if browser_id and manager_helpers is not None:
+        with contextlib.suppress(Exception):
+            manager_helpers.browser(browser_id)
 
 
 def _safe_name(name: str) -> str:
@@ -2043,6 +2079,7 @@ def _run(request: Dict[str, Any]) -> Dict[str, Any]:
         with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stdout):
             ns = _namespace(session_id, cwd, artifact_dir)
             _install_host_helpers(ns, request_id, cancel_requested)
+            _reset_browser_harness_selection(ns)
         cwd.mkdir(parents=True, exist_ok=True)
         os.chdir(cwd)
         if timeout_seconds > 0 and hasattr(signal, "SIGALRM"):

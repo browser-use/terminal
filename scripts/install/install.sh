@@ -531,6 +531,7 @@ release_dir_is_complete() {
     [ -x "$release_dir/bin/browser-use-terminal" ] &&
     [ -x "$release_dir/bin/agent-tools/rg" ] &&
     [ -f "$release_dir/python/llm_browser_worker/worker.py" ] &&
+    [ -f "$release_dir/python/browser_harness/run.py" ] &&
     [ "$(basename "$release_dir")" = "$expected_version-$expected_target" ]
 }
 

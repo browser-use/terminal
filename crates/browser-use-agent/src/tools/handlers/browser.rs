@@ -44,6 +44,7 @@ use anyhow::{anyhow, bail};
 use base64::{engine::general_purpose, Engine as _};
 use browser_use_browser::{BrowserCommandOutput, BrowserScriptOutput};
 use browser_use_llm::schema::ContentPart;
+use browser_use_python_worker::{PythonWorker, RunPythonResponse};
 use browser_use_store::Store;
 use regex::Regex;
 use serde_json::{json, Value};
@@ -429,6 +430,12 @@ pub trait BrowserBackend: Send + Sync {
     fn cleanup_session(&self, _session_id: &str) -> usize {
         0
     }
+
+    /// Whether this backend delegates browser lifecycle/page work to raw
+    /// browser-harness instead of the legacy Rust browser control plane.
+    fn uses_raw_browser_harness(&self) -> bool {
+        false
+    }
 }
 
 /// Production backend: a thin delegation to `browser-use-browser`.
@@ -798,6 +805,282 @@ impl BrowserBackend for RealBackend {
             &self.script_registry,
             &self.session_registry,
         )
+    }
+}
+
+pub struct HarnessBackend {
+    browser_mode: Arc<Mutex<Option<String>>>,
+    worker: Mutex<Option<PythonWorker>>,
+}
+
+impl Default for HarnessBackend {
+    fn default() -> Self {
+        Self {
+            browser_mode: Arc::new(Mutex::new(None)),
+            worker: Mutex::new(None),
+        }
+    }
+}
+
+impl HarnessBackend {
+    pub fn with_browser_mode(browser_mode: Option<String>) -> Self {
+        Self {
+            browser_mode: Arc::new(Mutex::new(browser_mode)),
+            worker: Mutex::new(None),
+        }
+    }
+
+    fn run_python(
+        &self,
+        session_id: &str,
+        cwd: &std::path::Path,
+        artifact_dir: &std::path::Path,
+        code: &str,
+        timeout_secs: u64,
+    ) -> anyhow::Result<RunPythonResponse> {
+        let mut worker = self
+            .worker
+            .lock()
+            .map_err(|_| anyhow!("browser-harness worker mutex poisoned"))?;
+        if worker.is_none() {
+            let browser_mode = self
+                .browser_mode
+                .lock()
+                .map_err(|_| anyhow!("browser-harness mode mutex poisoned"))?
+                .clone();
+            *worker = Some(PythonWorker::start_with_browser_mode_and_env(
+                browser_mode.as_deref(),
+                [("BH_MANAGER_MODE", "1")],
+            )?);
+        }
+        worker
+            .as_mut()
+            .expect("worker initialized")
+            .run_with_events_and_timeout(
+                session_id,
+                cwd,
+                artifact_dir,
+                code,
+                Some(timeout_secs as f64),
+                |_| {},
+            )
+            .map_err(Into::into)
+    }
+
+    fn direct_command_output(command: &str) -> anyhow::Result<Option<BrowserCommandOutput>> {
+        let argv = browser_command_words(command)?;
+        let args = strip_browser_prefix(&argv);
+        let first = args.first().map(String::as_str);
+        let content = match first {
+            None | Some("status") => Some(json!({
+                "status": "ok",
+                "browser_harness": "raw",
+                "note": "Use browser_script with browser-harness helpers for page work.",
+            })),
+            Some("list") | Some("profiles") | Some("use-profile") => None,
+            Some("local")
+                if matches!(args.get(1).map(String::as_str), Some("profiles" | "open")) =>
+            {
+                None
+            }
+            _ => Some(json!({
+                "status": "ok",
+                "browser_harness": "raw",
+                "command": command,
+                "message": "The legacy Rust browser command plane is disabled in this MVP. Use browser_script with browser-harness helpers.",
+            })),
+        };
+        Ok(content.map(|content| BrowserCommandOutput {
+            content,
+            events: Vec::new(),
+        }))
+    }
+
+    fn command_code(command: &str) -> anyhow::Result<String> {
+        let argv = browser_command_words(command)?;
+        let args = strip_browser_prefix(&argv);
+        let first = args.first().map(String::as_str);
+        let code = match first {
+            None | Some("status") => r#"
+result = {
+    "status": "ok",
+    "browser_harness": "raw",
+    "browsers": browser_list(),
+    "note": "Use browser_script with browser-harness helpers for page work.",
+}
+"#
+            .to_string(),
+            Some("list") => "result = {\"browsers\": browser_list()}".to_string(),
+            Some("profiles") => "result = browser_profiles(verbose=True)".to_string(),
+            Some("local") if args.get(1).map(String::as_str) == Some("profiles") => {
+                "result = browser_profiles(verbose=True)".to_string()
+            }
+            Some("local") if args.get(1).map(String::as_str) == Some("open") => {
+                let profile = args
+                    .iter()
+                    .position(|arg| arg == "--profile")
+                    .and_then(|idx| args.get(idx + 1))
+                    .cloned()
+                    .unwrap_or_default();
+                format!(
+                    "result = browser_use_profile({})",
+                    serde_json::to_string(&profile)?
+                )
+            }
+            Some("use-profile") => {
+                let profile = args.get(1).cloned().unwrap_or_default();
+                format!(
+                    "result = browser_use_profile({})",
+                    serde_json::to_string(&profile)?
+                )
+            }
+            _ => format!(
+                r#"
+result = {{
+    "status": "ok",
+    "browser_harness": "raw",
+    "command": {},
+    "message": "The legacy Rust browser command plane is disabled in this MVP. Use browser_script with browser-harness helpers.",
+}}
+"#,
+                serde_json::to_string(command)?
+            ),
+        };
+        Ok(code)
+    }
+}
+
+fn browser_script_output_from_python(response: RunPythonResponse) -> BrowserScriptOutput {
+    let harness_error = response
+        .browser_harness_error
+        .as_deref()
+        .filter(|error| !error.trim().is_empty())
+        .map(str::to_string);
+    let ok = response.ok && harness_error.is_none();
+    BrowserScriptOutput {
+        ok,
+        status: Some(if ok { "finished" } else { "failed" }.to_string()),
+        run_id: None,
+        next_observe_ms: None,
+        elapsed_ms: None,
+        ms_since_last_output: None,
+        text: response.text,
+        error: response
+            .error
+            .or_else(|| harness_error.map(|error| format!("browser_harness_error: {error}"))),
+        diagnosis: None,
+        data: response.data,
+        outputs: response.outputs,
+        summary: Vec::new(),
+        artifacts: response.artifacts,
+        images: response.images,
+        browser_events: response.browser_events,
+    }
+}
+
+impl BrowserBackend for HarnessBackend {
+    fn command(
+        &self,
+        session_id: &str,
+        cwd: &std::path::Path,
+        artifact_dir: &std::path::Path,
+        command: &str,
+    ) -> anyhow::Result<BrowserCommandOutput> {
+        if let Some(output) = Self::direct_command_output(command)? {
+            return Ok(output);
+        }
+        let response = self.run_python(
+            session_id,
+            cwd,
+            artifact_dir,
+            &Self::command_code(command)?,
+            60,
+        )?;
+        let content = if response.data.is_null() {
+            json!({
+                "status": if response.ok { "ok" } else { "failed" },
+                "browser_harness": "raw",
+                "text": response.text,
+                "error": response.error,
+                "browser_harness_error": response.browser_harness_error,
+            })
+        } else {
+            response.data
+        };
+        Ok(BrowserCommandOutput {
+            content,
+            events: response.browser_events,
+        })
+    }
+
+    fn run_script(
+        &self,
+        session_id: &str,
+        cwd: &std::path::Path,
+        artifact_dir: &std::path::Path,
+        code: &str,
+        timeout_secs: u64,
+    ) -> anyhow::Result<BrowserScriptOutput> {
+        let response = self.run_python(session_id, cwd, artifact_dir, code, timeout_secs)?;
+        Ok(browser_script_output_from_python(response))
+    }
+
+    fn start_script(
+        &self,
+        session_id: &str,
+        cwd: &std::path::Path,
+        artifact_dir: &std::path::Path,
+        code: &str,
+        timeout_secs: u64,
+    ) -> anyhow::Result<BrowserScriptOutput> {
+        self.run_script(session_id, cwd, artifact_dir, code, timeout_secs)
+    }
+
+    fn observe_script(
+        &self,
+        _session_id: &str,
+        run_id: &str,
+        _observe_timeout_ms: u64,
+    ) -> anyhow::Result<BrowserScriptOutput> {
+        Ok(BrowserScriptOutput {
+            ok: false,
+            status: Some("failed".to_string()),
+            text: String::new(),
+            error: Some(format!(
+                "browser_script observe is not supported by the raw browser-harness MVP; run_id={run_id}"
+            )),
+            ..Default::default()
+        })
+    }
+
+    fn cancel_script(
+        &self,
+        _session_id: &str,
+        run_id: &str,
+    ) -> anyhow::Result<BrowserScriptOutput> {
+        Ok(BrowserScriptOutput {
+            ok: false,
+            status: Some("failed".to_string()),
+            text: String::new(),
+            error: Some(format!(
+                "browser_script cancel is not supported by the raw browser-harness MVP; run_id={run_id}"
+            )),
+            ..Default::default()
+        })
+    }
+
+    fn set_browser_mode(&self, browser_mode: Option<String>) {
+        if let Ok(mut mode) = self.browser_mode.lock() {
+            *mode = browser_mode;
+        }
+    }
+
+    fn cleanup_session(&self, _session_id: &str) -> usize {
+        0
+    }
+
+    fn uses_raw_browser_harness(&self) -> bool {
+        true
     }
 }
 
@@ -2652,11 +2935,10 @@ impl std::fmt::Debug for BrowserTool {
 }
 
 impl BrowserTool {
-    /// Construct a browser tool backed by the real `browser-use-browser`
-    /// runtime.
+    /// Construct a browser tool backed by raw browser-harness.
     pub fn new() -> Self {
         Self {
-            backend: Arc::new(RealBackend::default()),
+            backend: Arc::new(HarnessBackend::default()),
             real_backend_mode: None,
             selected_browser_mode: None,
             dynamic_browser_mode_from_store: false,
@@ -2672,9 +2954,7 @@ impl BrowserTool {
     pub fn with_browser_mode(browser_mode: Option<String>) -> Self {
         let real_backend_mode = Arc::new(Mutex::new(browser_mode.clone()));
         Self {
-            backend: Arc::new(RealBackend::with_shared_browser_mode(Arc::clone(
-                &real_backend_mode,
-            ))),
+            backend: Arc::new(HarnessBackend::with_browser_mode(browser_mode.clone())),
             real_backend_mode: Some(real_backend_mode),
             selected_browser_mode: browser_mode,
             dynamic_browser_mode_from_store: false,
@@ -2972,32 +3252,38 @@ impl ToolRuntime<BrowserRequest, ExecOutput> for BrowserTool {
                     Ok(map_command_output(out))
                 }
                 BrowserAction::Execute { script, .. } => {
-                    if let Some(persistence) = &persistence {
-                        if let Some(preflight) = prepare_browser_for_script_with_shared_store(
-                            &persistence.store,
-                            backend.as_ref(),
-                            &session_id,
-                            &cwd,
-                            &artifact_dir,
-                            selected_browser_mode.as_deref(),
-                            selected_browser_profile_id.as_deref(),
-                            selected_local_browser.as_deref(),
-                        )? {
-                            return Ok(map_command_output(preflight));
+                    if !backend.uses_raw_browser_harness() {
+                        if let Some(persistence) = &persistence {
+                            if let Some(preflight) = prepare_browser_for_script_with_shared_store(
+                                &persistence.store,
+                                backend.as_ref(),
+                                &session_id,
+                                &cwd,
+                                &artifact_dir,
+                                selected_browser_mode.as_deref(),
+                                selected_browser_profile_id.as_deref(),
+                                selected_local_browser.as_deref(),
+                            )? {
+                                return Ok(map_command_output(preflight));
+                            }
                         }
-                    }
-                    // Re-resolve the secrets + nav policy on every run (fail closed)
-                    // so secret/domain changes take effect mid-session
-                    if let Some(persistence) = &persistence {
-                        let store = persistence.store.lock().map_err(|_| {
-                            ToolError::Other(anyhow::anyhow!("store mutex poisoned"))
-                        })?;
-                        super::secrets_admin::install_script_security(&store, &session_id)
-                            .map_err(|error| {
-                                ToolError::Other(anyhow::anyhow!(
-                                    "failed to apply browser security policy: {error:#}"
-                                ))
+                        // Re-resolve the secrets + nav policy on every run (fail closed)
+                        // so secret/domain changes take effect mid-session.
+                        //
+                        // Raw browser-harness does not use the legacy Rust
+                        // script-security registry; its helper surface should
+                        // come from the vendored harness package.
+                        if let Some(persistence) = &persistence {
+                            let store = persistence.store.lock().map_err(|_| {
+                                ToolError::Other(anyhow::anyhow!("store mutex poisoned"))
                             })?;
+                            super::secrets_admin::install_script_security(&store, &session_id)
+                                .map_err(|error| {
+                                    ToolError::Other(anyhow::anyhow!(
+                                        "failed to apply browser security policy: {error:#}"
+                                    ))
+                                })?;
+                        }
                     }
                     let out = backend
                         .start_script(&session_id, &cwd, &artifact_dir, &script, timeout_secs)
@@ -3196,6 +3482,9 @@ fn prepare_browser_for_script_with_shared_store(
     selected_browser_profile_id: Option<&str>,
     selected_local_browser: Option<&str>,
 ) -> Result<Option<BrowserCommandOutput>, ToolError> {
+    if backend.uses_raw_browser_harness() {
+        return Ok(None);
+    }
     let store = shared_store
         .lock()
         .map_err(|_| ToolError::Other(anyhow::anyhow!("store mutex poisoned")))?;
@@ -3312,7 +3601,7 @@ pub fn run_external_browser_command(
     artifact_dir: &std::path::Path,
     command: &str,
 ) -> anyhow::Result<BrowserCommandOutput> {
-    let backend = RealBackend::default();
+    let backend = HarnessBackend::default();
     set_backend_browser_mode_from_store(shared_store, &backend)?;
     let out = run_browser_command_with_shared_store(
         shared_store,
@@ -3353,7 +3642,7 @@ pub fn run_external_browser_script(
     code: &str,
     timeout_secs: u64,
 ) -> anyhow::Result<ExternalBrowserScriptOutcome> {
-    let backend = RealBackend::default();
+    let backend = HarnessBackend::default();
     set_backend_browser_mode_from_store(shared_store, &backend)?;
     if let Some(preflight) = prepare_browser_for_script_with_shared_store(
         shared_store,
@@ -3369,7 +3658,7 @@ pub fn run_external_browser_script(
     {
         return Ok(ExternalBrowserScriptOutcome::Blocked(preflight.content));
     }
-    {
+    if !backend.uses_raw_browser_harness() {
         let store = shared_store
             .lock()
             .map_err(|_| anyhow!("store mutex poisoned"))?;
@@ -3426,23 +3715,19 @@ mod browser_mode_tests {
     }
 
     #[test]
-    fn stored_cloud_preference_rejects_managed_only_recovery() {
+    fn stored_cloud_preference_leaves_legacy_recovery_to_raw_harness_backend() {
         let dir = tempfile::tempdir().unwrap();
         let store = Store::open(dir.path()).unwrap();
         store.set_setting(BROWSER_PREF_MODE, "cloud").unwrap();
 
-        let err = resolve_browser_command_for_selected_mode(
+        let resolved = resolve_browser_command_for_selected_mode(
             Some(&store),
             "browser recover restart-owned-browser",
             None,
             None,
         )
-        .unwrap_err();
+        .unwrap();
 
-        assert!(
-            err.to_string()
-                .contains("restart-owned-browser only applies to managed Chromium"),
-            "{err:#}"
-        );
+        assert_eq!(resolved, "browser recover restart-owned-browser");
     }
 }

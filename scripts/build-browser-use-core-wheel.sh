@@ -85,6 +85,8 @@ cp "$PACKAGE_SRC/README.md" "$STAGE/README.md"
 cp "$PACKAGE_SRC/src/browser_use_core/"*.py "$STAGE/src/browser_use_core/"
 cp "$BUILD_DIR/but$EXE_SUFFIX" "$STAGE/src/browser_use_core/bin/but$EXE_SUFFIX"
 cp "$BUILD_DIR/browser-use-terminal$EXE_SUFFIX" "$STAGE/src/browser_use_core/bin/browser-use-terminal$EXE_SUFFIX"
+cp -R "$ROOT/python/browser_harness" "$STAGE/src/browser_use_core/python/browser_harness"
+cp -R "$ROOT/python/browser_harness_skill" "$STAGE/src/browser_use_core/python/browser_harness_skill"
 cp -R "$ROOT/python/llm_browser_worker" "$STAGE/src/browser_use_core/python/llm_browser_worker"
 
 find "$STAGE/src/browser_use_core/python" -type d -name __pycache__ -prune -exec rm -rf {} +

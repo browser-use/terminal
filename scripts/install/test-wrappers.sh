@@ -93,8 +93,8 @@ EOF
 chmod +x "$CURRENT_LINK/bin/but" "$CURRENT_LINK/bin/browser-use-terminal"
 
 release_fixture="$STANDALONE_ROOT/releases/0.1.0-test-target"
-mkdir -p "$release_fixture/bin" "$release_fixture/python/llm_browser_worker"
-touch "$release_fixture/bin/but" "$release_fixture/bin/browser-use-terminal" "$release_fixture/python/llm_browser_worker/worker.py"
+mkdir -p "$release_fixture/bin" "$release_fixture/python/llm_browser_worker" "$release_fixture/python/browser_harness"
+touch "$release_fixture/bin/but" "$release_fixture/bin/browser-use-terminal" "$release_fixture/python/llm_browser_worker/worker.py" "$release_fixture/python/browser_harness/run.py"
 chmod +x "$release_fixture/bin/but" "$release_fixture/bin/browser-use-terminal"
 if release_dir_is_complete "$release_fixture" "0.1.0" "test-target"; then
   printf 'FAIL: release without managed rg should be incomplete\n' >&2

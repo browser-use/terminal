@@ -6,7 +6,7 @@ Task ID: {{task_id}}
 Task:
 {{task}}
 
-Use `browser` for browser connection/status/recovery and `browser_script` for browser interaction. Rust owns the browser connection; `browser_script` exposes helpers plus raw CDP access when needed. Prefer robust CDP/DOM observations over guessing. Use screenshots as verification checkpoints after meaningful visual transitions and whenever visible state, layout, blockers, coordinates, dynamic content, or final browser state matters.
+Use `browser_script` for browser work. Browser-harness owns connection, launch, profiles, cloud, and lifecycle through Python helpers such as `browser_new(...)`, `browser(id)`, `browser_profiles()`, and `browser_use_profile(...)`. Prefer robust helper/CDP/DOM observations over guessing. Use screenshots as verification checkpoints after meaningful visual transitions and whenever visible state, layout, blockers, coordinates, dynamic content, or final browser state matters.
 
 Filesystem contract: if the task asks you to save files, write them in the current working directory using relative paths. For large JSON/CSV/list results, save the full result to `result.json` or `result.csv` so it is available as an artifact. If the requested final answer is not an exact inline format, return a compact final answer with the output path, record count, schema/columns, and one sample row instead of pasting a giant blob.
 

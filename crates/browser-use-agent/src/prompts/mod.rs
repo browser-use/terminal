@@ -165,61 +165,27 @@ pub fn browser_mode_instruction(mode: &str) -> String {
     let normalized = mode.to_ascii_lowercase().replace(['_', ' '], "-");
     match normalized.as_str() {
         "local" | "local-chrome" => concat!(
-            "Selected browser mode: Local Chrome. Use `browser connect local` before page work. ",
-            "This attaches to a local Chromium-family browser exposing CDP.\n\n",
-            "Local Chrome requires a default profile before the first connect. Run `browser connect local`; if it reports `status: \"needs-user-action\"` because no default profile is set, show its `user_prompt` exactly and wait for the user's choice. Then run `browser profile use <profile-id>` and retry `browser connect local`. Use that one default profile setting for local Chrome.\n\n",
-            "After `browser connect local`, the runtime's `browser connect local` / `browser status --json` output is the source of truth. If it reports `status: \"needs-user-action\"` with multiple reachable `candidates`, ask the user which candidate/browser/profile to attach, then run `browser connect local --candidate <id>`.\n\n",
-            "If a browser/search/page task is blocked by Local Chrome connection, setup, permission, profile targeting, or disconnected status, STOP browser work and handle that blocker. Do NOT answer from memory, cached knowledge, or general web knowledge as a substitute for using Chrome. Follow the tool's `next_step` / `model_instruction`, ask the user for the required Chrome action if needed, then retry browser work.\n\n",
-            "When the connection is blocked, route by the right fields — there are two different `state` values in the JSON and they mean different things:\n",
-            "  • Each candidate inside `candidates[]` has its own `state` label (e.g. `stale-port`, `cdp-disabled`, `reachable`). IGNORE that label for routing — different labels can map to the same fix. Look at the candidate's `browser_running` and `remote_debugging_enabled` fields instead; those are the source of truth for cases A and B.\n",
-            "  • The top-level response of a connect ATTEMPT (especially `browser connect local --candidate <id>`) has its own `state` and `raw_error`. Those DO matter — they reflect what Chrome actually said when you tried to attach. Case C below routes on this top-level state (`permission-blocked` / HTTP 403) because Chrome's response to the attempt, not a pre-attempt guess from disk, is what tells you the per-session popup is in play.\n",
-            "Each fix changes Chrome's state, so re-run `browser connect local` to see what's next. Problems chain (Chrome not running → launch → retry → may now be fully connectable, OR may now need permission setup → handle whichever comes next).\n\n",
-            "`browser local profiles`, `browser profile suggest`, `browser profile use`, `browser local open`, and `browser local setup` are safe to run before connecting; they inspect, update, open/focus local profile state, or guide setup and do not themselves attach to a page.\n\n",
-            "Routing (re-evaluate after every retry):\n\n",
-            "  A) `browser_running: false` (Chrome process not running; can coexist with any value of `remote_debugging_enabled` — the field reflects the on-disk Local State even when the process is down):\n",
-            "      1. If the connect response says no default profile is set, ask the user which profile to set as default, mention `/profile`, run `browser profile use <profile-id>`, then retry `browser connect local`.\n",
-            "      2. If a default profile is already set, plain `browser connect local` may open/focus that saved profile before attaching when an already-reachable multi-profile Chrome endpoint would otherwise be ambiguous. If the selected profile target is missing, do not continue in an arbitrary existing Chrome profile; follow the returned `next_step`.\n",
-            "      3. If that retry returns `permission-blocked` / HTTP 403, the remote-debugging checkbox is already enabled and Chrome is showing the per-session popup. Follow case C. DO NOT run `browser local setup` and DO NOT tell the user to tick the checkbox again.\n\n",
-            "  B) `browser_running: true` AND `remote_debugging_enabled: false` (only this exact combination needs the chrome://inspect dance — DO NOT enter this branch if `remote_debugging_enabled` is `true` or missing):\n",
-            "      1. If no default profile is set, run `browser connect local` first and follow its profile-selection preflight. If a default profile is set, proceed silently.\n",
-            "      2. Run `browser local setup` to fetch the canonical URL (`chrome://inspect/#remote-debugging`) and step list. Then ALWAYS use the `shell` tool to open that URL for the user — DO NOT ask them to type chrome://inspect themselves. macOS: `open -a \"Google Chrome\" \"chrome://inspect/#remote-debugging\"` (Apple Events route chrome:// URLs; passing the URL as a plain CLI arg to the Chrome binary silently opens a blank tab on macOS — use `open -a`, not the binary). Linux: `google-chrome chrome://inspect/#remote-debugging`. Windows: `cmd /c start chrome chrome://inspect/#remote-debugging`. Adjust the app/binary if the user runs Edge/Brave/Canary. Only fall back to asking the user as a last resort if the shell command errors.\n",
-            "      3. Tell the user to tick 'Allow remote debugging for this browser instance' on the page you just opened, and reply when done. STOP — do NOT retry yet, and do NOT mention any Chrome popup. There is no popup at this stage.\n",
-            "      4. After they confirm, in the SAME chat message, warn them BEFORE you retry: Chrome is about to pop up asking 'Allow remote debugging?' and they should click Allow on it. THEN call `browser connect local` again in that same response. The user has to see the heads-up first so the popup doesn't blindside them.\n\n",
-            "  C) Candidate fields say `browser_running: true` AND `remote_debugging_enabled: true` BUT the latest fresh `browser connect local` ATTEMPT's top-level response is `state: \"permission-blocked\"` (or `raw_error` mentions HTTP 403 / Forbidden). Routing this case from the attempt's state is correct — the candidate fields alone can't tell you Chrome will reject the WebSocket; you only find out by trying. Do NOT infer this case from old chat history, old `browser status --json`, or a stale `last_issue`; if Chrome may have been closed/reopened or the user says no popup is visible, run `browser status --json` / `browser connect local` again and follow the latest result. The on-disk toggle is already on; Chrome is showing (or has queued) its per-session \"Allow remote debugging?\" popup and waiting on the user. DO NOT touch chrome://inspect, DO NOT tell the user to tick the checkbox — it's already ticked, that'd be confusing. Instead:\n",
-            "      1. If the latest tool result includes `profile_recovery_command`, run it first to open/focus the selected Chrome profile. Then immediately run `browser connect local` again; that fresh connection attempt is what triggers Chrome's visible \"Allow remote debugging?\" popup.\n",
-            "      2. If that fresh retry still returns `permission-blocked`, tell the user: \"Chrome is showing an 'Allow remote debugging?' popup somewhere — check each open Chrome window and click Allow. Reply when done.\" Mention that with multiple profile windows the popup may appear in a window they aren't looking at.\n",
-            "      3. After they confirm, retry `browser connect local`. If it still 403s, suggest they bring each Chrome window to the front in turn until they spot the popup, or close all but one Chrome window and try again.\n\n",
-            "If the first connection succeeds, continue with page work in the connected browser. If the connected browser is clearly the wrong account/session, stop and ask the user to change the default profile with `/profile` before continuing.\n\n",
-            "When the user chooses a default local profile in chat, run `browser profile use <profile-id>` and tell them they can change it anytime with `/profile`.\n\n",
-            "Never describe a terminal modal or button to click."
-        )
-        .to_string(),
-        "headless" | "headless-chromium" | "managed-headless" => concat!(
-            "Selected browser mode: Headless Chromium. Use `browser connect managed --headless` before page work. ",
-            "This starts a Rust-owned managed browser with an isolated automation profile."
-        )
-        .to_string(),
-        "managed" | "managed-headed" => concat!(
-            "Selected browser mode: managed headed browser. Use `browser connect managed --headed` before page work. ",
-            "This starts a Rust-owned visible browser with an isolated automation profile."
+            "Selected browser mode: Local Chrome via raw browser-harness. ",
+            "Use normal browser-harness page helpers. If setup asks for a profile, run `browser_profiles()`, ask the user which `id` to use, run `browser_use_profile(id)`, then retry page work. Do not use old `browser connect local` commands."
         )
         .to_string(),
         "cloud" | "browser-use-cloud" => concat!(
-            "Selected browser mode: Browser Use cloud. Use `browser connect` before page work. ",
-            "Plain `browser connect` uses the remembered cloud profile when one is set. ",
-            "Remote start means start and connect; use `browser remote live-url` to retrieve the watch URL."
+            "Selected browser mode: Browser Use cloud via raw browser-harness. ",
+            "Create a browser with `browser_new(\"cloud\")`, keep the returned `id`, and call `browser(id)` before page helpers in each script. If auth is required, tell the user to run `browser-harness auth login` or complete the terminal auth flow."
+        )
+        .to_string(),
+        "headless" | "headless-chromium" | "managed" | "managed-headed" | "managed-headless" => concat!(
+            "Selected browser mode: isolated private browser via raw browser-harness. ",
+            "Create it with `browser_new(\"private\")`, keep the returned `id`, and call `browser(id)` before page helpers in each script. Do not use old managed-browser connect commands."
         )
         .to_string(),
         "remote-cdp" | "cdp" => concat!(
-            "Selected browser mode: Remote CDP. The evaluation harness already provides the browser endpoint. ",
-            "Do not call `browser connect managed`, `browser connect local`, or `browser remote start`. ",
-            "If the task says the browser session is already open at the start URL, first inspect the current page with `browser_script` using `page_info()` and extraction/screenshot as needed; do not navigate to that same URL again unless the current page URL is wrong. ",
-            "Otherwise start page work directly with `browser_script` using `new_tab(url)` for first navigation, or `goto_url(url)` only when the current tab should be reused; trust its `navigation_ready` page_info result when the URL is correct, then inspect/extract instead of repeating the same navigation. ",
-            "Use `browser status --json` only if you need to inspect the current connection."
+            "Selected browser mode: externally provided CDP/browser context. ",
+            "Use raw browser-harness helpers directly. If a managed browser id is provided, call `browser(id)` before page helpers; otherwise inspect with normal helpers and follow browser-harness setup errors."
         )
         .to_string(),
         other => format!(
-            "Selected browser mode: {other}. Use `browser status --json` first, then choose an explicit browser connect command."
+            "Selected browser mode: {other}. Use raw browser-harness helpers; create `browser_new(\"private\")` or `browser_new(\"cloud\")` when an isolated managed browser is needed, then call `browser(id)` before page helpers."
         ),
     }
 }

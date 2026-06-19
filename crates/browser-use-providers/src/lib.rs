@@ -12377,7 +12377,7 @@ mod tests {
     }
 
     #[test]
-    fn default_instructions_preserve_bitter_cdp_browser_harness_contract() {
+    fn default_instructions_preserve_raw_browser_harness_contract() {
         let instructions = default_instructions();
         assert!(instructions.starts_with("You are Browser Use Terminal, a web agent"));
         for expected in [
@@ -12390,28 +12390,27 @@ mod tests {
             "NEVER revert existing changes you did not make",
             "**NEVER** use destructive commands like `git reset --hard`",
             "If the user asks for a \"review\", default to a code review mindset",
-            "bitter lesson",
-            "Raw CDP is the center",
-            "source of truth",
+            "Browser Agent Contract",
+            "raw browser-harness",
+            "The terminal does not own CDP",
+            "Browser-harness owns all of that",
+            "browser_new(\"private\")",
+            "browser_new(\"cloud\")",
+            "browser(\"<id>\")",
+            "Do not rely",
+            "on a current browser across separate tool calls",
             "new_tab(url)",
             "not `goto_url(url)`",
-            "Prefer coordinate clicks",
-            "Chrome hit-testing handles iframes",
-            "Never bulk-fill a live form by setting DOM values",
-            "screenshot(\"label\")",
-            "input_image",
-            "agent_helpers.py",
-            "Browser interaction tool",
+            "capture_screenshot()",
+            "click_at_xy(x, y)",
+            "cdp(\"Domain.method\"",
+            "Do not use old Rust browser commands",
             "Loaded Browser-Harness Interaction Skills",
-            "Use helper agents only when the user explicitly asks",
-            "detailed codebase analysis do not by themselves authorize spawning",
             "interaction-skills/screenshots.md",
             "interaction-skills/tabs.md",
             "interaction-skills/dialogs.md",
             "interaction-skills/forms.md",
             "JS may inspect forms; browser input actions mutate forms",
-            "Do not build manager layers",
-            "Do not import or install Playwright",
         ] {
             assert!(
                 instructions.contains(expected),

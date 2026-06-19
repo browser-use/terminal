@@ -920,7 +920,9 @@ async fn driver_prepends_selected_browser_mode_instruction_to_messages() {
     assert!(
         matches!(
             req.messages[0].content.first(),
-            Some(ContentPart::Text { text, .. }) if text.contains("Use `browser connect local` before page work")
+            Some(ContentPart::Text { text, .. }) if text.contains("Local Chrome via raw browser-harness")
+                && text.contains("browser_profiles()")
+                && text.contains("browser_use_profile(id)")
         ),
         "mode instruction message was not prepended: {:?}",
         req.messages[0]

@@ -11407,13 +11407,11 @@ mod tests {
     #[test]
     fn browser_help_is_cli_like() {
         let help = browser_help();
-        assert!(help.contains("browser status --json"));
-        assert!(help.contains("browser connect local"));
-        assert!(help.contains("browser domain skills --domain"));
+        assert!(help.contains("raw browser-harness MVP"));
+        assert!(help.contains("browser_new(\"private\")"));
+        assert!(help.contains("browser(id)"));
         assert!(help.contains("browser_script"));
-        assert!(help
-            .to_ascii_lowercase()
-            .contains("remote start means start and connect"));
+        assert!(help.contains("old Rust browser control plane"));
     }
 
     #[test]
@@ -13417,13 +13415,13 @@ print("bridge retry ok")
     }
 
     #[test]
-    fn browser_script_initial_wait_defaults_to_fifteen_seconds_and_clamps_env() {
+    fn browser_script_initial_wait_defaults_to_thirty_seconds_and_clamps_env() {
         {
             let _env = EnvRestore::unset(&[
                 "BU_BROWSER_SCRIPT_INITIAL_WAIT_MS",
                 "BROWSER_SCRIPT_INITIAL_WAIT_MS",
             ]);
-            assert_eq!(browser_script_initial_wait_ms(), 15_000);
+            assert_eq!(browser_script_initial_wait_ms(), 30_000);
         }
         {
             let _env = EnvRestore::set(&[("BU_BROWSER_SCRIPT_INITIAL_WAIT_MS", "1500")]);

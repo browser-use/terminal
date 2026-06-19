@@ -479,26 +479,27 @@ fn browser_backend_for_runtime_or_config(
                             ..RuntimeBrowserConfig::default()
                         },
                     )?;
-                    let browser_registries = handle.browser_physical_registries(&browser_id)?;
                     Ok(RuntimeBrowserBackend {
                         session_id: session_id.as_str().to_string(),
                         runtime: handle.clone(),
                         agent_id,
                         browser_id,
                         backend: Arc::new(
-                            crate::tools::handlers::browser::RealBackend::with_browser_mode_and_registries(
+                            crate::tools::handlers::browser::HarnessBackend::with_browser_mode(
                                 config.options.browser_mode.clone(),
-                                browser_registries.session_registry(),
-                                browser_registries.script_registry(),
                             ),
                         ),
                     })
                 },
                 |resource: Arc<RuntimeBrowserBackend>| {
-                    let cleaned = resource.backend.cleanup_session(&resource.session_id);
-                    let _ = resource
+                    let mut cleaned = resource.backend.cleanup_session(&resource.session_id);
+                    if resource
                         .runtime
-                        .close_browser_for_agent(&resource.browser_id, &resource.agent_id);
+                        .close_browser_for_agent(&resource.browser_id, &resource.agent_id)
+                        .is_ok()
+                    {
+                        cleaned += 1;
+                    }
                     cleaned
                 },
             )
@@ -513,7 +514,7 @@ fn browser_backend_for_runtime_or_config(
     }
 
     Ok(Arc::new(
-        crate::tools::handlers::browser::RealBackend::with_browser_mode(
+        crate::tools::handlers::browser::HarnessBackend::with_browser_mode(
             config.options.browser_mode.clone(),
         ),
     ))

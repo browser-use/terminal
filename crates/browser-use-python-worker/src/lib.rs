@@ -158,6 +158,8 @@ impl PythonWorker {
                 "fetch-use==0.4.0",
                 "--with",
                 "pillow==12.2.0",
+                "--with",
+                "websockets==15.0.1",
                 "python",
             ];
             if let Ok(worker) = Self::start_with_program_args(
@@ -803,7 +805,7 @@ def current_tab():
 "#,
         )?;
         let pythonpath =
-            std::env::join_paths([repo_root.join("python"), temp.path().to_path_buf()])?;
+            std::env::join_paths([temp.path().to_path_buf(), repo_root.join("python")])?;
         let mut worker = PythonWorker::start_with_pythonpath("python3", pythonpath)?;
         let mut events = Vec::new();
         let response = worker.run_with_events(
@@ -875,7 +877,7 @@ def current_tab():
 "#,
         )?;
         let pythonpath =
-            std::env::join_paths([repo_root.join("python"), temp.path().to_path_buf()])?;
+            std::env::join_paths([temp.path().to_path_buf(), repo_root.join("python")])?;
         let mut worker = PythonWorker::start_with_pythonpath("python3", pythonpath)?;
         let response = worker.run(
             "s1",
@@ -940,7 +942,7 @@ def current_tab():
 "#,
         )?;
         let pythonpath =
-            std::env::join_paths([repo_root.join("python"), temp.path().to_path_buf()])?;
+            std::env::join_paths([temp.path().to_path_buf(), repo_root.join("python")])?;
         let mut worker = PythonWorker::start_with_pythonpath("python3", pythonpath)?;
         let first = worker.run(
             "s1",
@@ -1029,7 +1031,7 @@ def set_identity(next_target_id, next_session_id, next_url, next_title):
 "#,
         )?;
         let pythonpath =
-            std::env::join_paths([repo_root.join("python"), temp.path().to_path_buf()])?;
+            std::env::join_paths([temp.path().to_path_buf(), repo_root.join("python")])?;
         let mut worker = PythonWorker::start_with_pythonpath("python3", pythonpath)?;
 
         let first = worker.run(
