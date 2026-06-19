@@ -899,6 +899,7 @@ trait DatasetRunner: Clone + Send + Sync + 'static {
         store: &Store,
         session_id: &str,
         options: AgentRunOptions,
+        cancellation_token: tokio_util::sync::CancellationToken,
     ) -> Result<()>;
 }
 
@@ -913,10 +914,17 @@ impl DatasetRunner for ConfigDatasetRunner {
         store: &Store,
         session_id: &str,
         options: AgentRunOptions,
+        cancellation_token: tokio_util::sync::CancellationToken,
     ) -> Result<()> {
         let mut config = self.config.clone();
         config.options = merge_dataset_provider_run_options(&config.options, options);
-        run_existing_session_from_config_and_notify(store, session_id, config, None)?;
+        run_existing_session_from_config_and_notify_with_cancel(
+            store,
+            session_id,
+            config,
+            None,
+            cancellation_token,
+        )?;
         Ok(())
     }
 }
@@ -2928,7 +2936,31 @@ fn run_existing_session_from_config_and_notify(
     config: ProviderRunConfig,
     expected_run_id: Option<String>,
 ) -> Result<String> {
-    let result = run_session_via_engine(store, task_id, config);
+    run_existing_session_from_config_and_notify_with_cancel(
+        store,
+        task_id,
+        config,
+        expected_run_id,
+        tokio_util::sync::CancellationToken::new(),
+    )
+}
+
+fn run_existing_session_from_config_and_notify_with_cancel(
+    store: &Store,
+    task_id: &str,
+    config: ProviderRunConfig,
+    expected_run_id: Option<String>,
+    cancellation_token: tokio_util::sync::CancellationToken,
+) -> Result<String> {
+    let runtime_handle = cli_runtime_handle(store)?;
+    let result = run_session_via_engine_with_runtime_and_cancel(
+        store,
+        task_id,
+        config,
+        runtime_handle,
+        cancellation_token,
+        None,
+    );
     let run_error = result.as_ref().err().map(|error| format!("{error:#}"));
     let child_id = result.as_deref().unwrap_or(task_id);
     notify_parent_after_cli_child_run(store, child_id, run_error, expected_run_id.as_deref())?;
@@ -9984,13 +10016,178 @@ fn run_dataset_case_with_provider<R: DatasetRunner>(
         agent_roles: AgentRunOptions::default().agent_roles,
         codex_engine: false,
     };
+    let cancellation_token = tokio_util::sync::CancellationToken::new();
+    let _safety_guard = start_dataset_case_safety_guard(
+        store,
+        &session_id,
+        &case.task_id,
+        cancellation_token.clone(),
+    );
     let run_error = runner
-        .run_dataset_session(store, &session_id, agent_options)
+        .run_dataset_session(store, &session_id, agent_options, cancellation_token)
         .err()
         .map(|error| format!("{error:#}"));
     let result = dataset_attempt_result(store, case, &session_id, config, attempt, run_error)?;
     spawn_dataset_browser_cleanup(store, &session_id);
     Ok(result)
+}
+
+struct DatasetCaseSafetyGuard {
+    done_tx: Option<mpsc::Sender<()>>,
+}
+
+impl Drop for DatasetCaseSafetyGuard {
+    fn drop(&mut self) {
+        if let Some(done_tx) = self.done_tx.take() {
+            let _ = done_tx.send(());
+        }
+    }
+}
+
+fn start_dataset_case_safety_guard(
+    store: &Store,
+    session_id: &str,
+    task_id: &str,
+    cancellation_token: tokio_util::sync::CancellationToken,
+) -> Option<DatasetCaseSafetyGuard> {
+    let timeout_seconds = dataset_task_timeout_seconds();
+    let token_cap = dataset_task_token_cap();
+    if timeout_seconds.is_none() && token_cap.is_none() {
+        return None;
+    }
+
+    let state_dir = store.state_dir().to_path_buf();
+    let session_id = session_id.to_string();
+    let task_id = task_id.to_string();
+    let poll_interval = Duration::from_secs(dataset_task_safety_poll_seconds());
+    let (done_tx, done_rx) = mpsc::channel();
+    thread::spawn(move || {
+        let started = Instant::now();
+        loop {
+            match done_rx.recv_timeout(poll_interval) {
+                Ok(()) | Err(mpsc::RecvTimeoutError::Disconnected) => return,
+                Err(mpsc::RecvTimeoutError::Timeout) => {}
+            }
+
+            if let Some(timeout_seconds) = timeout_seconds {
+                if started.elapsed() >= Duration::from_secs(timeout_seconds) {
+                    cancel_dataset_case_for_safety(
+                        &state_dir,
+                        &session_id,
+                        &task_id,
+                        cancellation_token,
+                        "wall_clock_timeout",
+                        serde_json::json!({
+                            "timeout_seconds": timeout_seconds,
+                            "elapsed_ms": started.elapsed().as_millis() as u64,
+                        }),
+                    );
+                    return;
+                }
+            }
+
+            if let Some(token_cap) = token_cap {
+                let total_tokens =
+                    latest_dataset_session_total_tokens(&state_dir, &session_id).unwrap_or(0);
+                if total_tokens >= token_cap {
+                    cancel_dataset_case_for_safety(
+                        &state_dir,
+                        &session_id,
+                        &task_id,
+                        cancellation_token,
+                        "token_cap",
+                        serde_json::json!({
+                            "token_cap": token_cap,
+                            "total_tokens": total_tokens,
+                            "elapsed_ms": started.elapsed().as_millis() as u64,
+                        }),
+                    );
+                    return;
+                }
+            }
+        }
+    });
+
+    Some(DatasetCaseSafetyGuard {
+        done_tx: Some(done_tx),
+    })
+}
+
+fn cancel_dataset_case_for_safety(
+    state_dir: &Path,
+    session_id: &str,
+    task_id: &str,
+    cancellation_token: tokio_util::sync::CancellationToken,
+    reason: &str,
+    details: Value,
+) {
+    cancellation_token.cancel();
+    let message = format!("dataset task safety guard cancelled {task_id}: {reason}");
+    if let Ok(store) = Store::open(state_dir) {
+        let _ = store.append_event(
+            session_id,
+            "dataset.task_safety_cancelled",
+            serde_json::json!({
+                "task_id": task_id,
+                "reason": reason,
+                "message": message,
+                "details": details,
+            }),
+        );
+        let _ = store.request_cancel(session_id, &message);
+    }
+}
+
+fn dataset_task_timeout_seconds() -> Option<u64> {
+    optional_u64_env("BROWSER_USE_DATASET_TASK_TIMEOUT_SECONDS")
+}
+
+fn dataset_task_token_cap() -> Option<u64> {
+    optional_u64_env("BROWSER_USE_DATASET_TASK_TOKEN_CAP")
+}
+
+fn dataset_task_safety_poll_seconds() -> u64 {
+    optional_u64_env("BROWSER_USE_DATASET_TASK_SAFETY_POLL_SECONDS")
+        .unwrap_or(10)
+        .max(1)
+}
+
+fn optional_u64_env(name: &str) -> Option<u64> {
+    let value = std::env::var(name).ok()?;
+    let value = value.trim();
+    if value.is_empty() || value == "0" {
+        return None;
+    }
+    value.parse::<u64>().ok().filter(|value| *value > 0)
+}
+
+fn latest_dataset_session_total_tokens(state_dir: &Path, session_id: &str) -> Option<u64> {
+    let store = Store::open(state_dir).ok()?;
+    let events = store.events_for_session(session_id).ok()?;
+    let mut latest_cumulative = None;
+    let mut summed_usage = 0_u64;
+    for event in events.iter().rev() {
+        if latest_cumulative.is_none() {
+            latest_cumulative = codex_total_tokens_from_payload(&event.payload);
+        }
+        if event.event_type == "model.usage" {
+            summed_usage = summed_usage.saturating_add(
+                event
+                    .payload
+                    .get("total_tokens")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(0),
+            );
+        }
+    }
+    latest_cumulative.or_else(|| (summed_usage > 0).then_some(summed_usage))
+}
+
+fn codex_total_tokens_from_payload(payload: &Value) -> Option<u64> {
+    payload
+        .pointer("/notification/params/tokenUsage/total/totalTokens")
+        .or_else(|| payload.pointer("/params/tokenUsage/total/totalTokens"))
+        .and_then(Value::as_u64)
 }
 
 #[cfg(test)]
@@ -10082,6 +10279,7 @@ fn dataset_attempt_result(
     let final_result_chars = final_result.as_deref().map(str::len).unwrap_or(0);
     let usage = usage_summary_from_events(&events);
     let session_failure = failure_from_events(&events);
+    let safety_failure = dataset_safety_failure_from_events(&events);
     if let Some(mirror) =
         mirror_dataset_final_artifact(case, Path::new(&session.cwd), final_result.as_deref())?
     {
@@ -10116,11 +10314,14 @@ fn dataset_attempt_result(
     let error = run_error
         .clone()
         .or(session_failure.clone())
+        .or(safety_failure.clone())
         .or(artifact_audit_error.clone());
     let error_type = if run_error.is_some() {
         Value::String("provider".to_string())
     } else if session_failure.is_some() {
         Value::String("session".to_string())
+    } else if safety_failure.is_some() {
+        Value::String("dataset_safety".to_string())
     } else if artifact_audit_error.is_some() {
         Value::String("artifact_audit".to_string())
     } else {
@@ -10152,6 +10353,23 @@ fn dataset_attempt_result(
             "artifact_root": session.artifact_root,
         },
     }))
+}
+
+fn dataset_safety_failure_from_events(
+    events: &[browser_use_protocol::EventRecord],
+) -> Option<String> {
+    events
+        .iter()
+        .rev()
+        .find(|event| event.event_type == "dataset.task_safety_cancelled")
+        .and_then(|event| {
+            event
+                .payload
+                .get("message")
+                .and_then(Value::as_str)
+                .or_else(|| event.payload.get("reason").and_then(Value::as_str))
+        })
+        .map(str::to_string)
 }
 
 fn dataset_artifact_audit(case: &DatasetCase, cwd: &Path, artifact_root: &Path) -> Result<Value> {
@@ -10500,6 +10718,8 @@ fn new_dataset_manifest(
         "max_attempts": options.max_attempts.max(1),
         "max_turns": config.max_turns,
         "python_timeout_seconds": config.python_timeout_seconds,
+        "task_timeout_seconds": dataset_task_timeout_seconds(),
+        "task_token_cap": dataset_task_token_cap(),
         "simple_harness": config.simple_harness,
         "codex_engine": config.codex_engine,
         "headless": config.browser_mode != "cloud",

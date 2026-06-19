@@ -286,6 +286,29 @@ Gate 7 attempt log:
 - Fix: the embedded CodexEngine in-process app-server channel capacity is now
   65,536 events instead of 1,024, matching the high-throughput eval path rather
   than the small default transport path.
+- Aborted run:
+  `/home/exedev/eval-runs/ibh-simple-harness-openai-simple-harness-parity-test-20260618-20260619-034811`.
+- Result before manual stop: 105 completed sessions, 0 failed sessions, 1
+  running session (`6dpbhs`), with no `session.failed`, `agent.failed`, or
+  `codex.event_lagged` events. The run was stopped with Ctrl-C after the last
+  task continued active beyond 6,800 events and roughly 25M cumulative Codex
+  token-usage events.
+- Reason: removing the 80-turn cap exposed an eval-runner safety gap. A single
+  hard archival lookup can keep burning tokens indefinitely while still
+  emitting valid events, so a full judged run can fail to become judgeable even
+  when the implementation is otherwise healthy.
+- Fix: dataset runs now thread a cancellation token into
+  `run_existing_session_from_config_and_notify`, and the Internal_Bench_hard
+  script opts into a generous eval safety guard:
+  `TASK_TIMEOUT_SECONDS=2700`, `TASK_TOKEN_CAP=30000000`, and
+  `TASK_SAFETY_POLL_SECONDS=10`. Safety cancellation records
+  `dataset.task_safety_cancelled`, requests session cancellation, and marks the
+  task result as `error_type=dataset_safety` instead of leaving it pending.
+- Verification after fix:
+  - `cargo fmt --check`
+  - `cargo test`
+  - `uv run --with pytest python -m pytest -q`
+  - `bash -n scripts/run-internal-bench-hard-openai.sh`
 
 ## Stop Conditions
 
@@ -305,10 +328,13 @@ Stop and do not claim completion if any of these occur:
 
 ## Current Status
 
-Active phase: Gate 7 full eval.
+Active phase: Gate 7 full eval, rerun after eval safety guard.
 
 Next concrete action:
 
-1. Commit the implementation checkpoint.
-2. Launch the full Internal_Bench_hard run only after the smoke artifacts show
-   `codex_engine=true`, browser-harness events, and complete final capture.
+1. Commit the dataset safety guard checkpoint.
+2. Relaunch full Internal_Bench_hard with `JUDGE_AFTER_RUN=1`,
+   `CONCURRENCY=25`, cloud browser mode, CodexEngine, simple harness, 10k
+   model-turn cap, and the eval safety guard enabled.
+3. Judge and compare task-by-task against the raw Codex + browser-harness
+   reference aggregate.
