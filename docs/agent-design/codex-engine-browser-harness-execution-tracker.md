@@ -34,9 +34,11 @@ Codex fork:
 Browser-harness:
 
 - path: `/home/exedev/repos/browser-harness`
-- commit: `785fb47b26e168862f3ae4546d4746602b523a7c`
-- status at snapshot: dirty
-- dirty files:
+- initial inspected commit: `785fb47b26e168862f3ae4546d4746602b523a7c`
+- pinned snapshot branch: `but-manager-profile-snapshot-20260619`
+- pinned snapshot commit: `91dbc6b1340c029bb841f7824fb74bb64434ab48`
+- status after pinning: clean
+- files included in the pinned snapshot:
   - `agent-workspace/agent_helpers.py`
   - `src/browser_harness/admin.py`
   - `src/browser_harness/daemon.py`
@@ -48,6 +50,9 @@ Browser-harness:
   - `docs/browser-manager-implementation-plan.md`
   - `docs/browser-manager-interface-plan.md`
   - `docs/browser-manager-v2-plan.md`
+- focused verification before pinning:
+  - `uv run --with pytest python -m pytest -q tests/unit/test_admin.py tests/unit/test_daemon_profile_context.py tests/unit/test_run.py`
+  - result: `76 passed in 0.32s`
 
 Dataset:
 
@@ -58,15 +63,25 @@ Dataset:
 
 ### Gate 0: Source And Eval Inputs Frozen
 
-- [ ] Browser Use Terminal implementation branch is committed.
-- [ ] Codex fork commit or patch branch is committed.
-- [ ] Browser-harness commit is pinned.
-- [ ] Browser-harness dirty changes are either committed or archived in eval
+- [x] Browser Use Terminal planning/tracker branch is committed.
+- [x] Codex fork baseline commit is recorded.
+- [x] Browser-harness commit is pinned.
+- [x] Browser-harness dirty changes are either committed or archived in eval
       metadata.
+- [x] Dataset hash is recorded in this tracker.
 - [ ] Dataset hash is recorded in every full eval run.
-- [ ] Internal_Bench_hard runner dry-run shows cloud, simple harness, 10k turns,
+- [x] Internal_Bench_hard runner dry-run shows cloud, simple harness, 10k turns,
       expected model, expected concurrency.
-- [ ] `MAX_TURNS=80` dry-run fails before launching.
+- [x] `MAX_TURNS=80` dry-run fails before launching.
+
+Gate 0 verification:
+
+- dry-run command:
+  - `scripts/run-internal-bench-hard-openai.sh --dry-run --judge --run-id audit-dry-run --root /tmp/ibh-audit-dry-run`
+  - result: command includes `-c simple_harness=true`, `-c disable_local_search=true`, `--model gpt-5.5`, `--max-turns 10000`, `--python-timeout-seconds 180`, `--max-attempts 1`, `--concurrency 25`, `--browser-mode cloud`, and judge concurrency `5`.
+- no-80 guard:
+  - `MAX_TURNS=80 scripts/run-internal-bench-hard-openai.sh --dry-run --run-id no80-check --root /tmp/ibh-no80-check`
+  - result: exits `2` with `MAX_TURNS must stay >= 10000 for Internal_Bench_hard parity`.
 
 ### Gate 1: CodexEngine Single-Session Proof
 
@@ -170,12 +185,8 @@ Stop and do not claim completion if any of these occur:
 
 ## Current Status
 
-Active phase: Gate 0.
+Active phase: Gate 1.
 
 Next concrete action:
 
-1. Commit or archive the two new planning docs.
-2. Decide whether browser-harness dirty changes are the intended manager branch
-   state or need to be moved to a clean branch.
-3. Start `CodexEngine` single-session implementation.
-
+1. Start `CodexEngine` single-session implementation.
