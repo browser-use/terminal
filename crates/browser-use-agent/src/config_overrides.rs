@@ -301,6 +301,10 @@ pub struct AgentRunOptions {
     /// Opt into the Codex-style browser-harness surface: a lean prompt, shell
     /// access to `browser-harness`, and no product browser/python/done tools.
     pub simple_harness: bool,
+    /// Run the task through embedded Codex app-server instead of the Browser Use
+    /// provider/turn loop. This is separate from `simple_harness` so tests and
+    /// rollouts can prove each layer independently.
+    pub codex_engine: bool,
     pub base_instructions: Option<String>,
     pub developer_instructions: Option<String>,
     pub compact_prompt: Option<String>,
@@ -375,6 +379,7 @@ impl Default for AgentRunOptions {
             config_overrides: Vec::new(),
             session_thread_config: None,
             simple_harness: false,
+            codex_engine: false,
             base_instructions: None,
             developer_instructions: None,
             compact_prompt: None,
@@ -488,6 +493,11 @@ impl AgentRunOptions {
 
     pub fn with_simple_harness(mut self, enabled: bool) -> Self {
         self.simple_harness = enabled;
+        self
+    }
+
+    pub fn with_codex_engine(mut self, enabled: bool) -> Self {
+        self.codex_engine = enabled;
         self
     }
 
@@ -831,6 +841,19 @@ pub fn apply_runtime_config_overrides(
         ],
     ) {
         options.simple_harness = value;
+        if !value {
+            options.codex_engine = false;
+        }
+    }
+    if let Some(value) = config_override_bool_any(
+        overrides,
+        &[
+            "codex_engine",
+            "agent.codex_engine",
+            "features.codex_engine",
+        ],
+    ) {
+        options.codex_engine = value;
     }
     if let Some(value) = config_override_str(overrides, "base_instructions") {
         options.base_instructions = Some(value);
@@ -1915,6 +1938,7 @@ command = "profile-server"
         assert!(options.config_overrides.is_empty());
         assert!(options.session_thread_config.is_none());
         assert!(!options.simple_harness);
+        assert!(!options.codex_engine);
         assert!(options.base_instructions.is_none());
         assert!(options.developer_instructions.is_none());
         assert!(options.compact_prompt.is_none());
@@ -1951,6 +1975,7 @@ command = "profile-server"
             "browser_profile_label=\"Work\"",
             "browser_local_browser=\"Google Chrome\"",
             "simple_harness=true",
+            "codex_engine=true",
             "python_tool_timeout_seconds=45",
             "model_compaction_enabled=false",
             "full_llm_input_events=true",
@@ -1972,6 +1997,7 @@ command = "profile-server"
             Some("Google Chrome")
         );
         assert!(options.simple_harness);
+        assert!(options.codex_engine);
         assert_eq!(options.python_tool_timeout_seconds, 45);
         assert!(!options.model_compaction_enabled);
         assert!(options.full_llm_input_events);

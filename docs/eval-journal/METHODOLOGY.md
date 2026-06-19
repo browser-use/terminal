@@ -30,7 +30,7 @@ codebase, and prove fixes. Everything below is reusable machinery in /home/exede
   the old cap.
 - For `Internal_Bench_hard` browser-harness parity, use the minimal simple-harness surface rather
   than the full product browser/supervisor tool surface:
-  `browser-use-terminal -c simple_harness=true -c disable_local_search=true --state-dir "$ROOT/state" dataset-run-openai /home/exedev/datasets/Internal_Bench_hard.json --all --model gpt-5.5 --max-turns 10000 --python-timeout-seconds 180 --max-attempts 1 --concurrency 25 --browser-mode cloud --run-id "$RUN_ID"`.
+  `browser-use-terminal -c simple_harness=true -c codex_engine=true -c disable_local_search=true --state-dir "$ROOT/state" dataset-run-openai /home/exedev/datasets/Internal_Bench_hard.json --all --model gpt-5.5 --max-turns 10000 --python-timeout-seconds 180 --max-attempts 1 --concurrency 25 --browser-mode cloud --run-id "$RUN_ID"`.
 - Preferred current runner:
   `scripts/run-internal-bench-hard-openai.sh`. It enforces the same contract, refuses to run
   without model + cloud browser credentials, writes `run-env.txt`, runs a 30s SQLite health check,

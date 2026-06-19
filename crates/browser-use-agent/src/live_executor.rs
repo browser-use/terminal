@@ -6,6 +6,9 @@ use std::thread;
 use std::time::Duration;
 
 use anyhow::{anyhow, Context, Result};
+use browser_use_codex_engine::{
+    run_codex_engine_turn, CodexEngineRunSpec, CodexProjectedEvent, OPENAI_API_PROVIDER_ID,
+};
 use browser_use_protocol::EventRecord;
 use browser_use_runtime::{
     AgentId, AttachChildAgentRequest, AttachRootAgentRequest, BrowserId as RuntimeBrowserId,
@@ -16,7 +19,7 @@ use browser_use_store::{Store, StoreNotifier};
 use serde_json::json;
 use tokio_util::sync::CancellationToken;
 
-use crate::config_overrides::ProviderRunConfig;
+use crate::config_overrides::{ProviderBackend, ProviderRunConfig, RunConfigValueSource};
 use crate::entrypoint::RuntimeTurnDriver;
 use crate::session::SharedStore;
 use crate::simple_harness;
@@ -124,6 +127,7 @@ impl RuntimeAgentExecutor {
         let tokio = tokio::runtime::Builder::new_multi_thread()
             .enable_all()
             .thread_name("browser-use-live-agent-runtime")
+            .thread_stack_size(16 * 1024 * 1024)
             .worker_threads(config.worker_threads)
             .build()
             .context("build live agent tokio runtime")?;
@@ -168,6 +172,9 @@ impl RuntimeAgentExecutor {
         let simple_harness_enabled = run_config.options.simple_harness;
         if simple_harness_enabled {
             simple_harness::prepare_existing_session(&store, &request.session_id, &mut run_config)?;
+        }
+        if run_config.options.codex_engine {
+            return self.run_codex_engine_blocking(request, store, run_config);
         }
         ensure_agent_attached(
             &self.inner.runtime,
@@ -286,6 +293,166 @@ impl RuntimeAgentExecutor {
                 if simple_harness_enabled {
                     let _ = mirror_session_outputs(&shared_store, &request_session_id);
                     cleanup_simple_harness_session(&shared_store, &request_session_id);
+                }
+                Err(error)
+            }
+        }
+    }
+
+    fn run_codex_engine_blocking(
+        &self,
+        request: RuntimeAgentRunRequest,
+        store: Store,
+        run_config: ProviderRunConfig,
+    ) -> Result<RuntimeAgentRunResult> {
+        let runtime_session_id = RuntimeSessionId::from_string(request.session_id.clone())?;
+        ensure_agent_attached(
+            &self.inner.runtime,
+            &store,
+            &request.session_id,
+            run_config
+                .options
+                .multi_agent_v2
+                .max_concurrent_threads_per_session,
+        )?;
+        let user_event =
+            latest_runtime_durable_prompt_input_event(&self.inner.runtime, &runtime_session_id)?
+                .with_context(|| {
+                    format!(
+                        "session {} has no durable input for CodexEngine",
+                        request.session_id
+                    )
+                })?;
+        let user_text = prompt_text_from_event(&user_event).with_context(|| {
+            format!(
+                "session {} has no durable text input for CodexEngine",
+                request.session_id
+            )
+        })?;
+        let initial_input = json!({
+            "source": "durable_prompt_input",
+            "event_type": user_event.event_type,
+            "source_event_seq": user_event.seq,
+            "payload": user_event.payload,
+        });
+        let session_meta = store
+            .load_session(&request.session_id)?
+            .with_context(|| format!("unknown session id: {}", request.session_id))?;
+        let run_cwd = PathBuf::from(&session_meta.cwd);
+        let shared_store: SharedStore = Arc::new(Mutex::new(store));
+        {
+            let store = shared_store
+                .lock()
+                .map_err(|_| anyhow!("session store lock poisoned"))?;
+            store.append_event(
+                &request.session_id,
+                "codex_engine.started",
+                json!({
+                    "backend": format!("{:?}", run_config.backend),
+                    "model": run_config.model.clone(),
+                    "model_provider": codex_model_provider_id(&run_config),
+                    "source": "runtime_agent_executor",
+                }),
+            )?;
+        }
+
+        let base_instructions = if run_config.options.simple_harness {
+            Some(simple_harness::simple_harness_system_prompt(
+                run_config.options.base_instructions.as_deref(),
+            ))
+        } else {
+            run_config.options.base_instructions.clone()
+        };
+        let spec = CodexEngineRunSpec {
+            session_id: request.session_id.clone(),
+            model: run_config.model.clone(),
+            model_provider: codex_model_provider_id(&run_config),
+            cwd: run_cwd,
+            codex_home: None,
+            base_instructions,
+            developer_instructions: run_config.options.developer_instructions.clone(),
+            browser_harness_env: simple_harness::shell_default_env(&run_config),
+            user_text,
+            cancellation_token: request.cancellation_token.clone(),
+        };
+
+        let request_session_id = request.session_id.clone();
+        let shared_store_for_emit = Arc::clone(&shared_store);
+        let runtime = self.inner.runtime.clone();
+        let agent_id = AgentId::from_string(request.session_id.clone())?;
+        let provider_config = json!({
+            "backend": format!("{:?}", run_config.backend),
+            "model": run_config.model.clone(),
+            "model_provider": codex_model_provider_id(&run_config),
+            "runtime_agent_executor": true,
+            "codex_engine": true,
+        });
+        let initial_cancel = request
+            .cancellation_token
+            .clone()
+            .unwrap_or_else(CancellationToken::new);
+        let maybe_run_id = request.run_id.clone();
+        let maybe_browser_id = request.browser_id.clone();
+        let result = self.inner.tokio.block_on(async move {
+            let mut runtime_request = RunAgentRequest::new(runtime_session_id.clone())
+                .with_agent_id(agent_id)
+                .with_provider_config(provider_config)
+                .with_cwd(spec.cwd.clone())
+                .with_input_source("codex_engine")
+                .with_initial_input(initial_input)
+                .with_cancellation_token(initial_cancel.clone());
+            if let Some(run_id) = maybe_run_id {
+                runtime_request = runtime_request.with_run_id(run_id);
+            }
+            if let Some(browser_id) = maybe_browser_id {
+                runtime_request = runtime_request.with_browser_id(browser_id);
+            }
+            let runtime_for_run = runtime.clone();
+            let runtime_session_id_for_run = runtime_session_id.clone();
+            runtime
+                .run_agent(runtime_request, async move {
+                    runtime_for_run
+                        .consume_prompt_input_for_session(&runtime_session_id_for_run)
+                        .context("consume CodexEngine durable prompt input")?;
+                    run_codex_engine_turn(spec, move |event: CodexProjectedEvent| {
+                        let store = shared_store_for_emit
+                            .lock()
+                            .map_err(|_| anyhow!("session store lock poisoned"))?;
+                        store.append_event(
+                            &request_session_id,
+                            &event.event_type,
+                            event.payload,
+                        )?;
+                        Ok(())
+                    })
+                    .await
+                })
+                .await
+        });
+
+        match result {
+            Ok(_) => {
+                let mirror_result = if run_config.options.simple_harness {
+                    let mirror_result = mirror_session_outputs(&shared_store, &request.session_id);
+                    cleanup_simple_harness_session(&shared_store, &request.session_id);
+                    mirror_result
+                } else {
+                    Ok(())
+                };
+                mirror_result?;
+                Ok(RuntimeAgentRunResult {
+                    session_id: request.session_id,
+                })
+            }
+            Err(error) => {
+                append_session_failed_if_missing(
+                    &shared_store,
+                    &request.session_id,
+                    &format!("{error:#}"),
+                );
+                if run_config.options.simple_harness {
+                    let _ = mirror_session_outputs(&shared_store, &request.session_id);
+                    cleanup_simple_harness_session(&shared_store, &request.session_id);
                 }
                 Err(error)
             }
@@ -422,6 +589,57 @@ fn latest_durable_prompt_input_from_events(events: Vec<EventRecord>) -> Option<E
             "session.input" | "session.followup" | "agent.mailbox_input"
         )
     })
+}
+
+fn prompt_text_from_event(event: &EventRecord) -> Option<String> {
+    if let Some(text) = event
+        .payload
+        .get("text")
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|text| !text.is_empty())
+    {
+        return Some(text.to_string());
+    }
+    if let Some(text) = event
+        .payload
+        .get("content")
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|text| !text.is_empty())
+    {
+        return Some(text.to_string());
+    }
+    event
+        .payload
+        .get("content")
+        .filter(|content| !content.is_null())
+        .map(|content| content.to_string())
+}
+
+fn codex_model_provider_id(config: &ProviderRunConfig) -> String {
+    if let Some(provider_id) = config
+        .options
+        .model_provider_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|provider_id| !provider_id.is_empty())
+        .filter(|_| config.options.model_provider_id_source == RunConfigValueSource::Explicit)
+    {
+        return provider_id.to_string();
+    }
+    match config.backend {
+        ProviderBackend::Codex => "codex",
+        ProviderBackend::Openai => OPENAI_API_PROVIDER_ID,
+        ProviderBackend::BrowserUse => "browser-use",
+        ProviderBackend::Anthropic => "anthropic",
+        ProviderBackend::Google => "google",
+        ProviderBackend::Openrouter => "openrouter",
+        ProviderBackend::Deepseek => "deepseek",
+        ProviderBackend::Fake => "fake",
+        ProviderBackend::None => "none",
+    }
+    .to_string()
 }
 
 fn runtime_has_trigger_turn_mail(runtime: &RuntimeHandle, session_id: &RuntimeSessionId) -> bool {

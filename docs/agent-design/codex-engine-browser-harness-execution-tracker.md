@@ -30,6 +30,9 @@ Codex fork:
 - path: `/home/exedev/repos/codex`
 - commit: `d735ef162f538d8e571778182a51ad5e9f795dfb`
 - status at snapshot: clean
+- repo-local submodule path: `codex`
+- repo-local submodule commit used by implementation:
+  `2832d78e759d2eba75fffdf84169cc6ef20514cf`
 
 Browser-harness:
 
@@ -78,24 +81,90 @@ Gate 0 verification:
 
 - dry-run command:
   - `scripts/run-internal-bench-hard-openai.sh --dry-run --judge --run-id audit-dry-run --root /tmp/ibh-audit-dry-run`
-  - result: command includes `-c simple_harness=true`, `-c disable_local_search=true`, `--model gpt-5.5`, `--max-turns 10000`, `--python-timeout-seconds 180`, `--max-attempts 1`, `--concurrency 25`, `--browser-mode cloud`, and judge concurrency `5`.
+  - result: command includes `-c simple_harness=true`, `-c codex_engine=true`,
+    `-c disable_local_search=true`, `--model gpt-5.5`, `--max-turns 10000`,
+    `--python-timeout-seconds 180`, `--max-attempts 1`, `--concurrency 25`,
+    `--browser-mode cloud`, and judge concurrency `5`.
 - no-80 guard:
   - `MAX_TURNS=80 scripts/run-internal-bench-hard-openai.sh --dry-run --run-id no80-check --root /tmp/ibh-no80-check`
   - result: exits `2` with `MAX_TURNS must stay >= 10000 for Internal_Bench_hard parity`.
 
 ### Gate 1: CodexEngine Single-Session Proof
 
-- [ ] New `CodexEngine` crate/module exists.
-- [ ] It uses Codex app-server crates, not `codex exec`.
-- [ ] One Browser Use session maps to one Codex thread.
-- [ ] One Browser Use run maps to one Codex turn.
-- [ ] Raw Codex events are persisted.
-- [ ] Browser Use events are projected into the store/runtime.
-- [ ] Final answer capture uses Codex message items/deltas, not only
+- [x] New `CodexEngine` crate/module exists.
+- [x] It uses Codex app-server crates, not `codex exec`.
+- [x] One Browser Use session maps to one Codex thread.
+- [x] One Browser Use run maps to one Codex turn.
+- [x] Raw Codex events are persisted.
+- [x] Browser Use events are projected into the store/runtime.
+- [x] Final answer capture uses Codex message items/deltas, not only
       `TurnCompleted`.
+- [x] One non-browser task works through CLI.
+- [x] One browser task works through cloud browser-harness.
 - [ ] One non-browser task works through TUI.
-- [ ] One browser task works through cloud browser-harness.
 - [ ] One SDK `Agent.run` works and streams events.
+
+Gate 1 verification so far:
+
+- implementation files:
+  - `crates/browser-use-codex-engine/Cargo.toml`
+  - `crates/browser-use-codex-engine/src/lib.rs`
+  - `crates/browser-use-codex-engine/src/requests.rs`
+  - `crates/browser-use-codex-engine/src/mapper.rs`
+  - `crates/browser-use-codex-engine/src/runner.rs`
+- direct Codex app-server dependency:
+  - `codex-app-server-client = { path = "../../codex/codex-rs/app-server-client" }`
+  - `codex-app-server-protocol = { path = "../../codex/codex-rs/app-server-protocol" }`
+- compile anchor:
+  - `pub type CodexInProcessClient = codex_app_server_client::InProcessAppServerClient;`
+- event mapper evidence:
+  - Codex app-server notifications are converted to Browser Use event names such
+    as `model.stream_delta`, `model.turn.response`, `exec_command.output_delta`,
+    `tool.output`, `tool.failed`, `codex.raw_response_item.completed`, and
+    `session.done`.
+  - `RuntimeAgentExecutor::run_codex_engine_blocking` appends every projected
+    Codex event into the Browser Use store and runs the turn inside
+    `runtime.run_agent(...)`, preserving runtime start/turn/completed/failure
+    projection.
+- dependency alignment needed for embedding:
+  - `rusqlite` aligned to `0.32.1` so `libsqlite3-sys 0.30.1` is shared with
+    Codex `sqlx-sqlite 0.8.6`.
+  - `allocative` locked to `0.3.4` and `allocative_derive` to `0.3.3` to match
+    Codex/starlark's `hashbrown 0.14.5` resolution.
+- focused verification:
+  - `cargo fmt --check`
+  - result: passed
+  - `cargo test -p browser-use-codex-engine`
+  - result: `8 passed`
+  - `cargo test -p browser-use-store`
+  - result: `20 passed`
+  - `cargo test -p browser-use-agent --lib`
+  - result: `1104 passed; 1 ignored`
+  - `cargo test -p browser-use-cli dataset_provider -- --nocapture`
+  - result: `2 passed`
+  - `JUDGE_AFTER_RUN=1 scripts/run-internal-bench-hard-openai.sh --dry-run`
+  - result: printed full command with explicit `-c codex_engine=true`.
+  - non-browser live smoke:
+    `target/debug/browser-use-terminal -c simple_harness=true -c codex_engine=true -c disable_local_search=true --state-dir /tmp/but-codex-engine-smoke run-openai --model gpt-5.5 'Reply with exactly CODEX_ENGINE_SMOKE_OK and nothing else.'`
+  - result: session `16224734-0fd8-485e-a4ea-70ffc0e3a2a5` wrote
+    `codex_engine.started`, `codex.thread.started`, `codex.turn.started`,
+    `codex.raw_event`, `session.done`, `agent.completed`, `harness.mirrored`,
+    `harness.cleaned`; final file contains `CODEX_ENGINE_SMOKE_OK`.
+  - API-key provider evidence: `codex_engine.started.model_provider` and
+    `codex.thread.started.model_provider` are `browser_use_openai_api`; the
+    smoke has zero `account/rateLimits/updated` Codex-account events.
+  - browser live smoke:
+    `target/debug/browser-use-terminal -c simple_harness=true -c codex_engine=true -c disable_local_search=true -c browser_mode='"cloud"' --state-dir /tmp/but-codex-browser-smoke run-openai --model gpt-5.5 'Use browser-harness to open https://example.com, read the page title, and answer with exactly the title.'`
+  - result: session `31fd6d18-cefe-473b-9559-6658ddc71442` invoked
+    browser-harness through the worker, recorded three successful
+    `exec_command` / `tool.output` calls, wrote `session.done`, mirrored
+    artifacts, and cleaned the worker.
+  - runtime stack fix: embedded Codex initially overflowed the default Tokio
+    worker stack; `RuntimeAgentExecutor` now sets a 16 MiB worker stack.
+  - API-key provider fix: Browser Use OpenAI defaults map to custom Codex
+    provider `browser_use_openai_api` with `env_key = "OPENAI_API_KEY"` and
+    `requires_openai_auth = false`, preserving explicit user provider
+    overrides.
 
 ### Gate 2: TUI/SDK Contract Preserved
 
@@ -107,13 +176,25 @@ Gate 0 verification:
 - [ ] TUI history shows completed CodexEngine runs.
 - [ ] SDK JSON-RPC API shape is unchanged.
 - [ ] Python SDK `Client.agent.run` uses CodexEngine.
-- [ ] Store status projection remains correct for running/done/failed/cancelled.
+- [x] Store status projection remains correct for running/done/failed/cancelled.
+
+Gate 2 verification so far:
+
+- TUI/CLI/SDK option constructors set both `simple_harness=true` and
+  `codex_engine=true`.
+- Dataset provider option merging now preserves `codex_engine`; regression test:
+  `cargo test -p browser-use-cli dataset_provider -- --nocapture`.
+- CodexEngine runs inside `runtime.run_agent(...)` and consumes durable prompt
+  input through the runtime. Regression coverage:
+  `cargo test -p browser-use-agent --lib live_executor::tests:: -- --nocapture`.
+- Full agent-lib status/runtime regression suite:
+  `cargo test -p browser-use-agent --lib`.
 
 ### Gate 3: Browser-Harness Manager Product Wiring
 
-- [ ] Python browser-harness owns model-visible CDP/browser interaction.
-- [ ] Old Rust browser/CDP runtime is bypassed in CodexEngine mode.
-- [ ] Model-visible browser command output is byte-preserved.
+- [x] Python browser-harness owns model-visible CDP/browser interaction.
+- [x] Old Rust browser/CDP runtime is bypassed in CodexEngine mode.
+- [x] Model-visible browser command output is byte-preserved.
 - [ ] `BH_MANAGER_ROOT` is explicit and under Browser Use state/artifacts.
 - [ ] `BH_MANAGER_SOCKET` is explicit.
 - [ ] `BH_RUN_ID`, `BH_AGENT_ID`, and `BH_PARENT_AGENT_ID` are explicit.
@@ -122,7 +203,7 @@ Gate 0 verification:
 - [ ] `/sync-cookies` cloud profile intent feeds browser-harness manager.
 - [ ] SDK `browser.set_backend` feeds the same intent.
 - [ ] SDK `browser.set_profile` feeds the same intent.
-- [ ] Browser manager cleanup runs on done/fail/cancel.
+- [x] Browser manager cleanup runs on done/fail/cancel.
 - [ ] Public browser evidence excludes secrets, CDP URLs, and provider browser
       IDs.
 
@@ -138,11 +219,19 @@ Gate 0 verification:
 
 ### Gate 5: Local Verification
 
-- [ ] `cargo fmt --check`
-- [ ] `cargo test`
-- [ ] `uv run --with pytest python -m pytest -q`
-- [ ] `scripts/verify-terminal-ui.sh`
-- [ ] Inspect `/tmp/but-design-loop/` after TUI verification.
+- [x] `cargo fmt --check`
+- [x] `cargo test`
+- [x] `uv run --with pytest python -m pytest -q`
+- [x] `scripts/verify-terminal-ui.sh`
+- [x] Inspect `/tmp/but-design-loop/` after TUI verification.
+
+Gate 5 verification:
+
+- `scripts/verify-terminal-ui.sh` passed.
+- Artifact directory inspected: `/tmp/but-design-loop/`.
+- Terminal flows covered by the repo smoke include browser overlay, history,
+  model/account overlays, completed plain output, follow-up input, queued input,
+  escape/cancel flows, paste, resize, scrollback, and slash-palette flows.
 
 ### Gate 6: Eval Smoke And Subset
 
@@ -185,8 +274,10 @@ Stop and do not claim completion if any of these occur:
 
 ## Current Status
 
-Active phase: Gate 1.
+Active phase: Gate 7 full eval.
 
 Next concrete action:
 
-1. Start `CodexEngine` single-session implementation.
+1. Commit the implementation checkpoint.
+2. Launch the full Internal_Bench_hard run only after the smoke artifacts show
+   `codex_engine=true`, browser-harness events, and complete final capture.

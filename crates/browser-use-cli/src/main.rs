@@ -890,6 +890,7 @@ struct DatasetProviderConfig {
     max_turns: usize,
     python_timeout_seconds: u64,
     simple_harness: bool,
+    codex_engine: bool,
 }
 
 trait DatasetRunner: Clone + Send + Sync + 'static {
@@ -928,6 +929,7 @@ fn merge_dataset_provider_run_options(
     merged_options.config_profile = provider_options.config_profile.clone();
     merged_options.config_overrides = provider_options.config_overrides.clone();
     merged_options.simple_harness = provider_options.simple_harness;
+    merged_options.codex_engine = provider_options.codex_engine;
     merged_options.model_provider_id = provider_options.model_provider_id.clone();
     merged_options.model_provider_id_source = provider_options.model_provider_id_source;
     merged_options.collaboration_mode = provider_options.collaboration_mode;
@@ -2325,6 +2327,7 @@ fn cli_agent_options(
         .with_collaboration_mode(collaboration_mode)
         .with_browser_mode(cli_browser_mode())
         .with_simple_harness(true)
+        .with_codex_engine(true)
         .with_model_compaction(true)
         .with_analytics_source("cli");
     if let Some(profile) = config_profile {
@@ -8293,6 +8296,7 @@ fn sdk_provider_run_config(
     let mut options = AgentRunOptions::default()
         .with_browser_mode(browser_mode)
         .with_simple_harness(true)
+        .with_codex_engine(true)
         .with_model_compaction(true)
         .with_analytics_source("sdk")
         .with_model_provider_id(provider_id.clone());
@@ -9516,6 +9520,7 @@ fn dataset_run_fake(store: &Store, dataset: &str, options: DatasetRunOptions) ->
     let run_config = ProviderRunConfig::new(ProviderBackend::Fake, "fake")
         .with_fake_result("Fake dataset case completed.");
     let simple_harness = run_config.options.simple_harness;
+    let codex_engine = run_config.options.codex_engine;
     dataset_run_provider(
         store,
         dataset,
@@ -9528,6 +9533,7 @@ fn dataset_run_fake(store: &Store, dataset: &str, options: DatasetRunOptions) ->
             max_turns: DATASET_PROVIDER_DEFAULT_MAX_TURNS,
             python_timeout_seconds: 120,
             simple_harness,
+            codex_engine,
         },
     )
 }
@@ -9605,6 +9611,7 @@ fn dataset_run_openai(
         .with_model_source(model_source)
         .with_options(agent_options);
     let simple_harness = run_config.options.simple_harness;
+    let codex_engine = run_config.options.codex_engine;
     dataset_run_provider(
         store,
         dataset,
@@ -9617,6 +9624,7 @@ fn dataset_run_openai(
             max_turns,
             python_timeout_seconds,
             simple_harness,
+            codex_engine,
         },
     )
 }
@@ -9643,6 +9651,7 @@ fn dataset_run_codex(
         .with_default_model_provider_id("codex"),
     );
     let simple_harness = run_config.options.simple_harness;
+    let codex_engine = run_config.options.codex_engine;
     dataset_run_provider(
         store,
         dataset,
@@ -9655,6 +9664,7 @@ fn dataset_run_codex(
             max_turns,
             python_timeout_seconds,
             simple_harness,
+            codex_engine,
         },
     )
 }
@@ -9675,6 +9685,7 @@ fn dataset_run_anthropic(
                 .with_default_model_provider_id("anthropic"),
         );
     let simple_harness = run_config.options.simple_harness;
+    let codex_engine = run_config.options.codex_engine;
     dataset_run_provider(
         store,
         dataset,
@@ -9687,6 +9698,7 @@ fn dataset_run_anthropic(
             max_turns,
             python_timeout_seconds,
             simple_harness,
+            codex_engine,
         },
     )
 }
@@ -9707,6 +9719,7 @@ fn dataset_run_openrouter(
                 .with_default_model_provider_id("openrouter"),
         );
     let simple_harness = run_config.options.simple_harness;
+    let codex_engine = run_config.options.codex_engine;
     dataset_run_provider(
         store,
         dataset,
@@ -9719,6 +9732,7 @@ fn dataset_run_openrouter(
             max_turns,
             python_timeout_seconds,
             simple_harness,
+            codex_engine,
         },
     )
 }
@@ -9968,6 +9982,7 @@ fn run_dataset_case_with_provider<R: DatasetRunner>(
         multi_agent_v2: AgentRunOptions::default().multi_agent_v2,
         collab_enabled: AgentRunOptions::default().collab_enabled,
         agent_roles: AgentRunOptions::default().agent_roles,
+        codex_engine: false,
     };
     let run_error = runner
         .run_dataset_session(store, &session_id, agent_options)
@@ -10486,6 +10501,7 @@ fn new_dataset_manifest(
         "max_turns": config.max_turns,
         "python_timeout_seconds": config.python_timeout_seconds,
         "simple_harness": config.simple_harness,
+        "codex_engine": config.codex_engine,
         "headless": config.browser_mode != "cloud",
         "browser": config.browser_mode,
         "selection": cases.iter().map(dataset_case_manifest).collect::<Vec<_>>(),
@@ -11338,6 +11354,7 @@ mod tests {
     fn dataset_provider_merge_preserves_dataset_browser_limits_and_provider_surface() {
         let provider_options = AgentRunOptions::default()
             .with_simple_harness(true)
+            .with_codex_engine(true)
             .with_model_provider_id("codex")
             .with_config_profile("bench")
             .with_config_overrides(vec![(
@@ -11362,6 +11379,7 @@ mod tests {
             vec![("BROWSER_USE_API_KEY".to_string(), "test-key".to_string())]
         );
         assert!(merged.simple_harness);
+        assert!(merged.codex_engine);
         assert_eq!(merged.model_provider_id.as_deref(), Some("codex"));
         assert_eq!(
             merged.model_provider_id_source,
@@ -11379,6 +11397,7 @@ mod tests {
             max_turns,
             python_timeout_seconds: 180,
             simple_harness: true,
+            codex_engine: true,
         }
     }
 

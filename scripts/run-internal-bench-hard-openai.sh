@@ -219,6 +219,10 @@ if [[ "$DRY_RUN" != "1" ]]; then
   judge_preflight
 fi
 
+if [[ -z "${OPENAI_API_KEY:-}" && -n "${LLM_BROWSER_OPENAI_API_KEY:-}" ]]; then
+  export OPENAI_API_KEY="$LLM_BROWSER_OPENAI_API_KEY"
+fi
+
 BRANCH="$(git rev-parse --abbrev-ref HEAD | tr '/ .' '---')"
 STAMP="$(date -u +%Y%m%d-%H%M%S)"
 RUN_ID="${RUN_ID:-ibh-simple-harness-openai-${BRANCH}-${STAMP}}"
@@ -231,6 +235,7 @@ PACKETS="$ROOT/judge_packets.json"
 cmd=(
   "$BIN"
   -c simple_harness=true
+  -c codex_engine=true
   -c disable_local_search=true
   --state-dir "$STATE_DIR"
   dataset-run-openai "$DATASET"
@@ -298,6 +303,7 @@ max_turns=$MAX_TURNS
 python_timeout_seconds=$PYTHON_TIMEOUT_SECONDS
 browser_mode=cloud
 simple_harness=true
+codex_engine=true
 disable_local_search=true
 browser_harness_src=$BROWSER_HARNESS_SRC
 judge_after_run=$JUDGE_AFTER_RUN

@@ -1012,12 +1012,14 @@ fn tui_agent_options(
             .with_collaboration_mode(collaboration_mode)
             .with_browser_mode("managed-headless")
             .with_simple_harness(true)
+            .with_codex_engine(true)
             .with_model_compaction(true)
             .with_analytics_source("tui"),
         "Managed Chromium" => AgentRunOptions::default()
             .with_collaboration_mode(collaboration_mode)
             .with_browser_mode("managed-headed")
             .with_simple_harness(true)
+            .with_codex_engine(true)
             .with_model_compaction(true)
             .with_analytics_source("tui"),
         BROWSER_USE_CLOUD => {
@@ -1025,6 +1027,7 @@ fn tui_agent_options(
                 .with_collaboration_mode(collaboration_mode)
                 .with_browser_mode("cloud")
                 .with_simple_harness(true)
+                .with_codex_engine(true)
                 .with_model_compaction(true)
                 .with_analytics_source("tui");
             if let Some(api_key) =
@@ -1041,6 +1044,7 @@ fn tui_agent_options(
             .with_collaboration_mode(collaboration_mode)
             .with_browser_mode("local")
             .with_simple_harness(true)
+            .with_codex_engine(true)
             .with_model_compaction(true)
             .with_analytics_source("tui"),
     };

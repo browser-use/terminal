@@ -11,6 +11,7 @@ version.workspace = true
 
 [dependencies]
 browser-use-browser = { path = "../browser-use-browser" }
+browser-use-codex-engine = { path = "../browser-use-codex-engine" }
 browser-use-llm = { path = "../browser-use-llm" }
 browser-use-providers = { path = "../browser-use-providers" }
 browser-use-protocol = { path = "../browser-use-protocol" }

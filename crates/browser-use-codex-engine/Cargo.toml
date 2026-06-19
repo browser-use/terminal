@@ -1,0 +1,22 @@
+[package]
+name = "browser-use-codex-engine"
+edition.workspace = true
+license.workspace = true
+version.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+codex-arg0 = { path = "../../codex/codex-rs/arg0" }
+codex-app-server-client = { path = "../../codex/codex-rs/app-server-client" }
+codex-app-server-protocol = { path = "../../codex/codex-rs/app-server-protocol" }
+codex-config = { path = "../../codex/codex-rs/config" }
+codex-feedback = { path = "../../codex/codex-rs/feedback" }
+codex-protocol = { path = "../../codex/codex-rs/protocol" }
+codex-rollout = { path = "../../codex/codex-rs/rollout" }
+serde.workspace = true
+serde_json.workspace = true
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "sync", "time"] }
+tokio-util.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

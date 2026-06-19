@@ -1,0 +1,3 @@
+[submodule "codex"]
+	path = codex
+	url = https://github.com/browser-use/new-terminal-exp-codex-fork
