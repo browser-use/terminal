@@ -83,14 +83,38 @@ for line in sys.stdin:
               "error": {"code": -32601, "message": "method not found"}})
 "#;
 
+const STDIO_STALL_AFTER_INIT_PY: &str = r#"
+import sys, json, time
+
+def send(obj):
+    sys.stdout.write(json.dumps(obj) + "\n")
+    sys.stdout.flush()
+
+line = sys.stdin.readline()
+msg = json.loads(line)
+send({"jsonrpc": "2.0", "id": msg.get("id"), "result": {
+    "protocolVersion": "2024-11-05",
+    "capabilities": {},
+    "serverInfo": {"name": "stall", "version": "0.0.1"},
+}})
+
+# Do not read stdin again. A large client request can fill the pipe while the
+# transport is still in write_json, before its per-request response timeout is
+# armed.
+time.sleep(60)
+"#;
+
 /// Write the python fixture into a tempdir and return its path. The tempdir is
 /// kept alive by the returned guard.
 fn write_stdio_fixture() -> (tempfile::TempDir, std::path::PathBuf) {
+    write_stdio_fixture_source(STDIO_FIXTURE_PY)
+}
+
+fn write_stdio_fixture_source(source: &str) -> (tempfile::TempDir, std::path::PathBuf) {
     let dir = tempfile::tempdir().expect("tempdir");
     let path = dir.path().join("server.py");
     let mut f = std::fs::File::create(&path).expect("create fixture");
-    f.write_all(STDIO_FIXTURE_PY.as_bytes())
-        .expect("write fixture");
+    f.write_all(source.as_bytes()).expect("write fixture");
     f.flush().expect("flush fixture");
     (dir, path)
 }
@@ -159,6 +183,34 @@ async fn stdio_error_result_maps_is_error() {
     let result = transport.call_tool("boom", None).await.expect("call boom");
     assert!(result.is_error);
     assert_eq!(mcp_result_tool_content(&result.into_seam()), "kaboom");
+}
+
+#[tokio::test]
+#[ignore = "diagnostic repro: stdio MCP timeout does not cover a blocked stdin write"]
+async fn repro_stdio_call_can_remain_pending_before_response_timeout_is_armed() {
+    let (_dir, script) = write_stdio_fixture_source(STDIO_STALL_AFTER_INIT_PY);
+    let transport = StdioTransport::connect(
+        "python3",
+        &[script.to_string_lossy().to_string()],
+        &HashMap::new(),
+        None,
+        Duration::from_secs(2),
+        Duration::from_millis(50),
+    )
+    .await
+    .expect("connect stalling stdio fixture");
+
+    let large_arg = "x".repeat(32 * 1024 * 1024);
+    let result = tokio::time::timeout(
+        Duration::from_secs(2),
+        transport.call_tool("stall", Some(json!({ "blob": large_arg }))),
+    )
+    .await;
+
+    assert!(
+        result.is_err(),
+        "MCP call returned inside the outer watchdog; this repro expects write_json to remain pending before the tool timeout"
+    );
 }
 
 // ---------------------------------------------------------------------------
