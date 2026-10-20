@@ -129,6 +129,12 @@ under `target/debug/agent-tools/rg`; run
 `scripts/install-agent-ripgrep.sh target/debug/agent-tools` to refresh it
 manually.
 
+### Command inspection
+
+Agent shell tools can run a trusted checker before execution. Set
+`BUT_COMMAND_GUARD` to enable the fail-closed gate, including the optional local
+Veltra adapter. See [command guard setup and limits](docs/command-guard.md).
+
 ### Telemetry
 
 You can disable (100% completely anonymous) telemetry with  `BUT_TELEMETRY=0`.

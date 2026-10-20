@@ -22,6 +22,8 @@ use tokio::sync::{Mutex, Notify};
 use tokio_util::sync::CancellationToken;
 
 use crate::events::{EventSink, PendingEvent};
+use crate::hooks::{HookEvent, HookInput};
+use crate::tools::command_guard;
 use crate::tools::runtime::ToolError;
 
 pub const MIN_YIELD_TIME_MS: u64 = 250;
@@ -185,9 +187,19 @@ struct ExecEndEvent<'a> {
 }
 
 /// Shared process manager. Cheap to clone.
-#[derive(Clone, Default)]
+#[derive(Clone)]
 pub struct UnifiedExecManager {
     inner: Arc<UnifiedExecManagerInner>,
+    command_guard: Option<Arc<Vec<String>>>,
+}
+
+impl Default for UnifiedExecManager {
+    fn default() -> Self {
+        Self {
+            inner: Arc::new(UnifiedExecManagerInner::default()),
+            command_guard: command_guard::from_env(),
+        }
+    }
 }
 
 impl std::fmt::Debug for UnifiedExecManager {
@@ -288,6 +300,15 @@ impl UnifiedExecSnapshot {
 }
 
 impl UnifiedExecManager {
+    /// Inspect process starts and nonempty stdin writes with a trusted executable.
+    ///
+    /// The checker receives `PreToolUse` JSON on stdin and must exit successfully
+    /// with `{"continue":true}` on stdout. Missing or failed decisions deny execution.
+    pub fn with_command_guard(mut self, command: Vec<String>) -> Self {
+        self.command_guard = Some(Arc::new(command));
+        self
+    }
+
     #[cfg(test)]
     pub fn deterministic_for_tests() -> Self {
         Self {
@@ -296,6 +317,7 @@ impl UnifiedExecManager {
                 next_session_id: Mutex::new(1000),
                 deterministic_session_ids: true,
             }),
+            command_guard: None,
         }
     }
 
@@ -313,6 +335,43 @@ impl UnifiedExecManager {
     ) -> Result<UnifiedExecSnapshot, ToolError> {
         if req.argv.is_empty() {
             return Err(ToolError::Other(anyhow::anyhow!("empty command")));
+        }
+
+        if let Some(checker) = self.command_guard.as_deref() {
+            tokio::select! {
+                biased;
+                _ = async {
+                    if let Some(cancel) = req.cancel.as_ref() {
+                        cancel.cancelled().await;
+                    } else {
+                        std::future::pending::<()>().await;
+                    }
+                } => {
+                    return Err(ToolError::Rejected(
+                        "Command cancelled before execution.".into(),
+                    ));
+                }
+                result = command_guard::inspect(
+                    checker,
+                    HookInput::new(HookEvent::PreToolUse)
+                        .with_tool_name(&req.tool_name)
+                        .with_tool_input(json!({
+                            "command": req.argv,
+                            "cwd": req.cwd,
+                            "env": req.env,
+                        }))
+                        .with_extra("callId", json!(req.call_id)),
+                ) => result?,
+            }
+            if req
+                .cancel
+                .as_ref()
+                .is_some_and(CancellationToken::is_cancelled)
+            {
+                return Err(ToolError::Rejected(
+                    "Command cancelled before execution.".into(),
+                ));
+            }
         }
 
         let session_id = self.allocate_session_id().await;
@@ -387,6 +446,28 @@ impl UnifiedExecManager {
             .ok_or_else(|| {
                 ToolError::Other(anyhow::anyhow!("unknown session `{}`", req.session_id))
             })?;
+
+        if !req.chars.is_empty() {
+            if let Some(checker) = self.command_guard.as_deref() {
+                let input = {
+                    let state = process.state.lock().await;
+                    json!({
+                        "command": state.argv,
+                        "cwd": state.cwd,
+                        "session_id": req.session_id,
+                        "chars": req.chars,
+                    })
+                };
+                command_guard::inspect(
+                    checker,
+                    HookInput::new(HookEvent::PreToolUse)
+                        .with_tool_name(&req.tool_name)
+                        .with_tool_input(input)
+                        .with_extra("callId", json!(req.call_id)),
+                )
+                .await?;
+            }
+        }
 
         process
             .update_call_context(req.call_id, req.tool_name, req.emitter)
@@ -1537,5 +1618,229 @@ mod tests {
             !late_file.exists(),
             "timed-out background child must not survive to write artifacts"
         );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn command_guard_denies_before_starting_the_process() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let manager = UnifiedExecManager::deterministic_for_tests().with_command_guard(vec![
+            "sh".into(),
+            "-c".into(),
+            "cat >/dev/null; printf '{\"continue\":false}'".into(),
+        ]);
+
+        let mut command = request(
+            vec!["sh".into(), "-c".into(), "touch should-not-exist".into()],
+            dir.path().to_path_buf(),
+            1_000,
+        );
+        command.env.insert("BUT_COMMAND_GUARD".into(), "[]".into());
+        let result = manager.run_to_completion(command).await;
+
+        assert!(matches!(
+            result,
+            Err(crate::tools::runtime::ToolError::Rejected(_))
+        ));
+        assert!(!dir.path().join("should-not-exist").exists());
+        assert_eq!(manager.terminate_all().await, 0);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn command_guard_receives_the_exact_command_before_allowing_execution() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let captured = dir.path().join("guard-input.json");
+        let manager = UnifiedExecManager::deterministic_for_tests().with_command_guard(vec![
+            "sh".into(),
+            "-c".into(),
+            "cat >\"$1\"; printf '{\"continue\":true}'".into(),
+            "guard".into(),
+            captured.to_string_lossy().into_owned(),
+        ]);
+        let argv = vec![
+            "sh".into(),
+            "-c".into(),
+            "printf allowed > marker.txt".into(),
+        ];
+
+        let mut command = request(argv.clone(), dir.path().to_path_buf(), 1_000);
+        command
+            .env
+            .insert("GUARD_TEST_VALUE".into(), "hello".into());
+        let result = manager
+            .run_to_completion(command)
+            .await
+            .expect("allowed command");
+
+        let input: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(captured).expect("guard input")).unwrap();
+        assert_eq!(input["hookEventName"], "PreToolUse");
+        assert_eq!(input["toolName"], "shell");
+        assert_eq!(input["toolInput"]["command"], serde_json::json!(argv));
+        assert_eq!(input["toolInput"]["cwd"], serde_json::json!(dir.path()));
+        assert_eq!(input["callId"], "test-call");
+        assert_eq!(
+            input["toolInput"]["env"],
+            serde_json::json!({"GUARD_TEST_VALUE": "hello"})
+        );
+        assert_eq!(result.exit_code, Some(0));
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("marker.txt")).unwrap(),
+            "allowed"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn command_guard_checks_input_to_an_already_running_shell() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let manager = UnifiedExecManager::deterministic_for_tests().with_command_guard(vec![
+            "sh".into(),
+            "-c".into(),
+            "input=$(cat); case \"$input\" in *'\"toolName\":\"write_stdin\"'*) printf '{\"continue\":false}';; *) printf '{\"continue\":true}';; esac".into(),
+        ]);
+        let mut spawn = request(vec!["sh".into()], dir.path().to_path_buf(), 5_000);
+        spawn.tty = true;
+        spawn.yield_time_ms = 250;
+        let running = manager.spawn_process(spawn).await.expect("start shell");
+        assert!(running.running);
+
+        let result = manager
+            .write_stdin(super::WriteStdinRequest {
+                session_id: running.session_id,
+                chars: "touch should-not-exist\n".into(),
+                yield_time_ms: 250,
+                max_output_tokens: None,
+                call_id: "stdin-call".into(),
+                tool_name: "write_stdin".into(),
+                emitter: None,
+            })
+            .await;
+        manager.terminate_all().await;
+
+        assert!(matches!(
+            result,
+            Err(crate::tools::runtime::ToolError::Rejected(_))
+        ));
+        assert!(!dir.path().join("should-not-exist").exists());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn command_guard_allows_polling_without_rechecking_the_command() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let manager = UnifiedExecManager::deterministic_for_tests().with_command_guard(vec![
+            "sh".into(), "-c".into(),
+            "input=$(cat); case \"$input\" in *'\"toolName\":\"write_stdin\"'*) printf '{\"continue\":false}';; *) printf '{\"continue\":true}';; esac".into(),
+        ]);
+        let mut spawn = request(
+            vec!["sh".into(), "-c".into(), "sleep 0.5".into()],
+            dir.path().to_path_buf(),
+            5_000,
+        );
+        spawn.yield_time_ms = 250;
+        let running = manager.spawn_process(spawn).await.expect("start command");
+        assert!(running.running);
+        let result = manager
+            .write_stdin(super::WriteStdinRequest {
+                session_id: running.session_id,
+                chars: String::new(),
+                yield_time_ms: 250,
+                max_output_tokens: None,
+                call_id: "poll-call".into(),
+                tool_name: "write_stdin".into(),
+                emitter: None,
+            })
+            .await
+            .expect("empty poll must not run the checker");
+        assert_eq!(result.exit_code, Some(0));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn command_guard_does_not_start_a_command_cancelled_during_inspection() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let manager = UnifiedExecManager::deterministic_for_tests().with_command_guard(vec![
+            "sh".into(),
+            "-c".into(),
+            "cat >/dev/null; exec sleep 30".into(),
+        ]);
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let mut command = request(
+            vec!["sh".into(), "-c".into(), "touch should-not-exist".into()],
+            dir.path().to_path_buf(),
+            1_000,
+        );
+        command.cancel = Some(cancel.clone());
+        let pending = manager.run_to_completion(command);
+        let cancellation = async {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            cancel.cancel();
+        };
+        let (result, ()) = tokio::time::timeout(Duration::from_secs(1), async {
+            tokio::join!(pending, cancellation)
+        })
+        .await
+        .expect("cancellation must not wait for the checker timeout");
+        manager.terminate_all().await;
+        assert!(
+            matches!(result, Err(crate::tools::runtime::ToolError::Rejected(ref reason))
+                if reason == "Command cancelled before execution."),
+            "cancellation must return a cancellation error, not a guard denial"
+        );
+        assert!(!dir.path().join("should-not-exist").exists());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    #[ignore = "requires BUT_COMMAND_GUARD configured with the local Veltra adapter"]
+    async fn veltra_guard_integration_inspects_before_process_side_effects() {
+        assert!(
+            std::env::var_os("BUT_COMMAND_GUARD").is_some(),
+            "configure the local Veltra adapter"
+        );
+        let manager = UnifiedExecManager::default();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let allowed = manager
+            .run_to_completion(request(
+                vec![
+                    "sh".into(),
+                    "-c".into(),
+                    "printf checked > allowed.txt".into(),
+                ],
+                dir.path().to_path_buf(),
+                1_000,
+            ))
+            .await
+            .expect("ordinary command must pass Veltra");
+        assert_eq!(allowed.exit_code, Some(0));
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("allowed.txt")).unwrap(),
+            "checked"
+        );
+        let denied = manager
+            .run_to_completion(request(
+                vec![
+                    "sh".into(),
+                    "-c".into(),
+                    "echo $OPENAI_API_KEY; touch denied.txt".into(),
+                ],
+                dir.path().to_path_buf(),
+                1_000,
+            ))
+            .await;
+        assert!(denied.is_err());
+        assert!(!dir.path().join("denied.txt").exists());
+        let mut with_env = request(
+            vec!["sh".into(), "-c".into(), "touch env-denied.txt".into()],
+            dir.path().to_path_buf(),
+            1_000,
+        );
+        with_env
+            .env
+            .insert("GUARD_TEST_VALUE".into(), "hello".into());
+        assert!(manager.run_to_completion(with_env).await.is_err());
+        assert!(!dir.path().join("env-denied.txt").exists());
     }
 }
